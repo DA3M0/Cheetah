@@ -1,25 +1,39 @@
-# 🐆 Cheetah
+# Cheetah
 
-> **Status:** 🔒 Private Development / Phase 0 (Learning & Prototyping)  
-> **Target:** Modern Hardware & 100% Pure Rust  
-> **Established:** 2026-10-31
+Cheetah is a local language-model CLI and OpenAI-compatible gateway using Candle for inference and Safetensors checkpoints for model weights. Supported decoder architectures include Qwen2, Gemma, Llama, and Phi; CPU is the default runtime.
 
-## The Philosophy
-While **Wolf** 🐺 focuses on lowering the barrier to entry (GGUF, legacy hardware, zero-config), **Cheetah** is built to push the absolute limits of modern hardware.
+## Build
 
-Cheetah is a highly customizable inference engine and gateway, powered entirely by **HuggingFace's Candle**. 
+```sh
+cargo build --release
+```
 
-## Core Objectives
-- **Native Format:** Built exclusively for `Safetensors`.
-- **Pure Blood:** 100% Rust. No C++ baggage, no legacy `#ifdef` bloat.
-- **Hardware Focus:** Fully optimized for Apple Silicon (Metal) and modern GPUs.
-- **Distributed Swarm:** Seamless integration with the upcoming **Bee** 🐝 module for distributed local compute.
-- **Extreme Customizability:** Expose tensor-level APIs for developers to write custom kernels and forward passes.
+Optional GPU backends can be compiled with `--features cuda` or `--features metal`. Set `CHEETAH_DEVICE=cuda` or `CHEETAH_DEVICE=metal` to select a compiled backend at runtime; `CHEETAH_DEVICE=cpu` (the default) selects the CPU.
 
-## Why a separate project?
-Because an engine optimized for a 10-year-old CPU (Wolf) should not dictate the architecture of an engine built for an M3 Max. 
+## Chat
 
-*"To lower the barrier with GGUF, and to push the limits with Safetensors."*
+Pass a Hugging Face model directory containing `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` plus its shard files:
 
----
-*Coming out of the lab when it's ready.*
+```sh
+cargo run -- /home/benny/models/qwen-0.5b
+cargo run -- /home/benny/models/qwen-0.5b --max-tokens 128 --temperature 0
+```
+
+The CLI also accepts a direct `.safetensors` path when its config and tokenizer files are in the same directory. Chat supports multi-turn conversations, `/exit`, `/clear`, `/save <name>`, and named context restore with `--context <name>`. Context archives are stored under the platform's Cheetah application-data directory; override it with `--context-dir <path>`.
+
+Sampling options include `--temperature`, `--top-p`, `--top-k`, `--repeat-penalty`, and `--seed`. `--threads` controls the CPU thread pool and `--ctx-size` bounds the context window.
+
+## Model inspection
+
+```sh
+cargo run -- inspect /home/benny/models/qwen-0.5b
+cargo run -- inspect /home/benny/models/qwen-0.5b/model.safetensors --json --output report.json
+```
+
+## OpenAI-compatible server
+
+```sh
+cargo run -- serve /home/benny/models/qwen-0.5b --host 127.0.0.1 --port 8080
+```
+
+The server exposes `POST /v1/chat/completions` (including SSE streaming), non-streaming `POST /v1/completions`, `GET /v1/models`, `GET /v1/models/:id`, and `GET /health`. Unauthenticated non-loopback listeners are rejected; use `--api-key` or `--generate-key` when binding to a non-loopback address.
