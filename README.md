@@ -8,7 +8,27 @@ Cheetah is a local language-model CLI and OpenAI-compatible gateway using Candle
 cargo build --release
 ```
 
-Optional GPU backends can be compiled with `--features cuda` or `--features metal`. Set `CHEETAH_DEVICE=cuda` or `CHEETAH_DEVICE=metal` to select a compiled backend at runtime; `CHEETAH_DEVICE=cpu` (the default) selects the CPU.
+Optional Candle inference backends can be compiled with `--features cuda` or `--features metal`. Set `CHEETAH_DEVICE=cuda` or `CHEETAH_DEVICE=metal` to select a compiled backend at runtime; `CHEETAH_DEVICE=cpu` (the default) selects the CPU.
+
+The separate C Vulkan compute backend is available with `--features vulkan`. It requires a Vulkan SDK/runtime and a C compiler. Its 800 MiB host-visible/coherent memory pool can be resized with `CHEETAH_VRAM_POOL_SIZE` (bytes). The feature exposes the initializer and matrix multiplication through `cheetah::native::vulkan`; Vulkan matrix multiplication also requires a compiled `matmul.spv` shader:
+
+```sh
+glslc -fshader-stage=compute matmul.comp -o matmul.spv
+cargo test --features vulkan
+```
+
+Set `CHEETAH_MATMUL_SPV` to use a shader at another path. The Vulkan compute API is separate from Candle inference device selection.
+
+## Static model initialization
+
+`cheetah init` prepares a Hugging Face model directory for static, mmap-friendly loading. It recursively scans Safetensors files, writes per-layer weight shards below `.cheetah/weights/`, and emits `cheetah_manifest.json` at the output root. Shard payloads are aligned to 4 KiB; a missing `config.json` is inferred and generated. Tokenizer files are copied when present. The source directory is not modified.
+
+```sh
+cargo run -- init /home/benny/models/qwen-0.5b /home/benny/models/qwen-0.5b-prepared
+cargo run -- inspect /home/benny/models/qwen-0.5b-prepared
+```
+
+The output directory is generated model data: initialization replaces its unsharded Safetensors weight files and manages stale generated shards. You can also use `cheetah prepare` as an alias for `cheetah init`.
 
 ## Chat
 
@@ -28,6 +48,7 @@ Sampling options include `--temperature`, `--top-p`, `--top-k`, `--repeat-penalt
 ```sh
 cargo run -- inspect /home/benny/models/qwen-0.5b
 cargo run -- inspect /home/benny/models/qwen-0.5b/model.safetensors --json --output report.json
+cargo run -- inspect /home/benny/models/qwen-0.5b-prepared
 ```
 
 ## OpenAI-compatible server
