@@ -209,6 +209,7 @@ impl Engine {
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
         let config: ModelConfig = serde_json::from_value(raw_config.clone())
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
+        let manifest_stop_markers = read_manifest_stop_markers(model_dir)?;
         let architecture = config
             .architectures
             .as_ref()
@@ -228,8 +229,12 @@ impl Engine {
             "qwen2" => ChatStyle::Qwen,
             "gemma" => ChatStyle::Gemma,
             "llama"
-                if vocabulary.contains_key("<|start_header_id|>")
-                    && vocabulary.contains_key("<|eot_id|>") =>
+                if manifest_stop_markers
+                    .as_ref()
+                    .is_some_and(|markers| markers.iter().any(|marker| marker == "<|eot_id|>"))
+                    || manifest_stop_markers.is_none()
+                        && vocabulary.contains_key("<|start_header_id|>")
+                        && vocabulary.contains_key("<|eot_id|>") =>
             {
                 ChatStyle::Llama3
             }
@@ -314,7 +319,8 @@ impl Engine {
                 _ => {}
             }
         }
-        let stop_markers = stop_markers_for(&config.model_type);
+        let stop_markers =
+            manifest_stop_markers.unwrap_or_else(|| stop_markers_for(&config.model_type));
         for marker in &stop_markers {
             if let Some(id) = vocabulary.get(marker) {
                 eos_token_ids.insert(*id);
@@ -598,6 +604,52 @@ fn resolve_weight_files(path: &Path) -> Result<Vec<PathBuf>, String> {
         }
         return Ok(vec![path.to_path_buf()]);
     }
+    let manifest_path = path.join("cheetah_manifest.json");
+    if manifest_path.is_file() {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest_path)
+                .map_err(|error| format!("Failed to read {}: {error}", manifest_path.display()))?,
+        )
+        .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+        let shards = manifest
+            .get("shards")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Cheetah manifest is missing its shards list.".to_string())?;
+        let mut files = HashSet::new();
+        for shard in shards {
+            let file = shard
+                .get("file")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "Cheetah manifest contains a shard without a file path.".to_string()
+                })?;
+            let relative = Path::new(file);
+            if relative.as_os_str().is_empty()
+                || !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                || relative.extension().and_then(|ext| ext.to_str()) != Some("safetensors")
+            {
+                return Err(format!(
+                    "Cheetah manifest contains an unsafe or unsupported shard path: {file}"
+                ));
+            }
+            let shard_path = path.join(relative);
+            if !shard_path.is_file() {
+                return Err(format!(
+                    "Cheetah manifest shard does not exist: {}",
+                    shard_path.display()
+                ));
+            }
+            files.insert(shard_path);
+        }
+        let mut paths: Vec<_> = files.into_iter().collect();
+        paths.sort();
+        if paths.is_empty() {
+            return Err("Cheetah manifest contains no weight shards.".into());
+        }
+        return Ok(paths);
+    }
     let index_path = path.join("model.safetensors.index.json");
     if index_path.is_file() {
         let index: serde_json::Value = serde_json::from_slice(
@@ -631,6 +683,31 @@ fn resolve_weight_files(path: &Path) -> Result<Vec<PathBuf>, String> {
         "No model.safetensors or model.safetensors.index.json found in '{}'.",
         path.display()
     ))
+}
+
+fn read_manifest_stop_markers(model_dir: &Path) -> Result<Option<Vec<String>>, String> {
+    let path = model_dir.join("cheetah_manifest.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+    let markers = manifest
+        .get("stop_markers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Cheetah manifest is missing its stop_markers list.".to_string())?;
+    markers
+        .iter()
+        .map(|marker| {
+            marker
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "Cheetah manifest contains a non-string stop marker.".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn render_chat_prompt(messages: &[ChatMessage], system: Option<&str>, style: ChatStyle) -> String {
@@ -977,6 +1054,60 @@ fn choose_device() -> Result<Device, String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cheetah_{name}_{}_{}", std::process::id(), nonce));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolves_safetensors_from_cheetah_manifest() {
+        let directory = temporary_directory("manifest_weights");
+        let weights = directory.join(".cheetah/weights");
+        fs::create_dir_all(&weights).unwrap();
+        fs::write(weights.join("layer_0.safetensors"), []).unwrap();
+        fs::write(weights.join("layer_1.safetensors"), []).unwrap();
+        fs::write(directory.join("model.safetensors"), []).unwrap();
+        fs::write(
+            directory.join("cheetah_manifest.json"),
+            r#"{"stop_markers":["<|eot_id|>"],"shards":[{"file":".cheetah/weights/layer_1.safetensors"},{"file":".cheetah/weights/layer_0.safetensors"}]}"#,
+        )
+        .unwrap();
+
+        let files = resolve_weight_files(&directory).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                weights.join("layer_0.safetensors"),
+                weights.join("layer_1.safetensors")
+            ]
+        );
+        assert_eq!(
+            read_manifest_stop_markers(&directory).unwrap(),
+            Some(vec!["<|eot_id|>".to_string()])
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_manifest_shard_paths() {
+        let directory = temporary_directory("unsafe_manifest");
+        fs::write(
+            directory.join("cheetah_manifest.json"),
+            r#"{"shards":[{"file":"../outside.safetensors"}]}"#,
+        )
+        .unwrap();
+
+        let error = resolve_weight_files(&directory).unwrap_err();
+        assert!(error.contains("unsafe or unsupported shard path"));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn renders_qwen_chatml_prompt_with_system_message() {

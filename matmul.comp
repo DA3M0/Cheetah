@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer MatrixA {
+    float values[];
+} a;
+
+layout(set = 0, binding = 1, std430) readonly buffer MatrixB {
+    float values[];
+} b;
+
+layout(set = 0, binding = 2, std430) writeonly buffer MatrixC {
+    float values[];
+} c;
+
+layout(push_constant) uniform Dimensions {
+    uint m;
+    uint k;
+    uint n;
+} dimensions;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint column = gl_GlobalInvocationID.x;
+    if (row >= dimensions.m || column >= dimensions.n) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint index = 0; index < dimensions.k; ++index) {
+        sum += a.values[row * dimensions.k + index] *
+               b.values[index * dimensions.n + column];
+    }
+    c.values[row * dimensions.n + column] = sum;
+}

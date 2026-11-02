@@ -47,6 +47,9 @@ pub fn inspect_model(path: &Path) -> Result<ModelInfo, String> {
             .checked_add(mmap.len() as u64)
             .ok_or_else(|| "Model file size exceeds the supported range.".to_string())?;
         for (name, tensor) in safetensors.tensors() {
+            if name.starts_with("__cheetah_padding_") {
+                continue;
+            }
             tensors.push(TensorInfo {
                 name,
                 shape: tensor
@@ -83,6 +86,54 @@ fn model_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     }
     if !path.is_dir() {
         return Err(format!("Model path does not exist: {}", path.display()));
+    }
+    let manifest = path.join("cheetah_manifest.json");
+    if manifest.is_file() {
+        let manifest_data = std::fs::read(&manifest)
+            .map_err(|error| format!("Failed to read {}: {error}", manifest.display()))?;
+        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_data)
+            .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+        let shards = manifest_value
+            .get("shards")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Cheetah manifest is missing its shards list.".to_string())?;
+        let mut files = Vec::new();
+        for shard in shards {
+            let file = shard
+                .get("file")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "Cheetah manifest contains a shard without a file path.".to_string()
+                })?;
+            let relative = Path::new(file);
+            if relative.as_os_str().is_empty()
+                || !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                || relative
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("safetensors")
+            {
+                return Err(format!(
+                    "Cheetah manifest contains an unsafe or unsupported shard path: {file}"
+                ));
+            }
+            let shard_path = path.join(relative);
+            if !shard_path.is_file() {
+                return Err(format!(
+                    "Cheetah manifest shard does not exist: {}",
+                    shard_path.display()
+                ));
+            }
+            files.push(shard_path);
+        }
+        files.sort();
+        files.dedup();
+        if files.is_empty() {
+            return Err("Cheetah manifest contains no weight shards.".into());
+        }
+        return Ok(files);
     }
     let index = path.join("model.safetensors.index.json");
     if index.is_file() {
@@ -176,6 +227,25 @@ mod tests {
     }
 
     #[test]
+    fn hides_internal_aligned_shard_padding_tensors() {
+        let path = std::env::temp_dir().join(format!(
+            "cheetah-padding-{}-{}.safetensors",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let data = safetensors_file(
+            r#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"__cheetah_padding_000000":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}}"#,
+            &[0; 8],
+        );
+        std::fs::write(&path, data).unwrap();
+
+        let info = inspect_model(&path).unwrap();
+        assert_eq!(info.tensors.len(), 1);
+        assert_eq!(info.tensors[0].name, "weight");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_safetensors_files() {
         let path = std::env::temp_dir().join(format!(
             "cheetah-invalid-{}-{}.safetensors",
@@ -189,5 +259,32 @@ mod tests {
                 .contains("Invalid Safetensors")
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resolves_manifest_shards_for_inspection() {
+        let directory = std::env::temp_dir().join(format!(
+            "cheetah-inspect-manifest-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let weights = directory.join(".cheetah/weights");
+        std::fs::create_dir_all(&weights).unwrap();
+        std::fs::write(weights.join("layer_0.safetensors"), []).unwrap();
+        std::fs::write(weights.join("layer_1.safetensors"), []).unwrap();
+        std::fs::write(
+            directory.join("cheetah_manifest.json"),
+            r#"{"shards":[{"file":".cheetah/weights/layer_1.safetensors"},{"file":".cheetah/weights/layer_0.safetensors"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model_files(&directory).unwrap(),
+            vec![
+                weights.join("layer_0.safetensors"),
+                weights.join("layer_1.safetensors")
+            ]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

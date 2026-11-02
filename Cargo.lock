@@ -329,6 +329,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "cc",
  "ctrlc",
  "half",
  "memmap2",

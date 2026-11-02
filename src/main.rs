@@ -7,6 +7,7 @@ mod inspect;
 mod options;
 mod serve;
 
+use cheetah::native;
 use cli::{ContextCommand, RunError};
 use context::{ContextArchive, ContextStore};
 use inspect::ModelInfo;
@@ -47,6 +48,7 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             Ok(())
         }
         "load" | "inspect" => run_inspect_command(&args[1..]),
+        "init" | "prepare" => run_init_command(&args[1..]),
         "chat" => {
             let (path, options, context_options) = cli::parse_chat_args(&args[1..])?;
             run_chat(&path, options, context_options)
@@ -67,6 +69,17 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             "Unknown command '{other}'. Run `cheetah help` for usage."
         ))),
     }
+}
+
+fn run_init_command(args: &[String]) -> Result<(), RunError> {
+    if args.len() != 2 || args.iter().any(String::is_empty) {
+        return Err(RunError::usage(
+            "Usage: cheetah init <source-dir> <destination-dir>",
+        ));
+    }
+    runtime(native::init_model(Path::new(&args[0]), Path::new(&args[1])))?;
+    println!("Model prepared in '{}'.", args[1]);
+    Ok(())
 }
 
 fn run_inspect_command(args: &[String]) -> Result<(), RunError> {
@@ -155,6 +168,8 @@ Usage:\n\
   cheetah serve <name-or-path> [options]    Run an OpenAI-compatible API server\n\
   cheetah inspect <model-path> [options]    Inspect Safetensors weights\n\
   cheetah load <model-path> [options]       Compatibility alias for inspect\n\
+  cheetah init <source-dir> <destination-dir>  Prepare aligned static model shards\n\
+  cheetah prepare <source-dir> <destination-dir>  Alias for init\n\
   cheetah context list [--context-dir <path>]  List saved contexts\n\
   cheetah context delete <name> [--context-dir <path>]  Delete a context\n\
   cheetah formats                           List supported formats\n\
@@ -205,6 +220,7 @@ Examples:\n\
   cheetah serve /home/user/models/qwen-0.5b --port 8080 --api-key secret\n\
   cheetah inspect /home/user/models/qwen-0.5b\n\
   cheetah inspect ./model.safetensors --json\n\
+  cheetah init ./hf-model ./prepared-model\n\
   CHEETAH_DEVICE=cuda cheetah /home/user/models/qwen-0.5b\n\
 \n\
 Set CHEETAH_DEVICE to cpu (default), cuda, or metal; GPU choices require the matching build feature.\n\

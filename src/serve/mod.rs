@@ -210,7 +210,8 @@ fn is_model_directory(path: &Path) -> bool {
     path.join("config.json").is_file()
         && path.join("tokenizer.json").is_file()
         && (path.join("model.safetensors").is_file()
-            || path.join("model.safetensors.index.json").is_file())
+            || path.join("model.safetensors.index.json").is_file()
+            || path.join("cheetah_manifest.json").is_file())
 }
 
 fn list_safetensors_models(dir: &Path) -> String {
@@ -364,6 +365,26 @@ mod tests {
         let (resolved, id) = resolve_model(&options).unwrap();
         assert_eq!(resolved, model);
         assert_eq!(id, "qwen-0.5b");
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn resolve_model_directory_with_cheetah_manifest() {
+        let temp = std::env::temp_dir().join("cheetah_test_resolve_manifest");
+        let model = temp.join("prepared-model");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("config.json"), b"{}").unwrap();
+        std::fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(model.join("cheetah_manifest.json"), b"{}").unwrap();
+
+        let options = ServeOptions {
+            model: "prepared-model".to_string(),
+            model_dir: temp.clone(),
+            ..Default::default()
+        };
+        let (resolved, id) = resolve_model(&options).unwrap();
+        assert_eq!(resolved, model);
+        assert_eq!(id, "prepared-model");
         std::fs::remove_dir_all(&temp).unwrap();
     }
 
