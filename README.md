@@ -35,9 +35,12 @@ The output directory is generated model data: initialization replaces its unshar
 Pass a Hugging Face model directory containing `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` plus its shard files:
 
 ```sh
+cd /home/benny/models/qwen-0.5b && cheetah
 cargo run -- /home/benny/models/qwen-0.5b
 cargo run -- /home/benny/models/qwen-0.5b --max-tokens 128 --temperature 0
 ```
+
+When Cheetah is launched without arguments, it loads the model from the current directory and starts an interactive chat.
 
 The CLI also accepts a direct `.safetensors` path when its config and tokenizer files are in the same directory. Chat supports multi-turn conversations, `/exit`, `/clear`, `/save <name>`, and named context restore with `--context <name>`. Context archives are stored under the platform's Cheetah application-data directory; override it with `--context-dir <path>`.
 

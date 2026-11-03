@@ -30,8 +30,11 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
     // Dispatch the first argument to a subcommand, while preserving the legacy bare-model chat form.
     // 将首个参数分派到子命令，同时保留直接传入模型路径启动聊天的旧用法。
     let Some(command) = args.first().map(String::as_str) else {
-        print_help();
-        return Ok(());
+        return run_chat(
+            Path::new("."),
+            ChatOptions::default(),
+            cli::ContextCliOptions::default(),
+        );
     };
 
     match command {
@@ -163,6 +166,7 @@ fn print_help() {
         "cheetah - Local Candle/Safetensors inference and gateway\n\
 \n\
 Usage:\n\
+  cheetah                                  Load the model in the current directory and chat\n\
   cheetah <model-path>                      Load a model directory or Safetensors file and chat\n\
   cheetah chat <model-path>                 Same as above\n\
   cheetah serve <name-or-path> [options]    Run an OpenAI-compatible API server\n\
@@ -212,6 +216,7 @@ Server API endpoints:\n\
   GET  /health                 Health check (no authentication required)\n\
 \n\
 Examples:\n\
+  cd /home/user/models/qwen-0.5b && cheetah\n\
   cheetah /home/user/models/qwen-0.5b --threads 8 --max-tokens 128\n\
   cheetah /home/user/models/qwen-0.5b --temperature 0.7 --top-k 50 --seed 42\n\
   cheetah /home/user/models/qwen-0.5b --system \"You are a concise assistant.\"\n\
@@ -369,5 +374,11 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new report\n");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn no_arguments_launches_chat_from_the_current_directory() {
+        let error = run(Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("config.json"));
     }
 }
