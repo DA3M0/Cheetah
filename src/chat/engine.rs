@@ -89,6 +89,8 @@ impl ChatParams {
 #[derive(Clone)]
 enum CausalModel {
     Qwen2(qwen2::Model),
+    #[cfg(feature = "vulkan")]
+    VulkanQwen2(super::vulkan_qwen::VulkanQwenModel),
     Gemma(gemma::Model),
     Llama(llama::Llama, llama::Cache),
     Phi(phi::Model),
@@ -104,18 +106,28 @@ enum ChatStyle {
 }
 
 impl CausalModel {
-    fn forward(&mut self, input: &Tensor, offset: usize) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
         match self {
-            Self::Qwen2(model) => model.forward(input, offset),
-            Self::Gemma(model) => model.forward(input, offset),
-            Self::Llama(model, cache) => model.forward(input, offset, cache),
-            Self::Phi(model) => model.forward(input),
+            Self::Qwen2(model) => model
+                .forward(input, offset)
+                .map_err(|error| error.to_string()),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQwen2(model) => model.forward(input, offset),
+            Self::Gemma(model) => model
+                .forward(input, offset)
+                .map_err(|error| error.to_string()),
+            Self::Llama(model, cache) => model
+                .forward(input, offset, cache)
+                .map_err(|error| error.to_string()),
+            Self::Phi(model) => model.forward(input).map_err(|error| error.to_string()),
         }
     }
 
     fn clear_cache(&mut self) {
         match self {
             Self::Qwen2(model) => model.clear_kv_cache(),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanQwen2(model) => model.clear_cache(),
             Self::Gemma(model) => model.clear_kv_cache(),
             Self::Llama(_, _) => {}
             Self::Phi(model) => model.clear_kv_cache(),
@@ -243,64 +255,8 @@ impl Engine {
             _ => ChatStyle::Qwen,
         };
         let weight_paths = resolve_weight_files(path)?;
-        let device = choose_device()?;
-        // CPU F32 is the portable baseline; Candle converts checkpoint dtypes as tensors load.
-        let mut vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &device) }
-                .map_err(|error| format!("Failed to map Safetensors weights: {error}"))?;
-        if raw_config
-            .get("tie_word_embeddings")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-            && !vb.contains_tensor("lm_head.weight")
-        {
-            vb = VarBuilder::new_with_args(
-                Box::new(TiedEmbeddingBackend { source: vb }),
-                DType::F32,
-                &device,
-            );
-        }
-        let model = match architecture {
-            "Qwen2ForCausalLM" | "qwen2" => {
-                let config: qwen2::Config = serde_json::from_value(raw_config)
-                    .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
-                CausalModel::Qwen2(
-                    qwen2::Model::new(&config, vb)
-                        .map_err(|error| format!("Failed to load Qwen2 weights: {error}"))?,
-                )
-            }
-            "GemmaForCausalLM" | "gemma" => {
-                let config: gemma::Config = serde_json::from_slice(&config_bytes)
-                    .map_err(|error| format!("Invalid Gemma configuration: {error}"))?;
-                CausalModel::Gemma(
-                    gemma::Model::new(&config, vb)
-                        .map_err(|error| format!("Failed to load Gemma weights: {error}"))?,
-                )
-            }
-            "LlamaForCausalLM" | "llama" => {
-                let raw: llama::LlamaConfig = serde_json::from_slice(&config_bytes)
-                    .map_err(|error| format!("Invalid Llama configuration: {error}"))?;
-                let config = raw.into_config(false);
-                let model = llama::Llama::load(vb, &config)
-                    .map_err(|error| format!("Failed to load Llama weights: {error}"))?;
-                let cache = llama::Cache::new(true, DType::F32, &config, &device)
-                    .map_err(|error| format!("Failed to initialize Llama KV cache: {error}"))?;
-                CausalModel::Llama(model, cache)
-            }
-            "PhiForCausalLM" | "phi" => {
-                let config: phi::Config = serde_json::from_slice(&config_bytes)
-                    .map_err(|error| format!("Invalid Phi configuration: {error}"))?;
-                CausalModel::Phi(
-                    phi::Model::new(&config, vb)
-                        .map_err(|error| format!("Failed to load Phi weights: {error}"))?,
-                )
-            }
-            other => {
-                return Err(format!(
-                    "Unsupported model architecture '{other}'. Supported architectures: Qwen2, Gemma, Llama, and Phi."
-                ));
-            }
-        };
+        let (device, model) =
+            load_model_backend(&weight_paths, &config_bytes, raw_config, architecture)?;
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {
             match value {
@@ -356,6 +312,10 @@ impl Engine {
             .model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(feature = "vulkan")]
+        if matches!(&loaded.model, CausalModel::VulkanQwen2(_)) {
+            return "Vulkan";
+        }
         match &loaded.device {
             Device::Cpu => "CPU",
             Device::Cuda(_) => "CUDA",
@@ -1015,6 +975,137 @@ fn chat_loop(
                 return Err(error);
             }
         }
+    }
+}
+
+fn load_model_backend(
+    weight_paths: &[PathBuf],
+    config_bytes: &[u8],
+    raw_config: serde_json::Value,
+    architecture: &str,
+) -> Result<(Device, CausalModel), String> {
+    let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
+    if selected == "vulkan" {
+        #[cfg(feature = "vulkan")]
+        {
+            if matches!(architecture, "Qwen2ForCausalLM" | "qwen2") {
+                let vulkan_model = (|| {
+                    cheetah::native::vulkan::initialize()?;
+                    cheetah::native::vulkan::prepare()?;
+                    let qwen_config = serde_json::from_value(raw_config.clone())
+                        .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
+                    super::vulkan_qwen::VulkanQwenModel::load(weight_paths, &qwen_config)
+                })();
+                match vulkan_model {
+                    Ok(model) => return Ok((Device::Cpu, CausalModel::VulkanQwen2(model))),
+                    Err(error) => {
+                        if let Err(shutdown_error) = cheetah::native::vulkan::shutdown() {
+                            eprintln!(
+                                "cheetah: Vulkan cleanup after startup failure also failed ({shutdown_error})."
+                            );
+                        }
+                        eprintln!(
+                            "cheetah: Vulkan Qwen2 unavailable ({error}); falling back to CPU."
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "cheetah: Vulkan inference currently supports dense Qwen2 only, not '{architecture}'; falling back to CPU."
+                );
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        eprintln!(
+            "cheetah: Vulkan support was not compiled; falling back to CPU. Rebuild with --features vulkan."
+        );
+        return load_candle_model(weight_paths, config_bytes, raw_config, architecture);
+    }
+
+    let device = choose_device()?;
+    let model = load_candle_model_on_device(
+        weight_paths,
+        config_bytes,
+        raw_config,
+        architecture,
+        &device,
+    )?;
+    Ok((device, model))
+}
+
+fn load_candle_model(
+    weight_paths: &[PathBuf],
+    config_bytes: &[u8],
+    raw_config: serde_json::Value,
+    architecture: &str,
+) -> Result<(Device, CausalModel), String> {
+    let device = Device::Cpu;
+    let model = load_candle_model_on_device(
+        weight_paths,
+        config_bytes,
+        raw_config,
+        architecture,
+        &device,
+    )?;
+    Ok((device, model))
+}
+
+fn load_candle_model_on_device(
+    weight_paths: &[PathBuf],
+    config_bytes: &[u8],
+    raw_config: serde_json::Value,
+    architecture: &str,
+    device: &Device,
+) -> Result<CausalModel, String> {
+    let mut vb = unsafe { VarBuilder::from_mmaped_safetensors(weight_paths, DType::F32, device) }
+        .map_err(|error| format!("Failed to map Safetensors weights: {error}"))?;
+    if raw_config
+        .get("tie_word_embeddings")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && !vb.contains_tensor("lm_head.weight")
+    {
+        vb = VarBuilder::new_with_args(
+            Box::new(TiedEmbeddingBackend { source: vb }),
+            DType::F32,
+            device,
+        );
+    }
+    match architecture {
+        "Qwen2ForCausalLM" | "qwen2" => {
+            let config: qwen2::Config = serde_json::from_value(raw_config)
+                .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
+            qwen2::Model::new(&config, vb)
+                .map(CausalModel::Qwen2)
+                .map_err(|error| format!("Failed to load Qwen2 weights: {error}"))
+        }
+        "GemmaForCausalLM" | "gemma" => {
+            let config: gemma::Config = serde_json::from_slice(config_bytes)
+                .map_err(|error| format!("Invalid Gemma configuration: {error}"))?;
+            gemma::Model::new(&config, vb)
+                .map(CausalModel::Gemma)
+                .map_err(|error| format!("Failed to load Gemma weights: {error}"))
+        }
+        "LlamaForCausalLM" | "llama" => {
+            let raw: llama::LlamaConfig = serde_json::from_slice(config_bytes)
+                .map_err(|error| format!("Invalid Llama configuration: {error}"))?;
+            let config = raw.into_config(false);
+            let model = llama::Llama::load(vb, &config)
+                .map_err(|error| format!("Failed to load Llama weights: {error}"))?;
+            let cache = llama::Cache::new(true, DType::F32, &config, device)
+                .map_err(|error| format!("Failed to initialize Llama KV cache: {error}"))?;
+            Ok(CausalModel::Llama(model, cache))
+        }
+        "PhiForCausalLM" | "phi" => {
+            let config: phi::Config = serde_json::from_slice(config_bytes)
+                .map_err(|error| format!("Invalid Phi configuration: {error}"))?;
+            phi::Model::new(&config, vb)
+                .map(CausalModel::Phi)
+                .map_err(|error| format!("Failed to load Phi weights: {error}"))
+        }
+        other => Err(format!(
+            "Unsupported model architecture '{other}'. Supported architectures: Qwen2, Gemma, Llama, and Phi."
+        )),
     }
 }
 

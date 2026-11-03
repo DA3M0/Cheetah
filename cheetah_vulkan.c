@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +14,15 @@
 #define CHEETAH_POOL_ENV "CHEETAH_VRAM_POOL_SIZE"
 #define CHEETAH_POOL_ALIGNMENT ((VkDeviceSize)4096)
 #define CHEETAH_SPIRV_MAGIC UINT32_C(0x07230203)
+#ifndef CHEETAH_DEFAULT_MATMUL_SPV
+#define CHEETAH_DEFAULT_MATMUL_SPV "matmul.spv"
+#endif
+#ifndef CHEETAH_DEFAULT_MATMUL_BF16_SPV
+#define CHEETAH_DEFAULT_MATMUL_BF16_SPV "matmul_bf16.spv"
+#endif
+#ifndef CHEETAH_DEFAULT_QWEN_OPS_SPV
+#define CHEETAH_DEFAULT_QWEN_OPS_SPV "qwen_ops.spv"
+#endif
 
 typedef struct FreeBlock {
     VkDeviceSize offset;
@@ -54,8 +64,13 @@ static atomic_flag g_matmul_lock = ATOMIC_FLAG_INIT;
 static VkDescriptorSetLayout g_matmul_descriptor_layout = VK_NULL_HANDLE;
 static VkPipelineLayout g_matmul_pipeline_layout = VK_NULL_HANDLE;
 static VkPipeline g_matmul_pipeline = VK_NULL_HANDLE;
+static VkPipeline g_matmul_bf16_pipeline = VK_NULL_HANDLE;
+static VkDescriptorSetLayout g_qwen_descriptor_layout = VK_NULL_HANDLE;
+static VkPipelineLayout g_qwen_pipeline_layout = VK_NULL_HANDLE;
+static VkPipeline g_qwen_pipeline = VK_NULL_HANDLE;
 
 static void destroy_matmul_pipeline(void);
+static int matrix_byte_size(int rows, int columns, size_t *bytes_out);
 
 static const char *vk_result_name(VkResult result) {
     switch (result) {
@@ -815,6 +830,12 @@ static void destroy_matmul_pipeline(void) {
         if (g_matmul_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(g_vulkan.device, g_matmul_pipeline, NULL);
         }
+        if (g_matmul_bf16_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g_vulkan.device, g_matmul_bf16_pipeline, NULL);
+        }
+        if (g_qwen_pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(g_vulkan.device, g_qwen_pipeline, NULL);
+        }
         if (g_matmul_pipeline_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(g_vulkan.device,
                                     g_matmul_pipeline_layout, NULL);
@@ -823,79 +844,497 @@ static void destroy_matmul_pipeline(void) {
             vkDestroyDescriptorSetLayout(g_vulkan.device,
                                          g_matmul_descriptor_layout, NULL);
         }
+        if (g_qwen_pipeline_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(g_vulkan.device, g_qwen_pipeline_layout,
+                                    NULL);
+        }
+        if (g_qwen_descriptor_layout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(g_vulkan.device,
+                                         g_qwen_descriptor_layout, NULL);
+        }
     }
     g_matmul_pipeline = VK_NULL_HANDLE;
+    g_matmul_bf16_pipeline = VK_NULL_HANDLE;
     g_matmul_pipeline_layout = VK_NULL_HANDLE;
     g_matmul_descriptor_layout = VK_NULL_HANDLE;
+    g_qwen_pipeline = VK_NULL_HANDLE;
+    g_qwen_pipeline_layout = VK_NULL_HANDLE;
+    g_qwen_descriptor_layout = VK_NULL_HANDLE;
 }
 
-static int ensure_matmul_pipeline(void) {
+static int ensure_matmul_pipeline(int bfloat16_weights) {
     VkDescriptorSetLayoutBinding bindings[3];
     VkDescriptorSetLayoutCreateInfo descriptor_layout_info;
     VkPushConstantRange push_constant;
     VkPipelineLayoutCreateInfo pipeline_layout_info;
     VkShaderModule shader = VK_NULL_HANDLE;
     VkResult result;
-    const char *shader_path = getenv("CHEETAH_MATMUL_SPV");
+    VkPipeline *pipeline = bfloat16_weights ? &g_matmul_bf16_pipeline
+                                            : &g_matmul_pipeline;
+    const char *shader_path = getenv(bfloat16_weights
+                                         ? "CHEETAH_MATMUL_BF16_SPV"
+                                         : "CHEETAH_MATMUL_SPV");
 
-    if (g_matmul_pipeline != VK_NULL_HANDLE) {
+    if (*pipeline != VK_NULL_HANDLE) {
         return 0;
     }
     if (shader_path == NULL || shader_path[0] == '\0') {
-        shader_path = "matmul.spv";
+        shader_path = bfloat16_weights ? CHEETAH_DEFAULT_MATMUL_BF16_SPV
+                                       : CHEETAH_DEFAULT_MATMUL_SPV;
     }
-    memset(bindings, 0, sizeof(bindings));
-    for (uint32_t i = 0; i < 3; ++i) {
-        bindings[i].binding = i;
-        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    if (g_matmul_descriptor_layout == VK_NULL_HANDLE) {
+        memset(bindings, 0, sizeof(bindings));
+        for (uint32_t i = 0; i < 3; ++i) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        memset(&descriptor_layout_info, 0, sizeof(descriptor_layout_info));
+        descriptor_layout_info.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        descriptor_layout_info.bindingCount = 3;
+        descriptor_layout_info.pBindings = bindings;
+        result = vkCreateDescriptorSetLayout(g_vulkan.device,
+                                              &descriptor_layout_info, NULL,
+                                              &g_matmul_descriptor_layout);
+        if (check_vk_result(result, "vkCreateDescriptorSetLayout(matmul)") != 0) {
+            return -1;
+        }
     }
-    memset(&descriptor_layout_info, 0, sizeof(descriptor_layout_info));
-    descriptor_layout_info.sType =
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptor_layout_info.bindingCount = 3;
-    descriptor_layout_info.pBindings = bindings;
-    result = vkCreateDescriptorSetLayout(g_vulkan.device,
-                                         &descriptor_layout_info, NULL,
-                                         &g_matmul_descriptor_layout);
-    if (check_vk_result(result, "vkCreateDescriptorSetLayout(matmul)") != 0) {
-        destroy_matmul_pipeline();
-        return -1;
+    if (g_matmul_pipeline_layout == VK_NULL_HANDLE) {
+        memset(&push_constant, 0, sizeof(push_constant));
+        push_constant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_constant.offset = 0;
+            push_constant.size = 4 * sizeof(uint32_t);
+        memset(&pipeline_layout_info, 0, sizeof(pipeline_layout_info));
+        pipeline_layout_info.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.setLayoutCount = 1;
+        pipeline_layout_info.pSetLayouts = &g_matmul_descriptor_layout;
+        pipeline_layout_info.pushConstantRangeCount = 1;
+        pipeline_layout_info.pPushConstantRanges = &push_constant;
+        result = vkCreatePipelineLayout(g_vulkan.device, &pipeline_layout_info,
+                                        NULL, &g_matmul_pipeline_layout);
+        if (check_vk_result(result, "vkCreatePipelineLayout(matmul)") != 0) {
+            return -1;
+        }
     }
-
-    memset(&push_constant, 0, sizeof(push_constant));
-    push_constant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    push_constant.offset = 0;
-    push_constant.size = 3 * sizeof(uint32_t);
-    memset(&pipeline_layout_info, 0, sizeof(pipeline_layout_info));
-    pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeline_layout_info.setLayoutCount = 1;
-    pipeline_layout_info.pSetLayouts = &g_matmul_descriptor_layout;
-    pipeline_layout_info.pushConstantRangeCount = 1;
-    pipeline_layout_info.pPushConstantRanges = &push_constant;
-    result = vkCreatePipelineLayout(g_vulkan.device, &pipeline_layout_info,
-                                    NULL, &g_matmul_pipeline_layout);
-    if (check_vk_result(result, "vkCreatePipelineLayout(matmul)") != 0) {
-        destroy_matmul_pipeline();
-        return -1;
-    }
-
     shader = vk_load_spirv_shader(shader_path);
     if (shader == VK_NULL_HANDLE) {
-        fprintf(stderr, "cheetah-vulkan: unable to load matmul shader '%s'\n",
-                shader_path);
-        destroy_matmul_pipeline();
+        fprintf(stderr, "cheetah-vulkan: unable to load matmul shader '%s'\n", shader_path);
         return -1;
     }
-    g_matmul_pipeline =
-        vk_create_compute_pipeline(shader, g_matmul_pipeline_layout, "main");
+    *pipeline = vk_create_compute_pipeline(shader, g_matmul_pipeline_layout,
+                                          "main");
     vkDestroyShaderModule(g_vulkan.device, shader, NULL);
-    if (g_matmul_pipeline == VK_NULL_HANDLE) {
-        destroy_matmul_pipeline();
+    if (*pipeline == VK_NULL_HANDLE) {
         return -1;
     }
     return 0;
+}
+
+static int ensure_qwen_pipeline(void) {
+    VkDescriptorSetLayoutBinding bindings[5];
+    VkDescriptorSetLayoutCreateInfo descriptor_info;
+    VkPushConstantRange push_constant;
+    VkPipelineLayoutCreateInfo pipeline_info;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkResult result;
+    const char *shader_path = getenv("CHEETAH_QWEN_OPS_SPV");
+
+    if (g_qwen_pipeline != VK_NULL_HANDLE) return 0;
+    if (shader_path == NULL || shader_path[0] == '\0') {
+        shader_path = CHEETAH_DEFAULT_QWEN_OPS_SPV;
+    }
+    if (g_qwen_descriptor_layout == VK_NULL_HANDLE) {
+        memset(bindings, 0, sizeof(bindings));
+        for (uint32_t i = 0; i < 5; ++i) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        memset(&descriptor_info, 0, sizeof(descriptor_info));
+        descriptor_info.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        descriptor_info.bindingCount = 5;
+        descriptor_info.pBindings = bindings;
+        result = vkCreateDescriptorSetLayout(g_vulkan.device, &descriptor_info,
+                                              NULL, &g_qwen_descriptor_layout);
+        if (check_vk_result(result, "vkCreateDescriptorSetLayout(qwen)") != 0)
+            return -1;
+    }
+    if (g_qwen_pipeline_layout == VK_NULL_HANDLE) {
+        memset(&push_constant, 0, sizeof(push_constant));
+        push_constant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_constant.size = 8 * sizeof(uint32_t);
+        memset(&pipeline_info, 0, sizeof(pipeline_info));
+        pipeline_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_info.setLayoutCount = 1;
+        pipeline_info.pSetLayouts = &g_qwen_descriptor_layout;
+        pipeline_info.pushConstantRangeCount = 1;
+        pipeline_info.pPushConstantRanges = &push_constant;
+        result = vkCreatePipelineLayout(g_vulkan.device, &pipeline_info, NULL,
+                                        &g_qwen_pipeline_layout);
+        if (check_vk_result(result, "vkCreatePipelineLayout(qwen)") != 0)
+            return -1;
+    }
+    shader = vk_load_spirv_shader(shader_path);
+    if (shader == VK_NULL_HANDLE) {
+        fprintf(stderr, "cheetah-vulkan: unable to load Qwen ops shader '%s'\n",
+                shader_path);
+        return -1;
+    }
+    g_qwen_pipeline =
+        vk_create_compute_pipeline(shader, g_qwen_pipeline_layout, "main");
+    vkDestroyShaderModule(g_vulkan.device, shader, NULL);
+    return g_qwen_pipeline == VK_NULL_HANDLE ? -1 : 0;
+}
+
+int vk_qwen_prepare(void) {
+    int status;
+    if (!g_vulkan.initialized) {
+        report_error("Vulkan device is not initialized");
+        return -1;
+    }
+    matmul_lock();
+    status = ensure_qwen_pipeline();
+    matmul_unlock();
+    return status;
+}
+
+static int run_qwen_compute(const void *const sources[5],
+                            void *const destinations[5],
+                            const size_t byte_sizes[5],
+                            const uint32_t parameters[8],
+                            uint32_t group_count_x) {
+    void *device_buffers[5] = {NULL, NULL, NULL, NULL, NULL};
+    VkBuffer buffers[5];
+    VkDeviceSize offsets[5];
+    VkDeviceSize ranges[5];
+    VkDescriptorBufferInfo buffer_infos[5];
+    VkWriteDescriptorSet writes[5];
+    VkDescriptorPoolSize pool_size;
+    VkDescriptorPoolCreateInfo pool_info;
+    VkDescriptorSetAllocateInfo set_info;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo command_info;
+    VkCommandBufferBeginInfo begin_info;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkFenceCreateInfo fence_info;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSubmitInfo submit_info;
+    VkResult result;
+    int command_allocated = 0;
+    int submitted = 0;
+    int completed = 0;
+    int status = -1;
+    uint32_t i;
+
+    if (!g_vulkan.initialized || parameters == NULL || group_count_x == 0) {
+        report_error("invalid Qwen compute dispatch");
+        return -1;
+    }
+    if (group_count_x > g_vulkan.properties.limits.maxComputeWorkGroupCount[0]) {
+        report_error("Qwen dispatch exceeds maxComputeWorkGroupCount");
+        return -1;
+    }
+    matmul_lock();
+    if (ensure_qwen_pipeline() != 0) goto cleanup;
+    for (i = 0; i < 5; ++i) {
+        size_t allocation_size;
+        if (byte_sizes[i] > SIZE_MAX - 3) {
+            report_error("Qwen buffer size overflows size_t");
+            goto cleanup;
+        }
+        allocation_size = (byte_sizes[i] + 3U) & ~(size_t)3U;
+        if (allocation_size == 0) allocation_size = 4;
+        if ((VkDeviceSize)allocation_size >
+            g_vulkan.properties.limits.maxStorageBufferRange) {
+            report_error("Qwen tensor exceeds maxStorageBufferRange");
+            goto cleanup;
+        }
+        device_buffers[i] = vk_alloc_vram(allocation_size);
+        if (device_buffers[i] == NULL) goto cleanup;
+        if (sources[i] != NULL && byte_sizes[i] > 0) {
+            memcpy(device_buffers[i], sources[i], byte_sizes[i]);
+        } else {
+            memset(device_buffers[i], 0, allocation_size);
+        }
+        if (destinations[i] != NULL) {
+            memset(device_buffers[i], 0, allocation_size);
+        }
+        if (vk_get_vram_allocation(device_buffers[i], &buffers[i],
+                                   &offsets[i], &ranges[i]) != 0) {
+            goto cleanup;
+        }
+        buffer_infos[i].buffer = buffers[i];
+        buffer_infos[i].offset = offsets[i];
+        buffer_infos[i].range = ranges[i];
+    }
+    memset(&pool_size, 0, sizeof(pool_size));
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_size.descriptorCount = 5;
+    memset(&pool_info, 0, sizeof(pool_info));
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    result = vkCreateDescriptorPool(g_vulkan.device, &pool_info, NULL,
+                                    &descriptor_pool);
+    if (check_vk_result(result, "vkCreateDescriptorPool(qwen)") != 0)
+        goto cleanup;
+    memset(&set_info, 0, sizeof(set_info));
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = descriptor_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &g_qwen_descriptor_layout;
+    result = vkAllocateDescriptorSets(g_vulkan.device, &set_info,
+                                      &descriptor_set);
+    if (check_vk_result(result, "vkAllocateDescriptorSets(qwen)") != 0)
+        goto cleanup;
+    memset(writes, 0, sizeof(writes));
+    for (i = 0; i < 5; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptor_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(g_vulkan.device, 5, writes, 0, NULL);
+
+    memset(&command_info, 0, sizeof(command_info));
+    command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_info.commandPool = g_vulkan.command_pool;
+    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    result = vkAllocateCommandBuffers(g_vulkan.device, &command_info,
+                                      &command_buffer);
+    if (check_vk_result(result, "vkAllocateCommandBuffers(qwen)") != 0)
+        goto cleanup;
+    command_allocated = 1;
+    memset(&begin_info, 0, sizeof(begin_info));
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(command_buffer, &begin_info);
+    if (check_vk_result(result, "vkBeginCommandBuffer(qwen)") != 0)
+        goto cleanup;
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      g_qwen_pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            g_qwen_pipeline_layout, 0, 1, &descriptor_set,
+                            0, NULL);
+    vkCmdPushConstants(command_buffer, g_qwen_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       8 * sizeof(uint32_t), parameters);
+    vkCmdDispatch(command_buffer, group_count_x, 1, 1);
+    result = vkEndCommandBuffer(command_buffer);
+    if (check_vk_result(result, "vkEndCommandBuffer(qwen)") != 0)
+        goto cleanup;
+    memset(&fence_info, 0, sizeof(fence_info));
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(g_vulkan.device, &fence_info, NULL, &fence);
+    if (check_vk_result(result, "vkCreateFence(qwen)") != 0) goto cleanup;
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+    result = vkQueueSubmit(g_vulkan.compute_queue, 1, &submit_info, fence);
+    if (check_vk_result(result, "vkQueueSubmit(qwen)") != 0) goto cleanup;
+    submitted = 1;
+    result = vkWaitForFences(g_vulkan.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (check_vk_result(result, "vkWaitForFences(qwen)") != 0) goto cleanup;
+    completed = 1;
+    for (i = 0; i < 5; ++i) {
+        if (destinations[i] != NULL && byte_sizes[i] > 0) {
+            memcpy(destinations[i], device_buffers[i], byte_sizes[i]);
+        }
+    }
+    status = 0;
+
+cleanup:
+    if (fence != VK_NULL_HANDLE) vkDestroyFence(g_vulkan.device, fence, NULL);
+    if (command_allocated) {
+        if (submitted && !completed) {
+            VkResult idle_result = vkDeviceWaitIdle(g_vulkan.device);
+            (void)check_vk_result(idle_result, "vkDeviceWaitIdle(qwen cleanup)");
+        }
+        vkFreeCommandBuffers(g_vulkan.device, g_vulkan.command_pool, 1,
+                             &command_buffer);
+    }
+    if (descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(g_vulkan.device, descriptor_pool, NULL);
+    }
+    for (i = 0; i < 5; ++i) {
+        if (device_buffers[i] != NULL) vk_free_vram(device_buffers[i]);
+    }
+    matmul_unlock();
+    return status;
+}
+
+static uint32_t ceil_div_u32(uint32_t numerator, uint32_t denominator) {
+    return numerator / denominator + (numerator % denominator != 0);
+}
+
+static int tensor_element_count(uint32_t a, uint32_t b, uint32_t c,
+                               uint64_t *count_out) {
+    uint64_t count = a;
+    if (b != 0 && count > UINT64_MAX / b) return -1;
+    count *= b;
+    if (c != 0 && count > UINT64_MAX / c) return -1;
+    *count_out = count * c;
+    return 0;
+}
+
+int vk_qwen_rms_norm(const float *input, const void *weight,
+                     uint32_t weight_format, float *output, uint32_t rows,
+                     uint32_t width, float epsilon) {
+    const void *sources[5] = {input, weight, NULL, NULL, NULL};
+    void *destinations[5] = {NULL, NULL, output, NULL, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    size_t input_bytes;
+    size_t weight_element_size;
+    size_t weight_bytes;
+    if (input == NULL || weight == NULL || output == NULL ||
+        rows == 0 || width == 0 || rows > INT_MAX || width > INT_MAX ||
+        weight_format > 2 || !isfinite(epsilon) || epsilon < 0.0f ||
+        matrix_byte_size((int)rows, (int)width, &input_bytes) != 0) {
+        report_error("invalid arguments to vk_qwen_rms_norm");
+        return -1;
+    }
+    weight_element_size = weight_format == 0 ? sizeof(float) : sizeof(uint16_t);
+    if ((size_t)width > SIZE_MAX / weight_element_size) {
+        report_error("Qwen normalization weight size overflows size_t");
+        return -1;
+    }
+    weight_bytes = (size_t)width * weight_element_size;
+    sizes[0] = input_bytes;
+    sizes[1] = weight_bytes;
+    sizes[2] = input_bytes;
+    sizes[3] = 0;
+    sizes[4] = 0;
+    parameters[0] = 0;
+    parameters[1] = rows;
+    parameters[2] = width;
+    memcpy(&parameters[3], &epsilon, sizeof(epsilon));
+    parameters[4] = weight_format;
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32(rows, 64));
+}
+
+int vk_qwen_elementwise(const float *a, const float *b, float *output,
+                        size_t count, uint32_t operation) {
+    const void *sources[5] = {a, b, NULL, NULL, NULL};
+    void *destinations[5] = {NULL, NULL, output, NULL, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    size_t bytes;
+    if (a == NULL || b == NULL || output == NULL || count == 0 ||
+        (operation != 1 && operation != 2) ||
+        count > SIZE_MAX / sizeof(float)) {
+        report_error("invalid arguments to vk_qwen_elementwise");
+        return -1;
+    }
+    bytes = count * sizeof(float);
+    sizes[0] = sizes[1] = sizes[2] = bytes;
+    sizes[3] = sizes[4] = 0;
+    parameters[0] = operation;
+    if (count > UINT32_MAX) {
+        report_error("Qwen elementwise count exceeds 32-bit shader indexing");
+        return -1;
+    }
+    parameters[1] = (uint32_t)count;
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32((uint32_t)count, 64));
+}
+
+int vk_qwen_rotary(const float *query, const float *keys,
+                   float *query_output, float *key_output,
+                   uint32_t sequence, uint32_t offset,
+                   uint32_t query_heads, uint32_t kv_heads,
+                   uint32_t head_dim, float theta) {
+    const void *sources[5] = {query, keys, NULL, NULL, NULL};
+    void *destinations[5] = {NULL, NULL, query_output, key_output, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    uint64_t query_count;
+    uint64_t key_count;
+    if (query == NULL || keys == NULL || query_output == NULL ||
+        key_output == NULL || sequence == 0 || query_heads == 0 ||
+        kv_heads == 0 || head_dim == 0 ||
+        query_heads % kv_heads != 0 || (head_dim & 1U) != 0 ||
+        !isfinite(theta) || theta <= 0.0f) {
+        report_error("invalid arguments to vk_qwen_rotary");
+        return -1;
+    }
+    if (tensor_element_count(sequence, query_heads, head_dim, &query_count) != 0 ||
+        tensor_element_count(sequence, kv_heads, head_dim, &key_count) != 0 ||
+        query_count > SIZE_MAX / sizeof(float) ||
+        key_count > SIZE_MAX / sizeof(float) ||
+        query_count > UINT32_MAX ||
+        key_count > UINT32_MAX - query_count) {
+        report_error("Qwen rotary tensor exceeds supported shader indexing");
+        return -1;
+    }
+    sizes[0] = sizes[2] = (size_t)query_count * sizeof(float);
+    sizes[1] = sizes[3] = (size_t)key_count * sizeof(float);
+    sizes[4] = 0;
+    parameters[0] = 3;
+    parameters[1] = sequence;
+    parameters[2] = offset;
+    parameters[3] = query_heads;
+    parameters[4] = kv_heads;
+    parameters[5] = head_dim;
+    memcpy(&parameters[6], &theta, sizeof(theta));
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32((uint32_t)(query_count + key_count), 64));
+}
+
+int vk_qwen_attention(const float *query, const float *keys,
+                      const float *values, float *output,
+                      uint32_t sequence, uint32_t offset,
+                      uint32_t cache_len, uint32_t query_heads,
+                      uint32_t kv_heads, uint32_t head_dim,
+                      uint32_t sliding_window) {
+    const void *sources[5] = {query, keys, NULL, NULL, values};
+    void *destinations[5] = {NULL, NULL, NULL, output, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    uint64_t query_count;
+    uint64_t kv_count;
+    if (query == NULL || keys == NULL || values == NULL || output == NULL ||
+        sequence == 0 || query_heads == 0 || kv_heads == 0 || head_dim == 0 ||
+        query_heads % kv_heads != 0 || offset > UINT32_MAX - sequence ||
+        cache_len < offset + sequence) {
+        report_error("invalid arguments to vk_qwen_attention");
+        return -1;
+    }
+    if (tensor_element_count(sequence, query_heads, head_dim, &query_count) != 0 ||
+        tensor_element_count(cache_len, kv_heads, head_dim, &kv_count) != 0 ||
+        query_count > UINT32_MAX || kv_count > UINT32_MAX ||
+        query_count > SIZE_MAX / sizeof(float) ||
+        kv_count > SIZE_MAX / sizeof(float) ||
+        (uint64_t)sequence * query_heads > UINT32_MAX) {
+        report_error("Qwen attention tensor exceeds supported shader indexing");
+        return -1;
+    }
+    sizes[0] = sizes[3] = (size_t)query_count * sizeof(float);
+    sizes[1] = sizes[4] = (size_t)kv_count * sizeof(float);
+    sizes[2] = 0;
+    parameters[0] = 4;
+    parameters[1] = sequence;
+    parameters[2] = offset;
+    parameters[3] = cache_len;
+    parameters[4] = query_heads;
+    parameters[5] = kv_heads;
+    parameters[6] = head_dim;
+    parameters[7] = sliding_window;
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32(sequence * query_heads, 64));
 }
 
 static int matrix_byte_size(int rows, int columns, size_t *bytes_out) {
@@ -915,8 +1354,9 @@ static int matrix_byte_size(int rows, int columns, size_t *bytes_out) {
     return 0;
 }
 
-int vk_matmul_checked(const float *a, const float *b, float *c,
-                      int m, int k, int n) {
+static int vk_matmul_impl(const float *a, const void *b, float *c,
+                          int m, int k, int n, int weight_format,
+                          int transpose_b) {
     void *device_a = NULL;
     void *device_b = NULL;
     void *device_c = NULL;
@@ -942,7 +1382,7 @@ int vk_matmul_checked(const float *a, const float *b, float *c,
     VkCommandBufferBeginInfo command_begin_info;
     VkFenceCreateInfo fence_info;
     VkSubmitInfo submit_info;
-    uint32_t dimensions[3];
+    uint32_t dimensions[4];
     uint32_t groups_x;
     uint32_t groups_y;
     size_t bytes_a;
@@ -967,8 +1407,19 @@ int vk_matmul_checked(const float *a, const float *b, float *c,
         matrix_byte_size(m, n, &bytes_c) != 0) {
         return -1;
     }
+    if (weight_format != 0) {
+        bytes_b /= 2;
+        if ((bytes_b & 3U) != 0) {
+            if (bytes_b > SIZE_MAX - 2) {
+                report_error("BF16 weight buffer size overflows size_t");
+                return -1;
+            }
+            bytes_b += 2;
+        }
+    }
     if (bytes_a / sizeof(float) > UINT32_MAX ||
-        bytes_b / sizeof(float) > UINT32_MAX ||
+        (weight_format != 0 ? bytes_b / sizeof(uint16_t)
+                            : bytes_b / sizeof(float)) > UINT32_MAX ||
         bytes_c / sizeof(float) > UINT32_MAX) {
         report_error("matrix element count exceeds shader 32-bit indexing");
         return -1;
@@ -997,7 +1448,7 @@ int vk_matmul_checked(const float *a, const float *b, float *c,
     }
 
     matmul_lock();
-    if (ensure_matmul_pipeline() != 0) {
+    if (ensure_matmul_pipeline(weight_format != 0) != 0) {
         goto cleanup;
     }
     device_a = vk_alloc_vram(bytes_a);
@@ -1007,7 +1458,10 @@ int vk_matmul_checked(const float *a, const float *b, float *c,
         goto cleanup;
     }
     memcpy(device_a, a, bytes_a);
-    memcpy(device_b, b, bytes_b);
+    memset(device_b, 0, bytes_b);
+    memcpy(device_b, b, weight_format != 0
+                            ? (size_t)k * (size_t)n * sizeof(uint16_t)
+                            : bytes_b);
     memset(device_c, 0, bytes_c);
     if (vk_get_vram_allocation(device_a, &buffer_a, &offset_a, &size_a) != 0 ||
         vk_get_vram_allocation(device_b, &buffer_b, &offset_b, &size_b) != 0 ||
@@ -1085,8 +1539,11 @@ int vk_matmul_checked(const float *a, const float *b, float *c,
     dimensions[0] = (uint32_t)m;
     dimensions[1] = (uint32_t)k;
     dimensions[2] = (uint32_t)n;
+    dimensions[3] = (uint32_t)transpose_b |
+                    (weight_format == 2 ? UINT32_C(2) : UINT32_C(0));
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      g_matmul_pipeline);
+                      weight_format != 0 ? g_matmul_bf16_pipeline
+                                         : g_matmul_pipeline);
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             g_matmul_pipeline_layout, 0, 1, &descriptor_set,
                             0, NULL);
@@ -1142,6 +1599,31 @@ cleanup:
     if (device_a != NULL) vk_free_vram(device_a);
     matmul_unlock();
     return status;
+}
+
+int vk_matmul_checked(const float *a, const float *b, float *c,
+                      int m, int k, int n) {
+    return vk_matmul_impl(a, b, c, m, k, n, 0, 0);
+}
+
+int vk_matmul_transposed_checked(const float *a, const float *b, float *c,
+                                 int m, int k, int n) {
+    return vk_matmul_impl(a, b, c, m, k, n, 0, 1);
+}
+
+int vk_matmul_bf16_checked(const float *a, const uint16_t *b, float *c,
+                           int m, int k, int n) {
+    return vk_matmul_impl(a, b, c, m, k, n, 1, 0);
+}
+
+int vk_matmul_bf16_transposed_checked(const float *a, const uint16_t *b,
+                                      float *c, int m, int k, int n) {
+    return vk_matmul_impl(a, b, c, m, k, n, 1, 1);
+}
+
+int vk_matmul_fp16_transposed_checked(const float *a, const uint16_t *b,
+                                      float *c, int m, int k, int n) {
+    return vk_matmul_impl(a, b, c, m, k, n, 2, 1);
 }
 
 void vk_matmul(float *a, float *b, float *c, int m, int k, int n) {

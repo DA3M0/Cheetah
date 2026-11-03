@@ -42,6 +42,37 @@ void vk_matmul(float *a, float *b, float *c, int m, int k, int n);
 /* Status-returning counterpart for language bindings. */
 int vk_matmul_checked(const float *a, const float *b, float *c,
                       int m, int k, int n);
+/* Multiplies A[M,K] by the transpose of row-major FP32 B[N,K]. */
+int vk_matmul_transposed_checked(const float *a, const float *b, float *c,
+                                 int m, int k, int n);
+/* Same operation with a row-major BF16 matrix B. */
+int vk_matmul_bf16_checked(const float *a, const uint16_t *b, float *c,
+                           int m, int k, int n);
+/* Multiplies A[M,K] by the transpose of row-major BF16 B[N,K]. */
+int vk_matmul_bf16_transposed_checked(const float *a, const uint16_t *b,
+                                      float *c, int m, int k, int n);
+/* Multiplies A[M,K] by the transpose of row-major FP16 B[N,K]. */
+int vk_matmul_fp16_transposed_checked(const float *a, const uint16_t *b,
+                                      float *c, int m, int k, int n);
+
+/* Qwen2 compute helpers. Weight format: 0=F32, 1=BF16, 2=FP16. */
+int vk_qwen_prepare(void);
+int vk_qwen_rms_norm(const float *input, const void *weight,
+                     uint32_t weight_format, float *output, uint32_t rows,
+                     uint32_t width, float epsilon);
+int vk_qwen_elementwise(const float *a, const float *b, float *output,
+                        size_t count, uint32_t operation);
+int vk_qwen_rotary(const float *query, const float *keys,
+                   float *query_output, float *key_output,
+                   uint32_t sequence, uint32_t offset,
+                   uint32_t query_heads, uint32_t kv_heads,
+                   uint32_t head_dim, float theta);
+int vk_qwen_attention(const float *query, const float *keys,
+                      const float *values, float *output,
+                      uint32_t sequence, uint32_t offset,
+                      uint32_t cache_len, uint32_t query_heads,
+                      uint32_t kv_heads, uint32_t head_dim,
+                      uint32_t sliding_window);
 
 /* Handles returned here are borrowed and remain valid until shutdown. */
 VkDevice vk_get_device(void);

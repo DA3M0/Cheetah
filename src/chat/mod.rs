@@ -1,6 +1,8 @@
 //! Candle-backed chat inference over Safetensors checkpoints.
 
 mod engine;
+#[cfg(feature = "vulkan")]
+mod vulkan_qwen;
 
 pub(crate) use engine::{ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice};
 

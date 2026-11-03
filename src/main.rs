@@ -226,9 +226,12 @@ Examples:\n\
   cheetah inspect /home/user/models/qwen-0.5b\n\
   cheetah inspect ./model.safetensors --json\n\
   cheetah init ./hf-model ./prepared-model\n\
-  CHEETAH_DEVICE=cuda cheetah /home/user/models/qwen-0.5b\n\
+  cargo build --release --features cuda\n\
+  CHEETAH_DEVICE=cuda ./target/release/cheetah /home/user/models/qwen-0.5b\n\
+  cargo build --release --features metal\n\
+  CHEETAH_DEVICE=metal ./target/release/cheetah /home/user/models/qwen-0.5b\n\
 \n\
-Set CHEETAH_DEVICE to cpu (default), cuda, or metal; GPU choices require the matching build feature.\n\
+Set CHEETAH_DEVICE to cpu (default), cuda, or metal; GPU choices require building with the matching --features option.\n\
 Enter /exit to leave a chat. Press Ctrl-C to stop the server."
     );
 }

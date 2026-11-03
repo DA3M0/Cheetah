@@ -8,16 +8,43 @@ Cheetah is a local language-model CLI and OpenAI-compatible gateway using Candle
 cargo build --release
 ```
 
-Optional Candle inference backends can be compiled with `--features cuda` or `--features metal`. Set `CHEETAH_DEVICE=cuda` or `CHEETAH_DEVICE=metal` to select a compiled backend at runtime; `CHEETAH_DEVICE=cpu` (the default) selects the CPU.
+### CUDA (NVIDIA)
 
-The separate C Vulkan compute backend is available with `--features vulkan`. It requires a Vulkan SDK/runtime and a C compiler. Its 800 MiB host-visible/coherent memory pool can be resized with `CHEETAH_VRAM_POOL_SIZE` (bytes). The feature exposes the initializer and matrix multiplication through `cheetah::native::vulkan`; Vulkan matrix multiplication also requires a compiled `matmul.spv` shader:
+Build with the CUDA inference backend, then select it when starting Cheetah:
 
 ```sh
-glslc -fshader-stage=compute matmul.comp -o matmul.spv
-cargo test --features vulkan
+cargo build --release --features cuda
+CHEETAH_DEVICE=cuda ./target/release/cheetah /home/user/models/qwen-0.5b
 ```
 
-Set `CHEETAH_MATMUL_SPV` to use a shader at another path. The Vulkan compute API is separate from Candle inference device selection.
+### Metal (macOS)
+
+Build with the Metal inference backend, then select it when starting Cheetah:
+
+```sh
+cargo build --release --features metal
+CHEETAH_DEVICE=metal ./target/release/cheetah /home/user/models/qwen-0.5b
+```
+
+The selected backend must be included at build time. Without `CHEETAH_DEVICE`, Cheetah uses the CPU; `CHEETAH_DEVICE=cpu` explicitly selects it.
+
+The Vulkan feature provides a C compute backend and dense Qwen2 inference. It requires a Vulkan runtime, Vulkan headers/loader, and a C compiler. When `glslc` is available, Cargo compiles and embeds the matmul and Qwen2 compute shaders. The default 800 MiB host-visible/coherent buffer pool can be resized with `CHEETAH_VRAM_POOL_SIZE` (bytes). Select it at runtime with:
+
+```sh
+cargo build --release --features vulkan
+CHEETAH_DEVICE=vulkan ./target/release/cheetah /home/user/models/qwen-0.5b
+```
+
+The current inference path supports dense Qwen2 checkpoints with F32, F16, or BF16 weights. Unsupported architectures, unavailable Vulkan devices, shader/pipeline startup errors, and model-load errors emit a diagnostic and fall back to CPU. Errors during an active Vulkan inference are returned rather than silently switching backends. Other architectures continue to use their existing Candle backends.
+
+The C API, including compute-device initialization and matrix multiplication, is also exposed through `cheetah::native::vulkan`. GPU operator tests are opt-in and require a Vulkan compute device plus `glslc`:
+
+```sh
+cargo test --features vulkan
+cargo test --features vulkan qwen_operators_match_cpu_reference -- --ignored --nocapture
+```
+
+Set `CHEETAH_MATMUL_SPV` or `CHEETAH_QWEN_OPS_SPV` to override the corresponding compiled shader path.
 
 ## Static model initialization
 

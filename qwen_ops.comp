@@ -1,0 +1,198 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Buffer0 {
+    uint data[];
+} b0;
+layout(set = 0, binding = 1, std430) readonly buffer Buffer1 {
+    uint data[];
+} b1;
+layout(set = 0, binding = 2, std430) buffer Buffer2 {
+    uint data[];
+} b2;
+layout(set = 0, binding = 3, std430) buffer Buffer3 {
+    uint data[];
+} b3;
+layout(set = 0, binding = 4, std430) readonly buffer Buffer4 {
+    uint data[];
+} b4;
+
+layout(push_constant) uniform Parameters {
+    uint op;
+    uint p1;
+    uint p2;
+    uint p3;
+    uint p4;
+    uint p5;
+    uint p6;
+    uint p7;
+} params;
+
+float load_weight(uint index, uint format) {
+    if (format == 0u) {
+        return uintBitsToFloat(b1.data[index]);
+    }
+    uint packed = b1.data[index >> 1u];
+    uint component = index & 1u;
+    if (format == 2u) {
+        vec2 half_values = unpackHalf2x16(packed);
+        return component == 0u ? half_values.x : half_values.y;
+    }
+    uint value = component == 0u ? (packed & 0xffffu) : (packed >> 16u);
+    return uintBitsToFloat(value << 16u);
+}
+
+void run_rms_norm(uint row) {
+    uint rows = params.p1;
+    uint width = params.p2;
+    if (row >= rows) {
+        return;
+    }
+    uint start = row * width;
+    float sum = 0.0;
+    for (uint index = 0u; index < width; ++index) {
+        float value = uintBitsToFloat(b0.data[start + index]);
+        sum += value * value;
+    }
+    float inverse = inversesqrt(sum / float(width) + uintBitsToFloat(params.p3));
+    for (uint index = 0u; index < width; ++index) {
+        float value = uintBitsToFloat(b0.data[start + index]);
+        b2.data[start + index] =
+            floatBitsToUint(value * inverse * load_weight(index, params.p4));
+    }
+}
+
+void run_elementwise(uint index, bool silu_multiply) {
+    uint count = params.p1;
+    if (index >= count) {
+        return;
+    }
+    float lhs = uintBitsToFloat(b0.data[index]);
+    float rhs = uintBitsToFloat(b1.data[index]);
+    if (silu_multiply) {
+        lhs = lhs / (1.0 + exp(-lhs)) * rhs;
+    } else {
+        lhs += rhs;
+    }
+    b2.data[index] = floatBitsToUint(lhs);
+}
+
+void run_rotary(uint index) {
+    uint sequence = params.p1;
+    uint offset = params.p2;
+    uint query_heads = params.p3;
+    uint kv_heads = params.p4;
+    uint head_dim = params.p5;
+    uint query_count = sequence * query_heads * head_dim;
+    uint key_count = sequence * kv_heads * head_dim;
+    uint max_count = query_count + key_count;
+    if (index >= max_count) {
+        return;
+    }
+    bool is_query = index < query_count;
+    uint heads = is_query ? query_heads : kv_heads;
+    uint local_index = is_query ? index : index - query_count;
+    uint dimension = local_index % head_dim;
+    uint half_dim = head_dim / 2u;
+    if (dimension >= half_dim) {
+        return;
+    }
+    uint pair_dimension = dimension;
+    uint sequence_index = local_index / (heads * head_dim);
+    uint row_start = local_index - dimension;
+    uint first_index = row_start + pair_dimension;
+    uint second_index = row_start + pair_dimension + half_dim;
+    float first = is_query
+                      ? uintBitsToFloat(b0.data[first_index])
+                      : uintBitsToFloat(b1.data[first_index]);
+    float second = is_query
+                       ? uintBitsToFloat(b0.data[second_index])
+                       : uintBitsToFloat(b1.data[second_index]);
+    float frequency = pow(uintBitsToFloat(params.p6),
+                          -float(2u * pair_dimension) / float(head_dim));
+    float angle = float(offset + sequence_index) * frequency;
+    float cosine = cos(angle);
+    float sine = sin(angle);
+    float first_rotated = first * cosine - second * sine;
+    float second_rotated = second * cosine + first * sine;
+    uint output_first = first_index;
+    uint output_second = second_index;
+    if (is_query) {
+        b2.data[output_first] = floatBitsToUint(first_rotated);
+        b2.data[output_second] = floatBitsToUint(second_rotated);
+    } else {
+        b3.data[output_first] = floatBitsToUint(first_rotated);
+        b3.data[output_second] = floatBitsToUint(second_rotated);
+    }
+}
+
+float attention_score(uint query_start, uint key_start, uint head_dim) {
+    float sum = 0.0;
+    for (uint dim = 0u; dim < head_dim; ++dim) {
+        sum += uintBitsToFloat(b0.data[query_start + dim]) *
+               uintBitsToFloat(b1.data[key_start + dim]);
+    }
+    return sum * inversesqrt(float(head_dim));
+}
+
+void run_attention(uint query_head_index) {
+    uint sequence = params.p1;
+    uint offset = params.p2;
+    uint cache_len = params.p3;
+    uint query_heads = params.p4;
+    uint kv_heads = params.p5;
+    uint head_dim = params.p6;
+    uint window = params.p7;
+    uint query_count = sequence * query_heads;
+    if (query_head_index >= query_count) {
+        return;
+    }
+    uint sequence_index = query_head_index / query_heads;
+    uint query_head = query_head_index % query_heads;
+    uint absolute_position = offset + sequence_index;
+    uint end = absolute_position + 1u;
+    if (end > cache_len) {
+        return;
+    }
+    uint start = window == 0u || end <= window ? 0u : end - window;
+    uint kv_head = query_head / (query_heads / kv_heads);
+    uint query_start = query_head_index * head_dim;
+    float max_score = -3.402823466e+38;
+    for (uint position = start; position < end; ++position) {
+        uint key_start = (position * kv_heads + kv_head) * head_dim;
+        max_score = max(max_score, attention_score(query_start, key_start, head_dim));
+    }
+    float denominator = 0.0;
+    for (uint position = start; position < end; ++position) {
+        uint key_start = (position * kv_heads + kv_head) * head_dim;
+        denominator += exp(attention_score(query_start, key_start, head_dim) - max_score);
+    }
+    for (uint dim = 0u; dim < head_dim; ++dim) {
+        float result = 0.0;
+        for (uint position = start; position < end; ++position) {
+            uint key_start = (position * kv_heads + kv_head) * head_dim;
+            uint value_start = (position * kv_heads + kv_head) * head_dim;
+            float probability =
+                exp(attention_score(query_start, key_start, head_dim) - max_score) /
+                denominator;
+            result += probability * uintBitsToFloat(b4.data[value_start + dim]);
+        }
+        b3.data[query_start + dim] = floatBitsToUint(result);
+    }
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (params.op == 0u) {
+        run_rms_norm(index);
+    } else if (params.op == 1u) {
+        run_elementwise(index, false);
+    } else if (params.op == 2u) {
+        run_elementwise(index, true);
+    } else if (params.op == 3u) {
+        run_rotary(index);
+    } else if (params.op == 4u) {
+        run_attention(index);
+    }
+}
