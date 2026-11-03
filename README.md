@@ -24,8 +24,8 @@ Set `CHEETAH_MATMUL_SPV` to use a shader at another path. The Vulkan compute API
 `cheetah init` prepares a Hugging Face model directory for static, mmap-friendly loading. It recursively scans Safetensors files, writes per-layer weight shards below `.cheetah/weights/`, and emits `cheetah_manifest.json` at the output root. Shard payloads are aligned to 4 KiB; a missing `config.json` is inferred and generated. Tokenizer files are copied when present. The source directory is not modified.
 
 ```sh
-cargo run -- init /home/benny/models/qwen-0.5b /home/benny/models/qwen-0.5b-prepared
-cargo run -- inspect /home/benny/models/qwen-0.5b-prepared
+cargo run -- init /home/user/models/qwen-0.5b /home/benny/models/qwen-0.5b-prepared
+cargo run -- inspect /home/user/models/qwen-0.5b-prepared
 ```
 
 The output directory is generated model data: initialization replaces its unsharded Safetensors weight files and manages stale generated shards. You can also use `cheetah prepare` as an alias for `cheetah init`.
@@ -36,8 +36,8 @@ Pass a Hugging Face model directory containing `config.json`, `tokenizer.json`, 
 
 ```sh
 cd /home/benny/models/qwen-0.5b && cheetah
-cargo run -- /home/benny/models/qwen-0.5b
-cargo run -- /home/benny/models/qwen-0.5b --max-tokens 128 --temperature 0
+cargo run -- /home/user/models/qwen-0.5b
+cargo run -- /home/user/models/qwen-0.5b --max-tokens 128 --temperature 0
 ```
 
 When Cheetah is launched without arguments, it loads the model from the current directory and starts an interactive chat.
@@ -49,9 +49,9 @@ Sampling options include `--temperature`, `--top-p`, `--top-k`, `--repeat-penalt
 ## Model inspection
 
 ```sh
-cargo run -- inspect /home/benny/models/qwen-0.5b
-cargo run -- inspect /home/benny/models/qwen-0.5b/model.safetensors --json --output report.json
-cargo run -- inspect /home/benny/models/qwen-0.5b-prepared
+cargo run -- inspect /home/user/models/qwen-0.5b
+cargo run -- inspect /home/user/models/qwen-0.5b/model.safetensors --json --output report.json
+cargo run -- inspect /home/user/models/qwen-0.5b-prepared
 ```
 
 ## OpenAI-compatible server
