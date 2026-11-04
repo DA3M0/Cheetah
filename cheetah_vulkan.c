@@ -1,4 +1,5 @@
 #include "cheetah_vulkan.h"
+#include "cheetah_color.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -112,13 +113,15 @@ static int check_vk_result(VkResult result, const char *operation) {
     if (result == VK_SUCCESS) {
         return 0;
     }
-    fprintf(stderr, "cheetah-vulkan: %s failed: %s (%d)\n",
-            operation, vk_result_name(result), (int)result);
+    CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                    "cheetah-vulkan: %s failed: %s (%d)\n",
+                    operation, vk_result_name(result), (int)result);
     return -1;
 }
 
 static void report_error(const char *message) {
-    fprintf(stderr, "cheetah-vulkan: %s\n", message);
+    CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                    "cheetah-vulkan: %s\n", message);
 }
 
 static void allocator_lock(void) {
@@ -502,10 +505,11 @@ int init_vulkan_device(void) {
     g_vulkan.free_blocks = initial_block;
     g_vulkan.initialized = 1;
 
-    fprintf(stderr, "cheetah-vulkan: initialized %s (pool=%" PRIu64
+    CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_GREEN,
+                    "cheetah-vulkan: initialized %s (pool=%" PRIu64
                     " bytes, compute queue family=%u)\n",
-            g_vulkan.properties.deviceName, (uint64_t)pool_size,
-            g_vulkan.queue_family_index);
+                    g_vulkan.properties.deviceName, (uint64_t)pool_size,
+                    g_vulkan.queue_family_index);
     return 0;
 }
 
@@ -732,21 +736,24 @@ VkShaderModule vk_load_spirv_shader(const char *path) {
     }
     file = fopen(path, "rb");
     if (file == NULL) {
-        fprintf(stderr, "cheetah-vulkan: cannot open SPIR-V file '%s': %s\n",
-                path, strerror(errno));
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: cannot open SPIR-V file '%s': %s\n",
+                        path, strerror(errno));
         return VK_NULL_HANDLE;
     }
     if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) < 0 ||
         fseek(file, 0, SEEK_SET) != 0) {
-        fprintf(stderr, "cheetah-vulkan: cannot determine SPIR-V file size '%s'\n",
-                path);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: cannot determine SPIR-V file size '%s'\n",
+                        path);
         fclose(file);
         return VK_NULL_HANDLE;
     }
     if (file_size < 4 || (file_size % 4) != 0 ||
         (uintmax_t)file_size > (uintmax_t)SIZE_MAX) {
-        fprintf(stderr, "cheetah-vulkan: invalid SPIR-V file size in '%s'\n",
-                path);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: invalid SPIR-V file size in '%s'\n",
+                        path);
         fclose(file);
         return VK_NULL_HANDLE;
     }
@@ -758,8 +765,9 @@ VkShaderModule vk_load_spirv_shader(const char *path) {
         return VK_NULL_HANDLE;
     }
     if (fread(code, 1, byte_count, file) != byte_count) {
-        fprintf(stderr, "cheetah-vulkan: failed to read SPIR-V file '%s'\n",
-                path);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: failed to read SPIR-V file '%s'\n",
+                        path);
         free(code);
         fclose(file);
         return VK_NULL_HANDLE;
@@ -774,7 +782,8 @@ VkShaderModule vk_load_spirv_shader(const char *path) {
         magic = code[0];
     }
     if (magic != CHEETAH_SPIRV_MAGIC) {
-        fprintf(stderr, "cheetah-vulkan: invalid SPIR-V magic in '%s'\n", path);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: invalid SPIR-V magic in '%s'\n", path);
         free(code);
         return VK_NULL_HANDLE;
     }
@@ -922,7 +931,9 @@ static int ensure_matmul_pipeline(int bfloat16_weights) {
     }
     shader = vk_load_spirv_shader(shader_path);
     if (shader == VK_NULL_HANDLE) {
-        fprintf(stderr, "cheetah-vulkan: unable to load matmul shader '%s'\n", shader_path);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: unable to load matmul shader '%s'\n",
+                        shader_path);
         return -1;
     }
     *pipeline = vk_create_compute_pipeline(shader, g_matmul_pipeline_layout,
@@ -982,8 +993,9 @@ static int ensure_qwen_pipeline(void) {
     }
     shader = vk_load_spirv_shader(shader_path);
     if (shader == VK_NULL_HANDLE) {
-        fprintf(stderr, "cheetah-vulkan: unable to load Qwen ops shader '%s'\n",
-                shader_path);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-vulkan: unable to load Qwen ops shader '%s'\n",
+                        shader_path);
         return -1;
     }
     g_qwen_pipeline =

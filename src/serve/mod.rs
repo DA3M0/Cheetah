@@ -6,6 +6,7 @@ mod queue;
 
 use crate::chat::Engine;
 use crate::cli::ServeOptions;
+use crate::color::{self, Color};
 use crate::options::ChatOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +27,13 @@ pub fn serve(options: ServeOptions, chat_options: ChatOptions) -> Result<(), Str
     }
 
     let (model_path, model_id) = resolve_model(&options)?;
-    eprintln!("Loading model: {}", model_path.display());
+    eprintln!(
+        "{}",
+        color::stderr(
+            &format!("Loading model: {}", model_path.display()),
+            Color::Cyan
+        )
+    );
 
     let engine = Engine::load(&model_path, chat_options.threads, chat_options.ctx_size)?;
     let api_key = resolve_api_key(&options)?;
@@ -43,13 +50,32 @@ pub fn serve(options: ServeOptions, chat_options: ChatOptions) -> Result<(), Str
         }
     };
 
-    println!("Loaded model: {}", model_path.display());
-    println!("Server started: {}", display_url(&options.host, port));
+    println!(
+        "{}",
+        color::stdout(
+            &format!("Loaded model: {}", model_path.display()),
+            Color::Green
+        )
+    );
+    println!(
+        "{}",
+        color::stdout(
+            &format!("Server started: {}", display_url(&options.host, port)),
+            Color::Green
+        )
+    );
     if let Some(key) = &api_key {
-        println!("API Key: {key}");
+        println!(
+            "{}",
+            color::stdout(&format!("API Key: {key}"), Color::Yellow)
+        );
     } else {
         println!(
-            "API key authentication is disabled (server is listening on a loopback address only)."
+            "{}",
+            color::stdout(
+                "API key authentication is disabled (server is listening on a loopback address only).",
+                Color::Yellow
+            )
         );
     }
 
@@ -81,12 +107,18 @@ pub fn serve(options: ServeOptions, chat_options: ChatOptions) -> Result<(), Str
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!("Failed to receive connection: {error}");
+                eprintln!(
+                    "{}",
+                    color::stderr(
+                        &format!("Failed to receive connection: {error}"),
+                        Color::Red
+                    )
+                );
             }
         }
     }
 
-    println!("Server stopped.");
+    println!("{}", color::stdout("Server stopped.", Color::Green));
     Ok(())
 }
 

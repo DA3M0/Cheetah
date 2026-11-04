@@ -8,6 +8,8 @@ The quickest way to start a chat is to pass a Hugging Face model directory:
 cheetah /path/to/model
 ```
 
+Human-readable CLI output uses semantic colors when writing to a terminal. Colors are disabled for redirected output and when `NO_COLOR` is set. Generated model text and machine-readable JSON/API responses are not colored.
+
 The directory should contain `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` with its weight shards. You can also launch `cheetah` from inside the model directory.
 
 ## Build

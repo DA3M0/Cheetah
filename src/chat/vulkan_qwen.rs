@@ -1,3 +1,4 @@
+use crate::color::{self, Color};
 use candle_core::{Device, Tensor};
 use candle_transformers::models::qwen2;
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
@@ -246,7 +247,13 @@ impl VulkanQwenExecutor {
         if result.is_err() {
             if let Err(shutdown_error) = cheetah::native::vulkan::shutdown() {
                 eprintln!(
-                    "cheetah: Vulkan cleanup after startup failure also failed ({shutdown_error})."
+                    "{}",
+                    color::stderr(
+                        &format!(
+                            "cheetah: Vulkan cleanup after startup failure also failed ({shutdown_error})."
+                        ),
+                        Color::Red
+                    )
                 );
             }
         }

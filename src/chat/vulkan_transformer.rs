@@ -1,3 +1,4 @@
+use crate::color::{self, Color};
 use candle_core::{Device, Tensor};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde_json::Value;
@@ -471,7 +472,13 @@ impl VulkanTransformerExecutor {
             && let Err(shutdown_error) = cheetah::native::vulkan::shutdown()
         {
             eprintln!(
-                "cheetah: Vulkan cleanup after model startup failure also failed ({shutdown_error})."
+                "{}",
+                color::stderr(
+                    &format!(
+                        "cheetah: Vulkan cleanup after model startup failure also failed ({shutdown_error})."
+                    ),
+                    Color::Red
+                )
             );
         }
         result

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "cheetah_color.h"
 #include "cheetah_init.h"
 
 #include <dirent.h>
@@ -106,12 +107,13 @@ typedef struct ModelInfo {
 } ModelInfo;
 
 static void set_error(const char *message) {
-    fprintf(stderr, "cheetah-init: %s\n", message);
+    CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED, "cheetah-init: %s\n", message);
 }
 
 static void set_path_error(const char *operation, const char *path) {
-    fprintf(stderr, "cheetah-init: %s '%s': %s\n", operation, path,
-            strerror(errno));
+    CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                    "cheetah-init: %s '%s': %s\n", operation, path,
+                    strerror(errno));
 }
 
 static int builder_reserve(StringBuilder *builder, size_t additional) {
@@ -648,7 +650,8 @@ static int make_directories(const char *path) {
                 return -1;
             }
             if (stat(copy, &status) != 0 || !S_ISDIR(status.st_mode)) {
-                fprintf(stderr, "cheetah-init: '%s' is not a directory\n", copy);
+                CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                                "cheetah-init: '%s' is not a directory\n", copy);
                 free(copy);
                 return -1;
             }
@@ -876,8 +879,9 @@ static int add_tensor_record(ModelInfo *model, TensorRecord *tensor) {
     }
     name_result = insert_tensor_name(model, tensor->name);
     if (name_result == 1) {
-        fprintf(stderr, "cheetah-init: duplicate tensor name '%s'\n",
-                tensor->name);
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                        "cheetah-init: duplicate tensor name '%s'\n",
+                        tensor->name);
         return -1;
     }
     if (name_result != 0) {
@@ -1089,8 +1093,9 @@ static int process_safetensors_file(const char *path, ModelInfo *model) {
         }
         end = file_payload + tensor->payload_size;
         if (end > mapping_size) {
-            fprintf(stderr, "cheetah-init: tensor '%s' extends beyond '%s'\n",
-                    tensor->name, path);
+            CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                            "cheetah-init: tensor '%s' extends beyond '%s'\n",
+                            tensor->name, path);
             goto done;
         }
         if (parse_layer_number(tensor->name, &layer) &&
@@ -1100,8 +1105,9 @@ static int process_safetensors_file(const char *path, ModelInfo *model) {
         }
         for (d = 0; d < tensor->dimensions; ++d) {
             if (tensor->shape[d] == 0) {
-                fprintf(stderr, "cheetah-init: tensor '%s' has a zero dimension\n",
-                        tensor->name);
+                CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_RED,
+                                "cheetah-init: tensor '%s' has a zero dimension\n",
+                                tensor->name);
                 goto done;
             }
         }
@@ -1660,13 +1666,15 @@ static int write_inferred_config(const char *path, const ModelInfo *model) {
     }
     if (!model->found_embedding || !model->found_layer ||
         !model->found_intermediate) {
-        fprintf(stderr, "cheetah-init: warning: generated config has missing "
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_YELLOW,
+                        "cheetah-init: warning: generated config has missing "
                         "or heuristic dimensions (embedding=%d layers=%d "
                         "intermediate=%d); verify it before inference\n",
-                model->found_embedding, model->found_layer,
-                model->found_intermediate);
+                        model->found_embedding, model->found_layer,
+                        model->found_intermediate);
     } else if (!model->has_q_norm && model->found_attention) {
-        fprintf(stderr, "cheetah-init: warning: attention-head count was "
+        CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_YELLOW,
+                        "cheetah-init: warning: attention-head count was "
                         "estimated from tensor dimensions; verify config.json\n");
     }
     return 0;
@@ -2139,11 +2147,12 @@ int cheetah_init_model(const char *src_dir, const char *dst_dir) {
         }
     }
     result = 0;
-    fprintf(stderr, "cheetah-init: prepared %zu tensors in %zu aligned "
+    CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_GREEN,
+                    "cheetah-init: prepared %zu tensors in %zu aligned "
                     "Safetensors shards "
                     "(layers=%" PRIu64 ", hidden_size=%" PRIu64 ")\n",
-            model.tensor_count, model.shard_count, model.num_layers,
-            model.hidden_size);
+                    model.tensor_count, model.shard_count, model.num_layers,
+                    model.hidden_size);
 done:
     free(aligned_buffer);
     free_model_info(&model);

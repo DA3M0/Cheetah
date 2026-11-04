@@ -1,4 +1,5 @@
 use super::models::ModelRuntime;
+use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
 use candle_core::{Device, Tensor};
@@ -287,7 +288,13 @@ impl Engine {
             let remove_count = if messages.len() > 2 { 2 } else { 1 };
             messages.drain(..remove_count);
             dropped_turns += 1;
-            eprintln!("Context limit nearly reached; earlier conversation turns were truncated.");
+            eprintln!(
+                "{}",
+                color::stderr(
+                    "Context limit nearly reached; earlier conversation turns were truncated.",
+                    Color::Yellow
+                )
+            );
         }
     }
 
@@ -699,12 +706,21 @@ pub(super) fn chat(
             path.display()
         ));
     }
-    eprintln!("Loading model: {}", path.display());
+    eprintln!(
+        "{}",
+        color::stderr(&format!("Loading model: {}", path.display()), Color::Cyan)
+    );
     let engine = Engine::load(path, options.threads, options.ctx_size)?;
     println!(
-        "Loaded {} model ({}). Enter /exit to quit.",
-        engine.model_id(),
-        engine.device_name()
+        "{}",
+        color::stdout(
+            &format!(
+                "Loaded {} model ({}). Enter /exit to quit.",
+                engine.model_id(),
+                engine.device_name()
+            ),
+            Color::Green
+        )
     );
     chat_loop(&engine, options, &mut archive, store)
 }
@@ -752,7 +768,7 @@ fn chat_loop(
         messages.push(ChatMessage::new("assistant", turn.assistant.clone()));
     }
     loop {
-        print!("> ");
+        print!("{}", color::stdout("> ", Color::Cyan));
         std::io::stdout()
             .flush()
             .map_err(|error| format!("Failed to show chat prompt: {error}"))?;
@@ -770,7 +786,11 @@ fn chat_loop(
             "/exit" | "/quit" => return Ok(()),
             "/help" => {
                 println!(
-                    "/exit, /quit  Exit the chat\n/clear        Clear conversation\n/save <name>  Save conversation"
+                    "{}",
+                    color::stdout(
+                        "/exit, /quit  Exit the chat\n/clear        Clear conversation\n/save <name>  Save conversation",
+                        Color::Cyan
+                    )
                 );
                 continue;
             }
@@ -778,13 +798,13 @@ fn chat_loop(
                 messages.clear();
                 archive.turns.clear();
                 archive.updated_at = random_seed();
-                println!("Conversation cleared.");
+                println!("{}", color::stdout("Conversation cleared.", Color::Green));
                 continue;
             }
             value if value.starts_with("/save ") => {
                 let name = value.trim_start_matches("/save ").trim();
                 if name.is_empty() {
-                    println!("Usage: /save <name>");
+                    println!("{}", color::stdout("Usage: /save <name>", Color::Yellow));
                     continue;
                 }
                 archive.name = name.to_owned();
@@ -796,7 +816,10 @@ fn chat_loop(
                     })
                     .collect();
                 store.save(archive)?;
-                println!("Saved context '{name}'.");
+                println!(
+                    "{}",
+                    color::stdout(&format!("Saved context '{name}'."), Color::Green)
+                );
                 continue;
             }
             _ if text.is_empty() => continue,
@@ -810,7 +833,10 @@ fn chat_loop(
         let mut sink = StdoutSink;
         match engine.generate(&mut context, &tokens, &options, &[], &mut sink) {
             Ok(generation) => {
-                println!("{}", format_generation_stats(&generation));
+                println!(
+                    "{}",
+                    color::stdout(&format_generation_stats(&generation), Color::Green)
+                );
                 let assistant = generation.text;
                 messages.push(ChatMessage::new("assistant", assistant.clone()));
                 archive.turns.push(ConversationTurn { user, assistant });

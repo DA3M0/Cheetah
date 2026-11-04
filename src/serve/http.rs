@@ -2,6 +2,7 @@
 
 use crate::chat::ChatParams;
 use crate::chat::{Engine, Generation, TextSink, ToolChoice};
+use crate::color::{self, Color};
 use crate::options::ChatOptions;
 use crate::serve::openai::{self, *};
 use crate::serve::queue::{QueueGuard, QueueTicket};
@@ -408,7 +409,13 @@ fn handle_chat_completions(
                             })
                             .and_then(|()| sink.send_done());
                         if let Err(error) = result {
-                            eprintln!("Failed to send tool-mode SSE response: {error}");
+                            eprintln!(
+                                "{}",
+                                color::stderr(
+                                    &format!("Failed to send tool-mode SSE response: {error}"),
+                                    Color::Red
+                                )
+                            );
                         }
                     }
                     Ok((_, ToolResponse::Calls(calls))) => {
@@ -418,14 +425,26 @@ fn handle_chat_completions(
                             .and_then(|()| sink.send_chunk(None, None, None, Some("tool_calls")))
                             .and_then(|()| sink.send_done());
                         if let Err(error) = result {
-                            eprintln!("Failed to send tool-call SSE response: {error}");
+                            eprintln!(
+                                "{}",
+                                color::stderr(
+                                    &format!("Failed to send tool-call SSE response: {error}"),
+                                    Color::Red
+                                )
+                            );
                         }
                     }
                     Err(error) => {
                         let sink = SseSink::new(tx, completion_id, created, model);
                         let _ = sink.send_chunk(None, None, None, Some("server_error"));
                         let _ = sink.send_done();
-                        eprintln!("Tool-call generation failed: {error}");
+                        eprintln!(
+                            "{}",
+                            color::stderr(
+                                &format!("Tool-call generation failed: {error}"),
+                                Color::Red
+                            )
+                        );
                     }
                 }
             });
@@ -513,13 +532,22 @@ fn handle_chat_completions(
                         .send_chunk(None, None, None, Some(generation.finish_reason.as_str()))
                         .and_then(|()| sink.send_done())
                     {
-                        eprintln!("Failed to send chat SSE response: {err}");
+                        eprintln!(
+                            "{}",
+                            color::stderr(
+                                &format!("Failed to send chat SSE response: {err}"),
+                                Color::Red
+                            )
+                        );
                     }
                 }
                 Err(err) => {
                     let _ = sink.send_chunk(None, None, None, Some("server_error"));
                     let _ = sink.send_done();
-                    eprintln!("Generation failed: {err}");
+                    eprintln!(
+                        "{}",
+                        color::stderr(&format!("Generation failed: {err}"), Color::Red)
+                    );
                 }
             }
         });

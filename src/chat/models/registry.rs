@@ -1,4 +1,5 @@
 use super::{ModelRegistration, ModelRuntime, candle};
+use crate::color::{self, Color};
 use candle_core::Device;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -86,8 +87,14 @@ fn load_vulkan_or_fallback(
             .any(|shader| !super::shader_is_registered(shader))
         {
             eprintln!(
-                "cheetah: Vulkan model '{}' references an unregistered shader; falling back to CPU.",
-                model_registration.chat_template.id
+                "{}",
+                color::stderr(
+                    &format!(
+                        "cheetah: Vulkan model '{}' references an unregistered shader; falling back to CPU.",
+                        model_registration.chat_template.id
+                    ),
+                    Color::Yellow
+                )
             );
         } else {
             let vulkan_model = (|| loader(weight_paths, config_bytes, raw_config.clone()))();
@@ -95,15 +102,27 @@ fn load_vulkan_or_fallback(
                 Ok(executor) => return Ok((Device::Cpu, executor)),
                 Err(error) => {
                     eprintln!(
-                        "cheetah: Vulkan model '{}' unavailable ({error}); falling back to CPU.",
-                        model_registration.chat_template.id
+                        "{}",
+                        color::stderr(
+                            &format!(
+                                "cheetah: Vulkan model '{}' unavailable ({error}); falling back to CPU.",
+                                model_registration.chat_template.id
+                            ),
+                            Color::Yellow
+                        )
                     );
                 }
             }
         }
     } else {
         eprintln!(
-            "cheetah: Vulkan inference is not registered for architecture '{_architecture}'; falling back to CPU."
+            "{}",
+            color::stderr(
+                &format!(
+                    "cheetah: Vulkan inference is not registered for architecture '{_architecture}'; falling back to CPU."
+                ),
+                Color::Yellow
+            )
         );
     }
     #[cfg(not(feature = "vulkan"))]
@@ -114,7 +133,11 @@ fn load_vulkan_or_fallback(
                 .iter()
                 .all(|shader| super::shader_is_registered(shader));
         eprintln!(
-            "cheetah: Vulkan support was not compiled; falling back to CPU. Rebuild with --features vulkan."
+            "{}",
+            color::stderr(
+                "cheetah: Vulkan support was not compiled; falling back to CPU. Rebuild with --features vulkan.",
+                Color::Yellow
+            )
         );
     }
 

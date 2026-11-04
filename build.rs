@@ -14,6 +14,7 @@ struct ShaderSource {
 fn main() {
     println!("cargo:rerun-if-changed=cheetah_init.c");
     println!("cargo:rerun-if-changed=cheetah_init.h");
+    println!("cargo:rerun-if-changed=cheetah_color.h");
     println!("cargo:rerun-if-changed=cheetah_vulkan.c");
     println!("cargo:rerun-if-changed=cheetah_vulkan.h");
     println!("cargo:rerun-if-changed=matmul.comp");

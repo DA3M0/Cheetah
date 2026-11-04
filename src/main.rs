@@ -2,6 +2,7 @@
 
 mod chat;
 mod cli;
+mod color;
 mod context;
 mod inspect;
 mod options;
@@ -20,7 +21,10 @@ fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Error: {error}");
+            eprintln!(
+                "{}",
+                color::stderr(&format!("Error: {error}"), color::Color::Red)
+            );
             error.exit_code()
         }
     }
@@ -47,7 +51,13 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             Ok(())
         }
         "version" | "--version" | "-V" => {
-            println!("cheetah {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                color::stdout(
+                    &format!("cheetah {}", env!("CARGO_PKG_VERSION")),
+                    color::Color::Cyan
+                )
+            );
             Ok(())
         }
         "load" | "inspect" => run_inspect_command(&args[1..]),
@@ -87,7 +97,13 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
         Path::new(&args[1]),
         metadata,
     ))?;
-    println!("Model prepared in '{}'.", args[1]);
+    println!(
+        "{}",
+        color::stdout(
+            &format!("Model prepared in '{}'.", args[1]),
+            color::Color::Green
+        )
+    );
     Ok(())
 }
 
@@ -101,8 +117,10 @@ fn run_inspect_command(args: &[String]) -> Result<(), RunError> {
     };
     if let Some(path) = options.output {
         write_report(&path, &report)?;
-    } else {
+    } else if options.json {
         println!("{report}");
+    } else {
+        println!("{}", color::stdout(&report, color::Color::Cyan));
     }
     Ok(())
 }
@@ -145,13 +163,22 @@ fn run_context_command(
     match operation {
         ContextCommand::List => {
             for archive in runtime(store.list())? {
-                println!("{:<24} {:>5} turns", archive.name, archive.turns.len());
+                println!(
+                    "{}",
+                    color::stdout(
+                        &format!("{:<24} {:>5} turns", archive.name, archive.turns.len()),
+                        color::Color::Cyan
+                    )
+                );
             }
             Ok(())
         }
         ContextCommand::Delete(name) => {
             runtime(store.delete(&name))?;
-            println!("Deleted context '{name}'.");
+            println!(
+                "{}",
+                color::stdout(&format!("Deleted context '{name}'."), color::Color::Green)
+            );
             Ok(())
         }
     }
@@ -162,14 +189,20 @@ fn runtime<T>(result: Result<T, String>) -> Result<T, RunError> {
 }
 
 fn print_formats() {
-    println!("Supported model formats:");
-    println!("  .safetensors   Candle inference and model inspection");
-    println!("  model directory  config.json, tokenizer.json, and Safetensors weights");
+    println!(
+        "{}",
+        color::stdout(
+            "Supported model formats:\n  .safetensors   Candle inference and model inspection\n  model directory  config.json, tokenizer.json, and Safetensors weights",
+            color::Color::Cyan
+        )
+    );
 }
 
 fn print_help() {
     println!(
-        "cheetah - Local Candle/Safetensors inference and gateway\n\
+        "{}",
+        color::stdout(
+            "cheetah - Local Candle/Safetensors inference and gateway\n\
 \n\
 Usage:\n\
   cheetah                                  Load the model in the current directory and chat\n\
@@ -238,7 +271,9 @@ Examples:\n\
   CHEETAH_DEVICE=metal ./target/release/cheetah /home/user/models/qwen-0.5b\n\
 \n\
 Set CHEETAH_DEVICE to cpu (default), cuda, or metal; GPU choices require building with the matching --features option.\n\
-Enter /exit to leave a chat. Press Ctrl-C to stop the server."
+Enter /exit to leave a chat. Press Ctrl-C to stop the server.",
+            color::Color::Cyan
+        )
     );
 }
 
