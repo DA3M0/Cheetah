@@ -1,6 +1,7 @@
 //! Safe Rust adapters for C APIs declared by the root-level C headers.
 
 use std::ffi::CString;
+use std::fs;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::Mutex;
@@ -18,8 +19,24 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
     CString::new(path).map_err(|_| "Path contains an interior NUL byte.".to_string())
 }
 
+#[derive(Clone, Copy)]
+pub struct ModelMetadata {
+    pub chat_template: &'static str,
+    pub stop_markers: &'static [&'static str],
+}
+
 /// Run the C static model-preparation stage and write its result to `dst_dir`.
 pub fn init_model(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
+    init_model_with_metadata(src_dir, dst_dir, None)
+}
+
+/// Run native preparation, then override chat metadata when the Rust registry recognizes the model.
+pub fn init_model_with_metadata(
+    src_dir: &Path,
+    dst_dir: &Path,
+    metadata: Option<ModelMetadata>,
+) -> Result<(), String> {
+    let dst_dir_path = dst_dir.to_path_buf();
     let src_dir = path_to_cstring(src_dir)?;
     let dst_dir = path_to_cstring(dst_dir)?;
     let _guard = INIT_LOCK
@@ -27,15 +44,80 @@ pub fn init_model(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
         .map_err(|_| "Native model initializer lock is poisoned.".to_string())?;
     let result = unsafe { cheetah_init_model(src_dir.as_ptr(), dst_dir.as_ptr()) };
     if result == 0 {
-        Ok(())
+        if let Some(metadata) = metadata {
+            update_manifest_metadata(&dst_dir_path, metadata)
+        } else {
+            Ok(())
+        }
     } else {
         Err("Cheetah model preparation failed; see the native diagnostic above.".into())
     }
 }
 
+fn update_manifest_metadata(dst_dir: &Path, metadata: ModelMetadata) -> Result<(), String> {
+    let manifest_path = dst_dir.join("cheetah_manifest.json");
+    let bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("Failed to read {}: {error}", manifest_path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+    let object = manifest
+        .as_object_mut()
+        .ok_or_else(|| "Cheetah manifest root must be a JSON object.".to_string())?;
+    let mut stop_markers = object
+        .get("stop_markers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for marker in metadata.stop_markers {
+        if !stop_markers.iter().any(|existing| existing == marker) {
+            stop_markers.push((*marker).to_owned());
+        }
+    }
+    object.insert(
+        "chat_template".into(),
+        serde_json::Value::String(metadata.chat_template.into()),
+    );
+    object.insert(
+        "stop_markers".into(),
+        serde_json::to_value(stop_markers)
+            .map_err(|error| format!("Failed to encode model stop markers: {error}"))?,
+    );
+
+    let temporary_path = manifest_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let updated = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("Failed to encode Cheetah manifest: {error}"))?;
+    fs::write(&temporary_path, updated)
+        .map_err(|error| format!("Failed to write {}: {error}", temporary_path.display()))?;
+    if let Err(error) = fs::rename(&temporary_path, &manifest_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "Failed to replace {}: {error}",
+            manifest_path.display()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cheetah-native-manifest-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn initializer_ffi_reports_native_failure() {
@@ -45,6 +127,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("native diagnostic"));
+    }
+
+    #[test]
+    fn registry_metadata_updates_manifest_without_dropping_other_fields() {
+        let directory = temporary_directory();
+        let manifest_path = directory.join("cheetah_manifest.json");
+        fs::write(
+            &manifest_path,
+            r#"{"model_type":"custom","stop_markers":["<|detected|>"],"shards":[]}"#,
+        )
+        .unwrap();
+
+        update_manifest_metadata(
+            &directory,
+            ModelMetadata {
+                chat_template: "custom-chat",
+                stop_markers: &["<|stop|>", "</s>"],
+            },
+        )
+        .unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["model_type"], "custom");
+        assert_eq!(manifest["chat_template"], "custom-chat");
+        assert_eq!(
+            manifest["stop_markers"],
+            serde_json::json!(["<|detected|>", "<|stop|>", "</s>"])
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
 

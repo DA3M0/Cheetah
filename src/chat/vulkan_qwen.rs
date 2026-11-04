@@ -214,7 +214,7 @@ struct Layer {
 }
 
 #[derive(Clone)]
-pub(crate) struct VulkanQwenModel {
+pub(crate) struct VulkanQwenExecutor {
     config: qwen2::Config,
     embedding: WeightData,
     layers: Vec<Layer>,
@@ -222,8 +222,38 @@ pub(crate) struct VulkanQwenModel {
     lm_head: WeightData,
 }
 
-impl VulkanQwenModel {
+impl super::models::ModelRuntime for VulkanQwenExecutor {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
+        VulkanQwenExecutor::forward(self, input, offset)
+    }
+
+    fn clear_cache(&mut self) {
+        VulkanQwenExecutor::clear_cache(self);
+    }
+
+    fn device_name(&self) -> &'static str {
+        "Vulkan"
+    }
+}
+
+impl VulkanQwenExecutor {
     pub(crate) fn load(paths: &[PathBuf], config: &qwen2::Config) -> Result<Self, String> {
+        let result = (|| {
+            cheetah::native::vulkan::initialize()?;
+            cheetah::native::vulkan::prepare()?;
+            Self::load_initialized(paths, config)
+        })();
+        if result.is_err() {
+            if let Err(shutdown_error) = cheetah::native::vulkan::shutdown() {
+                eprintln!(
+                    "cheetah: Vulkan cleanup after startup failure also failed ({shutdown_error})."
+                );
+            }
+        }
+        result
+    }
+
+    fn load_initialized(paths: &[PathBuf], config: &qwen2::Config) -> Result<Self, String> {
         if config.hidden_size == 0
             || config.intermediate_size == 0
             || config.vocab_size == 0
@@ -339,14 +369,14 @@ impl VulkanQwenModel {
         })
     }
 
-    pub(crate) fn clear_cache(&mut self) {
+    pub(super) fn clear_cache(&mut self) {
         for layer in &mut self.layers {
             layer.keys.clear();
             layer.values.clear();
         }
     }
 
-    pub(crate) fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
+    pub(super) fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
         let (batch, sequence) = input
             .dims2()
             .map_err(|error| format!("Invalid Vulkan Qwen2 input: {error}"))?;

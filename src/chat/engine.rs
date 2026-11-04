@@ -1,8 +1,8 @@
+use super::models::ModelRuntime;
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
-use candle_core::{DType, Device, Shape, Tensor};
-use candle_nn::{Init, VarBuilder, var_builder::SimpleBackend};
-use candle_transformers::models::{gemma, llama, phi, qwen2};
+use candle_core::{Device, Tensor};
+use candle_transformers::models::llama;
 use rand::SeedableRng;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
@@ -86,88 +86,9 @@ impl ChatParams {
     }
 }
 
-#[derive(Clone)]
-enum CausalModel {
-    Qwen2(qwen2::Model),
-    #[cfg(feature = "vulkan")]
-    VulkanQwen2(super::vulkan_qwen::VulkanQwenModel),
-    Gemma(gemma::Model),
-    Llama(llama::Llama, llama::Cache),
-    Phi(phi::Model),
-}
-
-#[derive(Clone, Copy)]
-enum ChatStyle {
-    Qwen,
-    Gemma,
-    Llama2,
-    Llama3,
-    Phi,
-}
-
-impl CausalModel {
-    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
-        match self {
-            Self::Qwen2(model) => model
-                .forward(input, offset)
-                .map_err(|error| error.to_string()),
-            #[cfg(feature = "vulkan")]
-            Self::VulkanQwen2(model) => model.forward(input, offset),
-            Self::Gemma(model) => model
-                .forward(input, offset)
-                .map_err(|error| error.to_string()),
-            Self::Llama(model, cache) => model
-                .forward(input, offset, cache)
-                .map_err(|error| error.to_string()),
-            Self::Phi(model) => model.forward(input).map_err(|error| error.to_string()),
-        }
-    }
-
-    fn clear_cache(&mut self) {
-        match self {
-            Self::Qwen2(model) => model.clear_kv_cache(),
-            #[cfg(feature = "vulkan")]
-            Self::VulkanQwen2(model) => model.clear_cache(),
-            Self::Gemma(model) => model.clear_kv_cache(),
-            Self::Llama(_, _) => {}
-            Self::Phi(model) => model.clear_kv_cache(),
-        }
-    }
-}
-
 struct LoadedModel {
-    model: CausalModel,
+    model: Box<dyn ModelRuntime>,
     device: Device,
-}
-
-struct TiedEmbeddingBackend<'a> {
-    source: VarBuilder<'a>,
-}
-
-impl SimpleBackend for TiedEmbeddingBackend<'_> {
-    fn get(
-        &self,
-        shape: Shape,
-        name: &str,
-        hints: Init,
-        dtype: DType,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
-        let name = if name == "lm_head.weight" {
-            "model.embed_tokens.weight"
-        } else {
-            name
-        };
-        self.source
-            .get_with_hints(shape, name, hints)
-            .and_then(|tensor| tensor.to_dtype(dtype))
-            .and_then(|tensor| tensor.to_device(device))
-    }
-
-    fn contains_tensor(&self, name: &str) -> bool {
-        self.source.contains_tensor(name)
-            || name == "lm_head.weight" && self.source.contains_tensor("model.embed_tokens.weight")
-    }
 }
 
 pub struct InferenceContext;
@@ -176,7 +97,7 @@ pub struct Engine {
     model: Mutex<LoadedModel>,
     tokenizer: Tokenizer,
     model_id: String,
-    chat_style: ChatStyle,
+    prompt_renderer: super::models::PromptRenderer,
     max_position_embeddings: usize,
     eos_token_ids: HashSet<u32>,
     stop_markers: Vec<String>,
@@ -221,42 +142,46 @@ impl Engine {
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
         let config: ModelConfig = serde_json::from_value(raw_config.clone())
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
-        let manifest_stop_markers = read_manifest_stop_markers(model_dir)?;
         let architecture = config
             .architectures
             .as_ref()
             .and_then(|architectures| architectures.first())
             .map(String::as_str)
             .unwrap_or(config.model_type.as_str());
+        let registration = super::models::registration_for_architecture(architecture)?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
+        let tokenizer_bytes = fs::read(&tokenizer_path).map_err(|error| {
+            format!(
+                "Failed to read tokenizer '{}': {error}",
+                tokenizer_path.display()
+            )
+        })?;
+        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes).map_err(|error| {
             format!(
                 "Failed to load tokenizer '{}': {error}",
                 tokenizer_path.display()
             )
         })?;
+        let (weight_paths, manifest_stop_markers) = resolve_model_files(path)?;
         let vocabulary = tokenizer.get_vocab(true);
-        let chat_style = match config.model_type.as_str() {
-            "qwen2" => ChatStyle::Qwen,
-            "gemma" => ChatStyle::Gemma,
-            "llama"
-                if manifest_stop_markers
-                    .as_ref()
-                    .is_some_and(|markers| markers.iter().any(|marker| marker == "<|eot_id|>"))
-                    || manifest_stop_markers.is_none()
-                        && vocabulary.contains_key("<|start_header_id|>")
-                        && vocabulary.contains_key("<|eot_id|>") =>
-            {
-                ChatStyle::Llama3
-            }
-            "llama" => ChatStyle::Llama2,
-            "phi" => ChatStyle::Phi,
-            _ => ChatStyle::Qwen,
+        let use_header_renderer = registration.chat_template.header_renderer.is_some()
+            && (manifest_stop_markers
+                .as_ref()
+                .is_some_and(|markers| markers.iter().any(|marker| marker == "<|eot_id|>"))
+                || manifest_stop_markers.is_none()
+                    && vocabulary.contains_key("<|start_header_id|>")
+                    && vocabulary.contains_key("<|eot_id|>"));
+        let prompt_renderer = if use_header_renderer {
+            registration
+                .chat_template
+                .header_renderer
+                .unwrap_or(registration.chat_template.render)
+        } else {
+            registration.chat_template.render
         };
-        let weight_paths = resolve_weight_files(path)?;
         let (device, model) =
-            load_model_backend(&weight_paths, &config_bytes, raw_config, architecture)?;
+            super::models::load_model(&weight_paths, &config_bytes, raw_config, architecture)?;
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {
             match value {
@@ -275,8 +200,13 @@ impl Engine {
                 _ => {}
             }
         }
-        let stop_markers =
-            manifest_stop_markers.unwrap_or_else(|| stop_markers_for(&config.model_type));
+        let stop_markers = manifest_stop_markers.unwrap_or_else(|| {
+            registration
+                .stop_markers
+                .iter()
+                .map(|marker| (*marker).to_owned())
+                .collect()
+        });
         for marker in &stop_markers {
             if let Some(id) = vocabulary.get(marker) {
                 eos_token_ids.insert(*id);
@@ -290,7 +220,7 @@ impl Engine {
                 .and_then(|name| name.to_str())
                 .unwrap_or("model")
                 .to_owned(),
-            chat_style,
+            prompt_renderer,
             max_position_embeddings: config.max_position_embeddings.min(ctx_size).min(
                 if config.model_type == "llama" {
                     llama::MAX_SEQ_LEN
@@ -312,15 +242,7 @@ impl Engine {
             .model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        #[cfg(feature = "vulkan")]
-        if matches!(&loaded.model, CausalModel::VulkanQwen2(_)) {
-            return "Vulkan";
-        }
-        match &loaded.device {
-            Device::Cpu => "CPU",
-            Device::Cuda(_) => "CUDA",
-            Device::Metal(_) => "Metal",
-        }
+        loaded.model.device_name()
     }
 
     pub fn new_context(&self) -> Result<InferenceContext, String> {
@@ -335,7 +257,7 @@ impl Engine {
     ) -> Result<(Vec<u32>, usize), String> {
         let mut dropped_turns = 0;
         loop {
-            let prompt = render_chat_prompt(messages, system, self.chat_style);
+            let prompt = (self.prompt_renderer)(messages, system);
             let tokens = self
                 .tokenizer
                 .encode(prompt, false)
@@ -554,7 +476,54 @@ impl Engine {
     }
 }
 
-fn resolve_weight_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+fn resolve_model_files(path: &Path) -> Result<(Vec<PathBuf>, Option<Vec<String>>), String> {
+    let model_dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let manifest = read_model_manifest(model_dir)?;
+    let stop_markers = manifest
+        .as_ref()
+        .map(parse_manifest_stop_markers)
+        .transpose()?;
+    let weight_paths = resolve_weight_files(path, manifest.as_ref())?;
+    Ok((weight_paths, stop_markers))
+}
+
+fn read_model_manifest(model_dir: &Path) -> Result<Option<serde_json::Value>, String> {
+    let manifest_path = model_dir.join("cheetah_manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| format!("Failed to read {}: {error}", manifest_path.display()))?,
+    )
+    .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+    Ok(Some(manifest))
+}
+
+fn parse_manifest_stop_markers(manifest: &serde_json::Value) -> Result<Vec<String>, String> {
+    let markers = manifest
+        .get("stop_markers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Cheetah manifest is missing its stop_markers list.".to_string())?;
+    markers
+        .iter()
+        .map(|marker| {
+            marker
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "Cheetah manifest contains a non-string stop marker.".to_string())
+        })
+        .collect()
+}
+
+fn resolve_weight_files(
+    path: &Path,
+    manifest: Option<&serde_json::Value>,
+) -> Result<Vec<PathBuf>, String> {
     if path.is_file() {
         if path.extension().and_then(|ext| ext.to_str()) != Some("safetensors") {
             return Err(format!(
@@ -564,13 +533,7 @@ fn resolve_weight_files(path: &Path) -> Result<Vec<PathBuf>, String> {
         }
         return Ok(vec![path.to_path_buf()]);
     }
-    let manifest_path = path.join("cheetah_manifest.json");
-    if manifest_path.is_file() {
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(&manifest_path)
-                .map_err(|error| format!("Failed to read {}: {error}", manifest_path.display()))?,
-        )
-        .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+    if let Some(manifest) = manifest {
         let shards = manifest
             .get("shards")
             .and_then(serde_json::Value::as_array)
@@ -643,152 +606,6 @@ fn resolve_weight_files(path: &Path) -> Result<Vec<PathBuf>, String> {
         "No model.safetensors or model.safetensors.index.json found in '{}'.",
         path.display()
     ))
-}
-
-fn read_manifest_stop_markers(model_dir: &Path) -> Result<Option<Vec<String>>, String> {
-    let path = model_dir.join("cheetah_manifest.json");
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?,
-    )
-    .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
-    let markers = manifest
-        .get("stop_markers")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "Cheetah manifest is missing its stop_markers list.".to_string())?;
-    markers
-        .iter()
-        .map(|marker| {
-            marker
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| "Cheetah manifest contains a non-string stop marker.".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
-}
-
-fn render_chat_prompt(messages: &[ChatMessage], system: Option<&str>, style: ChatStyle) -> String {
-    if matches!(style, ChatStyle::Gemma) {
-        let mut rendered = String::new();
-        for (index, message) in messages.iter().enumerate() {
-            rendered.push_str("<start_of_turn>");
-            rendered.push_str(if message.role == "assistant" {
-                "model"
-            } else {
-                "user"
-            });
-            rendered.push('\n');
-            if index == 0
-                && message.role != "assistant"
-                && let Some(system) = system
-            {
-                rendered.push_str(system);
-                rendered.push_str("\n\n");
-            }
-            rendered.push_str(&message.content);
-            rendered.push_str("<end_of_turn>\n");
-        }
-        rendered.push_str("<start_of_turn>model\n");
-        return rendered;
-    }
-
-    if matches!(style, ChatStyle::Llama3) {
-        let mut rendered = String::from("<|begin_of_text|>");
-        if let Some(system) = system {
-            rendered.push_str("<|start_header_id|>system<|end_header_id|>\n");
-            rendered.push_str(system);
-            rendered.push_str("<|eot_id|>");
-        }
-        for message in messages {
-            rendered.push_str("<|start_header_id|>");
-            rendered.push_str(&message.role);
-            rendered.push_str("<|end_header_id|>\n");
-            rendered.push_str(&message.content);
-            rendered.push_str("<|eot_id|>");
-        }
-        rendered.push_str("<|start_header_id|>assistant<|end_header_id|>\n");
-        return rendered;
-    }
-
-    if matches!(style, ChatStyle::Llama2) {
-        let mut rendered = String::new();
-        let mut system_message = system.map(str::to_owned);
-        let mut first_user = true;
-        for message in messages {
-            match message.role.as_str() {
-                "system" => system_message = Some(message.content.clone()),
-                "assistant" => {
-                    rendered.push(' ');
-                    rendered.push_str(&message.content);
-                    rendered.push_str(" </s>");
-                }
-                _ => {
-                    rendered.push_str("<s>[INST] ");
-                    if first_user && let Some(system) = system_message.as_deref() {
-                        rendered.push_str("<<SYS>>\n");
-                        rendered.push_str(system);
-                        rendered.push_str("\n<</SYS>>\n\n");
-                    }
-                    rendered.push_str(&message.content);
-                    rendered.push_str(" [/INST]");
-                    first_user = false;
-                }
-            }
-        }
-        return rendered;
-    }
-
-    if matches!(style, ChatStyle::Phi) {
-        let mut rendered = String::new();
-        if let Some(system) = system {
-            rendered.push_str("<|system|>\n");
-            rendered.push_str(system);
-            rendered.push_str("<|end|>\n");
-        }
-        for message in messages {
-            let role = match message.role.as_str() {
-                "assistant" => "assistant",
-                "system" => "system",
-                _ => "user",
-            };
-            rendered.push_str("<|");
-            rendered.push_str(role);
-            rendered.push_str("|>\n");
-            rendered.push_str(&message.content);
-            rendered.push_str("<|end|>\n");
-        }
-        rendered.push_str("<|assistant|>\n");
-        return rendered;
-    }
-
-    let mut rendered = String::new();
-    if let Some(system) = system {
-        rendered.push_str("<|im_start|>system\n");
-        rendered.push_str(system);
-        rendered.push_str("<|im_end|>\n");
-    }
-    for message in messages {
-        rendered.push_str("<|im_start|>");
-        rendered.push_str(&message.role);
-        rendered.push('\n');
-        rendered.push_str(&message.content);
-        rendered.push_str("<|im_end|>\n");
-    }
-    rendered.push_str("<|im_start|>assistant\n");
-    rendered
-}
-
-fn stop_markers_for(model_type: &str) -> Vec<String> {
-    match model_type {
-        "qwen2" => vec!["<|im_end|>".into()],
-        "gemma" => vec!["<end_of_turn>".into()],
-        "llama" => vec!["<|eot_id|>".into(), "</s>".into()],
-        "phi" => vec!["<|end|>".into(), "<|assistant|>".into()],
-        _ => vec![],
-    }
 }
 
 fn random_seed() -> u64 {
@@ -978,173 +795,9 @@ fn chat_loop(
     }
 }
 
-fn load_model_backend(
-    weight_paths: &[PathBuf],
-    config_bytes: &[u8],
-    raw_config: serde_json::Value,
-    architecture: &str,
-) -> Result<(Device, CausalModel), String> {
-    let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
-    if selected == "vulkan" {
-        #[cfg(feature = "vulkan")]
-        {
-            if matches!(architecture, "Qwen2ForCausalLM" | "qwen2") {
-                let vulkan_model = (|| {
-                    cheetah::native::vulkan::initialize()?;
-                    cheetah::native::vulkan::prepare()?;
-                    let qwen_config = serde_json::from_value(raw_config.clone())
-                        .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
-                    super::vulkan_qwen::VulkanQwenModel::load(weight_paths, &qwen_config)
-                })();
-                match vulkan_model {
-                    Ok(model) => return Ok((Device::Cpu, CausalModel::VulkanQwen2(model))),
-                    Err(error) => {
-                        if let Err(shutdown_error) = cheetah::native::vulkan::shutdown() {
-                            eprintln!(
-                                "cheetah: Vulkan cleanup after startup failure also failed ({shutdown_error})."
-                            );
-                        }
-                        eprintln!(
-                            "cheetah: Vulkan Qwen2 unavailable ({error}); falling back to CPU."
-                        );
-                    }
-                }
-            } else {
-                eprintln!(
-                    "cheetah: Vulkan inference currently supports dense Qwen2 only, not '{architecture}'; falling back to CPU."
-                );
-            }
-        }
-        #[cfg(not(feature = "vulkan"))]
-        eprintln!(
-            "cheetah: Vulkan support was not compiled; falling back to CPU. Rebuild with --features vulkan."
-        );
-        return load_candle_model(weight_paths, config_bytes, raw_config, architecture);
-    }
-
-    let device = choose_device()?;
-    let model = load_candle_model_on_device(
-        weight_paths,
-        config_bytes,
-        raw_config,
-        architecture,
-        &device,
-    )?;
-    Ok((device, model))
-}
-
-fn load_candle_model(
-    weight_paths: &[PathBuf],
-    config_bytes: &[u8],
-    raw_config: serde_json::Value,
-    architecture: &str,
-) -> Result<(Device, CausalModel), String> {
-    let device = Device::Cpu;
-    let model = load_candle_model_on_device(
-        weight_paths,
-        config_bytes,
-        raw_config,
-        architecture,
-        &device,
-    )?;
-    Ok((device, model))
-}
-
-fn load_candle_model_on_device(
-    weight_paths: &[PathBuf],
-    config_bytes: &[u8],
-    raw_config: serde_json::Value,
-    architecture: &str,
-    device: &Device,
-) -> Result<CausalModel, String> {
-    let mut vb = unsafe { VarBuilder::from_mmaped_safetensors(weight_paths, DType::F32, device) }
-        .map_err(|error| format!("Failed to map Safetensors weights: {error}"))?;
-    if raw_config
-        .get("tie_word_embeddings")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        && !vb.contains_tensor("lm_head.weight")
-    {
-        vb = VarBuilder::new_with_args(
-            Box::new(TiedEmbeddingBackend { source: vb }),
-            DType::F32,
-            device,
-        );
-    }
-    match architecture {
-        "Qwen2ForCausalLM" | "qwen2" => {
-            let config: qwen2::Config = serde_json::from_value(raw_config)
-                .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
-            qwen2::Model::new(&config, vb)
-                .map(CausalModel::Qwen2)
-                .map_err(|error| format!("Failed to load Qwen2 weights: {error}"))
-        }
-        "GemmaForCausalLM" | "gemma" => {
-            let config: gemma::Config = serde_json::from_slice(config_bytes)
-                .map_err(|error| format!("Invalid Gemma configuration: {error}"))?;
-            gemma::Model::new(&config, vb)
-                .map(CausalModel::Gemma)
-                .map_err(|error| format!("Failed to load Gemma weights: {error}"))
-        }
-        "LlamaForCausalLM" | "llama" => {
-            let raw: llama::LlamaConfig = serde_json::from_slice(config_bytes)
-                .map_err(|error| format!("Invalid Llama configuration: {error}"))?;
-            let config = raw.into_config(false);
-            let model = llama::Llama::load(vb, &config)
-                .map_err(|error| format!("Failed to load Llama weights: {error}"))?;
-            let cache = llama::Cache::new(true, DType::F32, &config, device)
-                .map_err(|error| format!("Failed to initialize Llama KV cache: {error}"))?;
-            Ok(CausalModel::Llama(model, cache))
-        }
-        "PhiForCausalLM" | "phi" => {
-            let config: phi::Config = serde_json::from_slice(config_bytes)
-                .map_err(|error| format!("Invalid Phi configuration: {error}"))?;
-            phi::Model::new(&config, vb)
-                .map(CausalModel::Phi)
-                .map_err(|error| format!("Failed to load Phi weights: {error}"))
-        }
-        other => Err(format!(
-            "Unsupported model architecture '{other}'. Supported architectures: Qwen2, Gemma, Llama, and Phi."
-        )),
-    }
-}
-
-fn choose_device() -> Result<Device, String> {
-    let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
-    match selected.as_str() {
-        "cpu" => Ok(Device::Cpu),
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                return Device::new_cuda(0)
-                    .map_err(|error| format!("Failed to initialize CUDA device: {error}"));
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err("CUDA support was not compiled; rebuild with --features cuda.".into())
-            }
-        }
-        "metal" => {
-            #[cfg(feature = "metal")]
-            {
-                return Device::new_metal(0)
-                    .map_err(|error| format!("Failed to initialize Metal device: {error}"));
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                Err("Metal support was not compiled; rebuild with --features metal.".into())
-            }
-        }
-        _ => Err(format!(
-            "Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, or metal."
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn temporary_directory(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1171,7 +824,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = resolve_weight_files(&directory).unwrap();
+        let (files, stop_markers) = resolve_model_files(&directory).unwrap();
         assert_eq!(
             files,
             vec![
@@ -1179,10 +832,7 @@ mod tests {
                 weights.join("layer_1.safetensors")
             ]
         );
-        assert_eq!(
-            read_manifest_stop_markers(&directory).unwrap(),
-            Some(vec!["<|eot_id|>".to_string()])
-        );
+        assert_eq!(stop_markers, Some(vec!["<|eot_id|>".to_string()]));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1191,43 +841,76 @@ mod tests {
         let directory = temporary_directory("unsafe_manifest");
         fs::write(
             directory.join("cheetah_manifest.json"),
-            r#"{"shards":[{"file":"../outside.safetensors"}]}"#,
+            r#"{"stop_markers":[],"shards":[{"file":"../outside.safetensors"}]}"#,
         )
         .unwrap();
 
-        let error = resolve_weight_files(&directory).unwrap_err();
+        let error = resolve_model_files(&directory).unwrap_err();
         assert!(error.contains("unsafe or unsupported shard path"));
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
+    fn resolves_direct_weight_file_and_parent_manifest_metadata() {
+        let directory = temporary_directory("direct_manifest_metadata");
+        let weights = directory.join("model.safetensors");
+        fs::write(&weights, []).unwrap();
+        fs::write(
+            directory.join("cheetah_manifest.json"),
+            r#"{"stop_markers":["<|stop|>"],"shards":[]}"#,
+        )
+        .unwrap();
+
+        let (files, stop_markers) = resolve_model_files(&weights).unwrap();
+        assert_eq!(files, vec![weights]);
+        assert_eq!(stop_markers, Some(vec!["<|stop|>".to_string()]));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn renders_qwen_chatml_prompt_with_system_message() {
-        let prompt = render_chat_prompt(
-            &[ChatMessage::new("user", "hello")],
-            Some("Be brief."),
-            ChatStyle::Qwen,
-        );
+        let template = super::super::models::registration_for_architecture("qwen2")
+            .unwrap()
+            .chat_template;
+        let prompt = (template.render)(&[ChatMessage::new("user", "hello")], Some("Be brief."));
         assert!(prompt.starts_with("<|im_start|>system\nBe brief.<|im_end|>\n"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
     fn renders_llama_instruction_prompt() {
-        let prompt = render_chat_prompt(
-            &[ChatMessage::new("user", "hello")],
-            Some("Be brief."),
-            ChatStyle::Llama2,
-        );
+        let template = super::super::models::registration_for_architecture("llama")
+            .unwrap()
+            .chat_template;
+        let prompt = (template.render)(&[ChatMessage::new("user", "hello")], Some("Be brief."));
         assert!(prompt.contains("<<SYS>>\nBe brief.\n<</SYS>>"));
         assert!(prompt.ends_with("hello [/INST]"));
     }
 
     #[test]
+    fn renders_mistral_instruction_prompt() {
+        let template = super::super::models::registration_for_architecture("MistralForCausalLM")
+            .unwrap()
+            .chat_template;
+        let prompt = (template.render)(
+            &[
+                ChatMessage::new("user", "hello"),
+                ChatMessage::new("assistant", "hi"),
+            ],
+            Some("Be brief."),
+        );
+        assert!(prompt.starts_with("<s>[INST] <<SYS>>\nBe brief.\n<</SYS>>\n\nhello [/INST]"));
+        assert!(prompt.ends_with(" hi </s>"));
+    }
+
+    #[test]
     fn renders_llama3_header_prompt() {
-        let prompt = render_chat_prompt(
+        let template = super::super::models::registration_for_architecture("llama")
+            .unwrap()
+            .chat_template;
+        let prompt = (template.header_renderer.unwrap())(
             &[ChatMessage::new("user", "hello")],
             Some("Be brief."),
-            ChatStyle::Llama3,
         );
         assert!(prompt.starts_with("<|begin_of_text|><|start_header_id|>system"));
         assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n"));
@@ -1246,30 +929,6 @@ mod tests {
         assert_eq!(
             sample_token(&logits, &[], &options, &mut first).unwrap(),
             sample_token(&logits, &[], &options, &mut second).unwrap()
-        );
-    }
-
-    #[test]
-    fn tied_lm_head_uses_embedding_weights() {
-        let device = Device::Cpu;
-        let embeddings = Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &device).unwrap();
-        let source = VarBuilder::from_tensors(
-            HashMap::from([("model.embed_tokens.weight".to_owned(), embeddings)]),
-            DType::F32,
-            &device,
-        );
-        let tied = VarBuilder::new_with_args(
-            Box::new(TiedEmbeddingBackend { source }),
-            DType::F32,
-            &device,
-        );
-        let lm_head = tied
-            .pp("lm_head")
-            .get::<(usize, usize)>((2, 2), "weight")
-            .unwrap();
-        assert_eq!(
-            lm_head.to_vec2::<f32>().unwrap(),
-            vec![vec![1., 2.], vec![3., 4.]]
         );
     }
 }

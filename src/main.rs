@@ -80,7 +80,13 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
             "Usage: cheetah init <source-dir> <destination-dir>",
         ));
     }
-    runtime(native::init_model(Path::new(&args[0]), Path::new(&args[1])))?;
+    let source = Path::new(&args[0]);
+    let metadata = runtime(chat::model_metadata_for_init(source))?;
+    runtime(native::init_model_with_metadata(
+        source,
+        Path::new(&args[1]),
+        metadata,
+    ))?;
     println!("Model prepared in '{}'.", args[1]);
     Ok(())
 }

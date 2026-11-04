@@ -1,90 +1,215 @@
 # Cheetah
 
-Cheetah is a local language-model CLI and OpenAI-compatible gateway using Candle for inference and Safetensors checkpoints for model weights. Supported decoder architectures include Qwen2, Gemma, Llama, and Phi; CPU is the default runtime.
+Cheetah is a local language-model CLI and OpenAI-compatible API gateway written in Rust and C. It runs Safetensors decoder models using Candle on CPU, CUDA, or Metal; an optional Vulkan backend provides Qwen2, supported Mistral 7B, and Mixtral inference. Cheetah can also prepare model weights for mmap-friendly loading and inspect Safetensors files.
+
+The quickest way to start a chat is to pass a Hugging Face model directory:
+
+```sh
+cheetah /path/to/model
+```
+
+The directory should contain `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` with its weight shards. You can also launch `cheetah` from inside the model directory.
 
 ## Build
+
+The default build uses Candle's CPU backend:
 
 ```sh
 cargo build --release
 ```
 
-### CUDA (NVIDIA)
-
-Build with the CUDA inference backend, then select it when starting Cheetah:
+The executable is created at `target/release/cheetah`. GPU backends are selected at runtime and must also be enabled at build time:
 
 ```sh
+# NVIDIA CUDA
 cargo build --release --features cuda
-CHEETAH_DEVICE=cuda ./target/release/cheetah /home/user/models/qwen-0.5b
-```
+CHEETAH_DEVICE=cuda ./target/release/cheetah /path/to/model
 
-### Metal (macOS)
-
-Build with the Metal inference backend, then select it when starting Cheetah:
-
-```sh
+# Apple Metal (macOS)
 cargo build --release --features metal
-CHEETAH_DEVICE=metal ./target/release/cheetah /home/user/models/qwen-0.5b
+CHEETAH_DEVICE=metal ./target/release/cheetah /path/to/model
 ```
 
-The selected backend must be included at build time. Without `CHEETAH_DEVICE`, Cheetah uses the CPU; `CHEETAH_DEVICE=cpu` explicitly selects it.
+Without `CHEETAH_DEVICE`, Cheetah uses CPU. CUDA and Metal require their respective local toolchains and compatible runtime/driver installations.
 
-The Vulkan feature provides a C compute backend and dense Qwen2 inference. It requires a Vulkan runtime, Vulkan headers/loader, and a C compiler. When `glslc` is available, Cargo compiles and embeds the matmul and Qwen2 compute shaders. The default 800 MiB host-visible/coherent buffer pool can be resized with `CHEETAH_VRAM_POOL_SIZE` (bytes). Select it at runtime with:
+### Vulkan
+
+The optional Vulkan feature uses native C compute operators for Qwen2, Mistral, and Mixtral. It requires a Vulkan development environment (headers, loader/runtime, and a C compiler); the compute shaders are compiled with `glslc`.
 
 ```sh
 cargo build --release --features vulkan
-CHEETAH_DEVICE=vulkan ./target/release/cheetah /home/user/models/qwen-0.5b
+CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/qwen2-model
 ```
 
-The current inference path supports dense Qwen2 checkpoints with F32, F16, or BF16 weights. Unsupported architectures, unavailable Vulkan devices, shader/pipeline startup errors, and model-load errors emit a diagnostic and fall back to CPU. Errors during an active Vulkan inference are returned rather than silently switching backends. Other architectures continue to use their existing Candle backends.
+The Vulkan paths support F32, F16, and BF16 weights. Mistral uses the standard 7B configuration presets supported by Candle 0.4.1; Mixtral uses the Mixtral sparse-expert architecture and its configured top-k routing. Unsupported configurations, unavailable Vulkan devices, or initialization and model-loading errors report a diagnostic and fall back to Candle on CPU. An error during active Vulkan inference is returned rather than silently switching devices. Gemma, Llama, and Phi currently use Candle backends only.
 
-The C API, including compute-device initialization and matrix multiplication, is also exposed through `cheetah::native::vulkan`. GPU operator tests are opt-in and require a Vulkan compute device plus `glslc`:
+Vulkan operator tests that exercise a real device are ignored by default and require a Vulkan compute device and `glslc`:
 
 ```sh
 cargo test --features vulkan
 cargo test --features vulkan qwen_operators_match_cpu_reference -- --ignored --nocapture
 ```
 
-Set `CHEETAH_MATMUL_SPV` or `CHEETAH_QWEN_OPS_SPV` to override the corresponding compiled shader path.
-
-## Static model initialization
-
-`cheetah init` prepares a Hugging Face model directory for static, mmap-friendly loading. It recursively scans Safetensors files, writes per-layer weight shards below `.cheetah/weights/`, and emits `cheetah_manifest.json` at the output root. Shard payloads are aligned to 4 KiB; a missing `config.json` is inferred and generated. Tokenizer files are copied when present. The source directory is not modified.
-
-```sh
-cargo run -- init /home/user/models/qwen-0.5b /home/benny/models/qwen-0.5b-prepared
-cargo run -- inspect /home/user/models/qwen-0.5b-prepared
-```
-
-The output directory is generated model data: initialization replaces its unsharded Safetensors weight files and manages stale generated shards. You can also use `cheetah prepare` as an alias for `cheetah init`.
+`CHEETAH_MATMUL_SPV` and `CHEETAH_QWEN_OPS_SPV` can override the corresponding compiled shader paths.
 
 ## Chat
 
-Pass a Hugging Face model directory containing `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` plus its shard files:
-
 ```sh
-cd /home/benny/models/qwen-0.5b && cheetah
-cargo run -- /home/user/models/qwen-0.5b
-cargo run -- /home/user/models/qwen-0.5b --max-tokens 128 --temperature 0
+# Interactive chat from the current model directory
+cd /path/to/model && cheetah
+
+# Chat using a model directory or a Safetensors file
+cheetah /path/to/model
+cheetah chat /path/to/model
+cheetah /path/to/model/model.safetensors
+
+# Configure generation
+cheetah /path/to/model --threads 8 --max-tokens 128
+cheetah /path/to/model --temperature 0.7 --top-k 50 --seed 42
+cheetah /path/to/model --system "You are a concise assistant."
 ```
 
-When Cheetah is launched without arguments, it loads the model from the current directory and starts an interactive chat.
+| Option | Default | Description |
+| --- | --- | --- |
+| `--threads N` | Physical core count | CPU inference thread count |
+| `--max-tokens N` | 256 | Maximum generated tokens per turn |
+| `--ctx-size N` | 8192 | Context window size in tokens |
+| `--temperature F` | 0 | Sampling temperature; `0` uses deterministic greedy decoding |
+| `--top-p F` | 0.9 | Nucleus sampling threshold; used when temperature is greater than zero |
+| `--top-k N` | Disabled | Limit sampling to the top K candidates |
+| `--repeat-penalty F` | 1 (disabled) | Repetition penalty |
+| `--seed N` | Random | Seed for reproducible sampling |
+| `--system "..."` | Built-in concise assistant prompt | System prompt, injected at the beginning of the conversation |
+| `--context <name>` | None | Restore a saved conversation |
+| `--context-dir <path>` | Platform application-data directory | Override context archive storage |
 
-The CLI also accepts a direct `.safetensors` path when its config and tokenizer files are in the same directory. Chat supports multi-turn conversations, `/exit`, `/clear`, `/save <name>`, and named context restore with `--context <name>`. Context archives are stored under the platform's Cheetah application-data directory; override it with `--context-dir <path>`.
+At the chat prompt, use `/exit` or `/quit` to leave, `/clear` to reset the conversation, `/save <name>` to save it, and `/help` to list chat commands. `Ctrl-C` interrupts the current generation; `Ctrl-D` exits.
 
-Sampling options include `--temperature`, `--top-p`, `--top-k`, `--repeat-penalty`, and `--seed`. `--threads` controls the CPU thread pool and `--ctx-size` bounds the context window.
+### Context management
+
+Restore a saved conversation by passing the same model and context name:
+
+```sh
+cheetah /path/to/model --context work
+cheetah context list
+cheetah context delete work
+```
+
+Contexts preserve the conversation and inference settings. The model path and explicitly supplied settings must be compatible with the saved context. `--context-dir <path>` can be used with chat and context-management commands to choose a different storage directory.
+
+## Model initialization
+
+`cheetah init` prepares a Hugging Face model directory for static, mmap-friendly loading. It recursively scans Safetensors weights, writes aligned per-layer shards below `.cheetah/weights/`, and emits `cheetah_manifest.json`. A missing `config.json` can be inferred; tokenizer files are copied when present. The source directory is not modified. `prepare` is an alias for `init`.
+
+```sh
+cheetah init /path/to/hf-model /path/to/prepared-model
+cheetah inspect /path/to/prepared-model
+```
+
+The destination is generated model data: initialization replaces unsharded Safetensors weight files there and manages stale generated shards.
 
 ## Model inspection
 
 ```sh
-cargo run -- inspect /home/user/models/qwen-0.5b
-cargo run -- inspect /home/user/models/qwen-0.5b/model.safetensors --json --output report.json
-cargo run -- inspect /home/user/models/qwen-0.5b-prepared
+cheetah formats
+cheetah inspect /path/to/model
+cheetah inspect /path/to/model/model.safetensors --all
+cheetah inspect /path/to/model/model.safetensors --json --output report.json
 ```
 
-## OpenAI-compatible server
+`load` is a compatibility alias for `inspect`. Inspection supports Safetensors files and model directories, reports model/tensor metadata, and validates file headers and tensor data ranges. By default, at most 20 tensors are shown; `--all` shows every tensor. `--output` overwrites the specified report file and suppresses terminal output.
+
+## OpenAI-compatible API server
+
+Start a server with a model path, or resolve a model by name under `--model-dir`:
 
 ```sh
-cargo run -- serve /home/benny/models/qwen-0.5b --host 127.0.0.1 --port 8080
+cheetah serve /path/to/model --host 127.0.0.1 --port 8080
+
+# Resolve "qwen" in ./models and generate an API key
+cheetah serve qwen --model-dir ./models --port 8080 --generate-key
 ```
 
-The server exposes `POST /v1/chat/completions` (including SSE streaming), non-streaming `POST /v1/completions`, `GET /v1/models`, `GET /v1/models/:id`, and `GET /health`. Unauthenticated non-loopback listeners are rejected; use `--api-key` or `--generate-key` when binding to a non-loopback address.
+The service prints its URL and, when enabled, its API key at startup. Press `Ctrl-C` to stop it.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `<name-or-path>` | Required | Model name or Safetensors model path |
+| `--model <name-or-path>` | Not applicable | Compatibility syntax for supplying the model |
+| `--model-dir <directory>` | `.` | Directory searched when a model name is used |
+| `--host <address>` | `127.0.0.1` | Listening address |
+| `--port <port>` | 8080 | Listening port; `0` selects an available port |
+| `--max-concurrent-generations N` | 1 | Maximum simultaneous inference requests |
+| `--generate-key` | Disabled | Generate and print an API key |
+| `--api-key <KEY>` | None | Set an API key; mutually exclusive with `--generate-key` |
+
+Chat options can also be supplied to `serve` to set generation defaults. Without authentication, the server refuses non-loopback listen addresses. Requests other than `GET /health` require `Authorization: Bearer <key>`.
+
+### Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/v1/chat/completions` | Chat completions, including SSE streaming with `stream: true` |
+| `POST` | `/v1/completions` | Non-streaming text completion; the prompt is treated as one user message |
+| `GET` | `/v1/models` | List the loaded model |
+| `GET` | `/v1/models/:id` | Get the loaded model |
+| `GET` | `/health` | Health check; no authentication required |
+
+Example requests:
+
+```sh
+curl http://localhost:8080/v1/models \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
+
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+The standard OpenAI Python client can use the local server by setting `base_url`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="YOUR_API_KEY",
+)
+
+response = client.chat.completions.create(
+    model="qwen-0.5b",
+    messages=[{"role": "user", "content": "Hello"}],
+    max_tokens=128,
+)
+print(response.choices[0].message.content)
+```
+
+The chat endpoint accepts `model`, `messages`, `stream`, `temperature`, `top_p`, `top_k`, `max_tokens` or `max_completion_tokens`, `stop`, `seed`, `n` (only `1`), `tools`, and `tool_choice`. Supported roles are `system`, `developer` (mapped to system), `user`, `assistant`, and `tool`. Tool calls are returned to the client; Cheetah does not execute external functions. The text-completion endpoint supports `prompt`, `stream` (streaming is not supported), `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, and `echo` (not currently supported).
+
+The server loads one model at a time. Generation requests are queued in arrival order, with concurrency limited by `--max-concurrent-generations`; raising the limit may increase memory use. Hot-loading multiple models, embeddings, audio, and image endpoints are not supported.
+
+## Supported models and limitations
+
+- **Inference:** Safetensors decoder models registered for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral architectures. Candle CPU, CUDA, and Metal support depends on the selected architecture and compiled backend. Vulkan inference supports Qwen2, standard Mistral 7B configs, and Mixtral with F32, F16, or BF16 weights.
+- **Inspection and preparation:** Safetensors model directories and weight files.
+- **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
+
+Model inference requires enough system or GPU memory for the weights, context, and generated output. Actual performance depends on model size, backend, and hardware.
+
+## Adding model registrations
+
+The build scans `src/chat/models/*.rs` (excluding shared registry/support modules) and generates the model registry. Add a Rust module with a `REGISTRATION` for architecture aliases, a prompt renderer/template id, stop markers, and a loader implementing `ModelRuntime`; no central registry edit is needed. The runtime trait supports `clone_box` so generation can keep an independent model instance per request.
+
+An optional same-stem `src/chat/models/<name>.comp` is discovered and compiled when building with `--features vulkan`. Its compiled path is available through `super::shader_path("<name>")`; list shader stems in the registration so Vulkan dispatch can validate them. Cargo rebuilds when model or shader sources change. `cheetah init` uses these registrations to add registered template ids and stop markers to the prepared manifest.
+
+See the [model integration guide](MODEL_INTEGRATION.md) for the registration contract, Candle loader example, and optional Vulkan integration details.
+
+## License
+
+Cheetah is distributed under the [Apache-2.0](LICENSE) license.
