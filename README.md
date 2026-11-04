@@ -83,6 +83,8 @@ cheetah /path/to/model --system "You are a concise assistant."
 | `--context <name>` | None | Restore a saved conversation |
 | `--context-dir <path>` | Platform application-data directory | Override context archive storage |
 
+After each reply, interactive chat displays the number of generated tokens and decoding speed in tokens per second. The speed excludes prompt prefill; it is unavailable when no tokens are generated.
+
 At the chat prompt, use `/exit` or `/quit` to leave, `/clear` to reset the conversation, `/save <name>` to save it, and `/help` to list chat commands. `Ctrl-C` interrupts the current generation; `Ctrl-D` exits.
 
 ### Context management

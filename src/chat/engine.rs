@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +65,18 @@ pub struct Generation {
     pub text: String,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
+    pub decode_duration: Duration,
     pub finish_reason: FinishReason,
+}
+
+impl Generation {
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        let seconds = self.decode_duration.as_secs_f64();
+        if self.generated_tokens == 0 || seconds == 0.0 {
+            return None;
+        }
+        Some(self.generated_tokens as f64 / seconds)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +422,7 @@ impl Engine {
                 .cloned(),
         );
 
+        let decoding_started = Instant::now();
         for _ in 0..options.max_tokens {
             if sink.interrupted() {
                 finish_reason = FinishReason::Stop;
@@ -459,6 +471,7 @@ impl Engine {
                 .forward(&input, history.len() - 1)
                 .map_err(|error| format!("Model inference failed: {error}"))?;
         }
+        let decode_duration = decoding_started.elapsed();
         sink.finish()?;
         model.clear_cache();
         tracing::debug!(
@@ -471,6 +484,7 @@ impl Engine {
             text: answer,
             prompt_tokens: prompt.len(),
             generated_tokens: generated_tokens.len(),
+            decode_duration,
             finish_reason,
         })
     }
@@ -710,6 +724,19 @@ impl TextSink for StdoutSink {
     }
 }
 
+fn format_generation_stats(generation: &Generation) -> String {
+    match generation.tokens_per_second() {
+        Some(tokens_per_second) => format!(
+            "Generated {} tokens ({tokens_per_second:.2} tokens/s).",
+            generation.generated_tokens
+        ),
+        None => format!(
+            "Generated {} tokens (speed unavailable).",
+            generation.generated_tokens
+        ),
+    }
+}
+
 fn chat_loop(
     engine: &Engine,
     options: ChatOptions,
@@ -783,6 +810,7 @@ fn chat_loop(
         let mut sink = StdoutSink;
         match engine.generate(&mut context, &tokens, &options, &[], &mut sink) {
             Ok(generation) => {
+                println!("{}", format_generation_stats(&generation));
                 let assistant = generation.text;
                 messages.push(ChatMessage::new("assistant", assistant.clone()));
                 archive.turns.push(ConversationTurn { user, assistant });
@@ -930,5 +958,37 @@ mod tests {
             sample_token(&logits, &[], &options, &mut first).unwrap(),
             sample_token(&logits, &[], &options, &mut second).unwrap()
         );
+    }
+
+    #[test]
+    fn generation_stats_report_decode_speed_and_handle_unavailable_speed() {
+        let generation = Generation {
+            text: String::new(),
+            prompt_tokens: 0,
+            generated_tokens: 6,
+            decode_duration: Duration::from_secs(2),
+            finish_reason: FinishReason::Stop,
+        };
+        assert_eq!(generation.tokens_per_second(), Some(3.0));
+        assert_eq!(
+            format_generation_stats(&generation),
+            "Generated 6 tokens (3.00 tokens/s)."
+        );
+
+        let no_tokens = Generation {
+            generated_tokens: 0,
+            ..generation.clone()
+        };
+        assert_eq!(no_tokens.tokens_per_second(), None);
+        assert_eq!(
+            format_generation_stats(&no_tokens),
+            "Generated 0 tokens (speed unavailable)."
+        );
+
+        let zero_duration = Generation {
+            decode_duration: Duration::ZERO,
+            ..generation
+        };
+        assert_eq!(zero_duration.tokens_per_second(), None);
     }
 }
