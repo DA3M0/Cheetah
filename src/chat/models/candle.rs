@@ -103,7 +103,7 @@ mod tests {
             super::super::mixtral::REGISTRATION.chat_template.id,
             "mixtral"
         );
-        assert!(super::super::shader_is_registered("qwen_ops"));
+        assert!(super::super::shader_is_registered("shared_ops"));
     }
 
     #[test]
@@ -113,7 +113,7 @@ mod tests {
             super::super::REGISTRY
                 .iter()
                 .all(|registration| registration.vulkan_loader.is_some()
-                    && registration.shaders.contains(&"qwen_ops"))
+                    && registration.shaders.contains(&"shared_ops"))
         );
         #[cfg(not(feature = "vulkan"))]
         assert!(

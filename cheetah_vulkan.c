@@ -21,8 +21,8 @@
 #ifndef CHEETAH_DEFAULT_MATMUL_BF16_SPV
 #define CHEETAH_DEFAULT_MATMUL_BF16_SPV "matmul_bf16.spv"
 #endif
-#ifndef CHEETAH_DEFAULT_QWEN_OPS_SPV
-#define CHEETAH_DEFAULT_QWEN_OPS_SPV "qwen_ops.spv"
+#ifndef CHEETAH_DEFAULT_SHARED_OPS_SPV
+#define CHEETAH_DEFAULT_SHARED_OPS_SPV "shared_ops.spv"
 #endif
 
 typedef struct FreeBlock {
@@ -956,7 +956,7 @@ static int ensure_qwen_pipeline(void) {
 
     if (g_qwen_pipeline != VK_NULL_HANDLE) return 0;
     if (shader_path == NULL || shader_path[0] == '\0') {
-        shader_path = CHEETAH_DEFAULT_QWEN_OPS_SPV;
+        shader_path = CHEETAH_DEFAULT_SHARED_OPS_SPV;
     }
     if (g_qwen_descriptor_layout == VK_NULL_HANDLE) {
         memset(bindings, 0, sizeof(bindings));

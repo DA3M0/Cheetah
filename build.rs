@@ -19,7 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cheetah_vulkan.h");
     println!("cargo:rerun-if-changed=matmul.comp");
     println!("cargo:rerun-if-changed=matmul_bf16.comp");
-    println!("cargo:rerun-if-changed=qwen_ops.comp");
+    println!("cargo:rerun-if-changed=shared_ops.comp");
     println!("cargo:rerun-if-changed=src/chat/models");
 
     cc::Build::new()
@@ -85,10 +85,10 @@ fn discover_shaders(directory: &Path) -> Vec<ShaderSource> {
             c_define: Some("CHEETAH_DEFAULT_MATMUL_BF16_SPV"),
         },
         ShaderSource {
-            name: "qwen_ops".into(),
-            source: PathBuf::from("qwen_ops.comp"),
-            output: "qwen_ops.spv".into(),
-            c_define: Some("CHEETAH_DEFAULT_QWEN_OPS_SPV"),
+            name: "shared_ops".into(),
+            source: PathBuf::from("shared_ops.comp"),
+            output: "shared_ops.spv".into(),
+            c_define: Some("CHEETAH_DEFAULT_SHARED_OPS_SPV"),
         },
     ];
     let mut names: HashSet<String> = sources.iter().map(|shader| shader.name.clone()).collect();

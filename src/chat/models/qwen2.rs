@@ -16,7 +16,7 @@ pub(super) const REGISTRATION: ModelRegistration = ModelRegistration {
     stop_markers: &["<|im_end|>"],
     loader: load,
     vulkan_loader: vulkan_loader(),
-    shaders: &["qwen_ops"],
+    shaders: &["shared_ops"],
 };
 
 #[derive(Clone)]
