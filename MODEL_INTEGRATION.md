@@ -4,14 +4,15 @@ This guide explains how to add a Safetensors decoder architecture to Cheetah's c
 
 ## How registration works
 
-At build time, `build.rs` scans `src/chat/models/` for Rust source files and `.comp` compute shaders:
+At build time, `build.rs` scans `src/chat/models/` for Rust model modules and optional model-specific `.comp` compute shaders. The shared Vulkan operator shaders (`matmul.comp`, `matmul_bf16.comp`, and `shared_ops.comp`) are maintained at the repository root and built independently of model registrations:
 
 - Every `.rs` file in that directory is treated as a model module and must define a `REGISTRATION`. The shared files `mod.rs`, `candle.rs`, `registry.rs`, and `templates.rs` are excluded.
-- Every `.comp` file is discovered as a shader named after its filename stem. Under `--features vulkan`, discovered shaders are compiled with `glslc`.
+- A model-specific `.comp` file is optional. If present, it is discovered as a shader named after its filename stem and compiled with `glslc` under `--features vulkan`.
+- The root-level shared operator shaders are compiled with `glslc` under `--features vulkan`; models using the shared Vulkan operator library do not need their own `.comp` file.
 - Generated Rust code declares each model module and combines its registration into the static registry. No central model list needs editing.
 - Adding, removing, or changing files triggers a Cargo rebuild.
 
-This is compile-time discovery, not runtime plugin loading. A `.comp` file is only discovered and compiled; it does not implement a Vulkan model or connect itself to inference. A Vulkan backend must be explicitly provided by the registration's loader and executor.
+This is compile-time discovery, not runtime plugin loading. A model-specific `.comp` file is only discovered and compiled; it does not implement a Vulkan model or connect itself to inference. A Vulkan backend must be explicitly provided by the registration's loader and executor.
 
 ## Add a Candle model
 
@@ -114,18 +115,17 @@ The template's `id` is the stable name written to `cheetah_manifest.json` during
 
 `stop_markers` are used as model defaults and are also written into prepared manifests. Choose the actual end-of-turn strings for the model. Cheetah also recognizes stop token IDs from model configuration and accepts per-request stop values through the API.
 
-## Optional compute shader and Vulkan inference
+## Vulkan inference and optional model-specific shaders
 
-For a model that uses a compute shader, add an optional paired file `src/chat/models/<name>.comp`. The build discovers the shader under the stem `<name>` and exposes its compiled path through `super::shader_path("<name>")`.
+Models built on the shared native Vulkan operators need no per-model `.comp` file. Their registration lists `shared_ops` in `shaders` so backend selection can verify that the shared operator pipeline is available. The shared shader sources are at the repository root; they are not discovered from `src/chat/models/`.
 
-To opt into Vulkan inference, the model registration must provide both:
+Only add `src/chat/models/<name>.comp` when the model requires an additional architecture-specific compute shader. The build discovers it under the stem `<name>` and exposes its compiled path through `super::shader_path("<name>")`. If the executor uses that shader, list the stem in `shaders`.
 
-1. A `vulkan_loader` that initializes and loads a Vulkan executor, returning it as `Box<dyn ModelRuntime>`.
-2. The shader stem(s) used by that executor in `shaders`.
+To opt into Vulkan inference, provide a `vulkan_loader` that initializes and loads a Vulkan executor, returning it as `Box<dyn ModelRuntime>`. List in `shaders` the shared operator pipeline and any optional model-specific shaders that the executor actually uses. Adding a `.comp` file alone does not activate Vulkan inference.
 
 The executor must implement the same `ModelRuntime` interface as the Candle model. Follow the shared Vulkan initialization, resource ownership, tensor validation, and error-handling patterns in `src/chat/vulkan_transformer.rs`; the Candle loader remains necessary for CPU/CUDA/Metal and Vulkan fallback. `vulkan_loader` should be `None` when the model has no Vulkan implementation. Shader presence alone does not activate Vulkan inference.
 
-Qwen2, Gemma, Llama, Mistral, and Mixtral construct `TransformerFeatures` in their registration modules and use the shared transformer executor in `src/chat/vulkan_transformer.rs`. A registration starts with `TransformerFeatures::standard(...)`, adjusts architecture behavior and tensor-layout fields, then builds a `VulkanTransformerConfig` with `VulkanTransformerConfig::from_raw(&raw_config, features)`. Dense models use the default dense feed-forward feature; MoE models describe expert count, top-k routing, activation, and router/expert tensor names in `TransformerFeedForwardFeatures::MixtureOfExperts`. The executor's single `load(weight_paths, &config)` entry point then loads according to that data, without architecture-specific branches or a separate sparse flag. These registrations list the shared `shared_ops` shader because they call its native compute operators; shader names do not describe model architecture. A new executor may be implemented in its registration module or in a shared chat module. If adding a separate module under `src/chat/`, declare it in `src/chat/mod.rs`; do not place a helper `.rs` next to model registrations unless it also defines a complete model registration.
+Qwen2, Gemma, Llama, Mistral, and Mixtral construct `TransformerFeatures` in their registration modules and use the shared transformer executor in `src/chat/vulkan_transformer.rs`. A registration starts with `TransformerFeatures::standard(...)`, adjusts architecture behavior and tensor-layout fields, then builds a `VulkanTransformerConfig` with `VulkanTransformerConfig::from_raw(&raw_config, features)`. Dense models use the default dense feed-forward feature; MoE models describe expert count, top-k routing, activation, and router/expert tensor names in `TransformerFeedForwardFeatures::MixtureOfExperts`. The executor's single `load(weight_paths, &config)` entry point loads according to that data, without architecture-specific branches or a separate sparse flag. These registrations list the shared `shared_ops` pipeline because they call the common native compute operators; they do not need individual `.comp` files. A new executor may be implemented in its registration module or in a shared chat module. If adding a separate module under `src/chat/`, declare it in `src/chat/mod.rs`; do not place a helper `.rs` next to model registrations unless it also defines a complete model registration.
 
 Build and select Vulkan explicitly:
 
@@ -150,15 +150,15 @@ cargo test
 cargo check --features vulkan
 ```
 
-Add focused tests for non-obvious model behavior, such as template rendering, architecture aliases, weight/config loading, cache reset, or Vulkan executor behavior. A Vulkan build needs `glslc` when a model shader is present; device-dependent tests additionally require a Vulkan-capable system.
+Add focused tests for non-obvious model behavior, such as template rendering, architecture aliases, weight/config loading, cache reset, or Vulkan executor behavior. A Vulkan build needs `glslc` to compile the root-level shared operator shaders (and any optional model-specific shaders); device-dependent tests additionally require a Vulkan-capable system.
 
 Before submitting, check that:
 
 - The registration includes all architecture aliases, a stable template id, a renderer, stop markers, and a Candle loader.
 - The runtime can be cloned and its cache is correctly reset between requests.
 - The loader uses the expected config format and weight tensor names.
-- A shader filename stem exactly matches the stem passed to `shader_path` and listed in `shaders`.
-- Vulkan inference has an executor and loader; merely adding `.comp` is not sufficient.
+- Shared-operator registrations list `shared_ops`; optional model-specific shader stems match both the filename and the value passed to `shader_path`.
+- Vulkan inference has an executor and loader; a model-specific `.comp` file is not required and does not activate Vulkan by itself.
 - The new architecture can be selected by `cheetah init`, `cheetah inspect`, and chat using a representative model directory.
 
 ## Current registered decoder architectures
