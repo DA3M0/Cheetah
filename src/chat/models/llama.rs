@@ -3,6 +3,8 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use candle_transformers::models::llama;
 use serde_json::Value;
+#[cfg(feature = "vulkan")]
+use std::path::PathBuf;
 
 pub(super) const REGISTRATION: ModelRegistration = ModelRegistration {
     architectures: &["LlamaForCausalLM", "llama"],
@@ -13,8 +15,8 @@ pub(super) const REGISTRATION: ModelRegistration = ModelRegistration {
     },
     stop_markers: &["<|eot_id|>", "</s>"],
     loader: load,
-    vulkan_loader: None,
-    shaders: &[],
+    vulkan_loader: vulkan_loader(),
+    shaders: &["qwen_ops"],
 };
 
 #[derive(Clone)]
@@ -22,6 +24,33 @@ struct Runtime {
     model: llama::Llama,
     cache: llama::Cache,
     device: Device,
+}
+
+const fn vulkan_loader() -> Option<super::VulkanModelLoader> {
+    #[cfg(feature = "vulkan")]
+    {
+        Some(load_vulkan)
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn load_vulkan(
+    weight_paths: &[PathBuf],
+    _config_bytes: &[u8],
+    raw_config: Value,
+) -> Result<Box<dyn ModelRuntime>, String> {
+    let config =
+        super::super::vulkan_transformer::VulkanTransformerConfig::llama(&raw_config)?;
+    Ok(Box::new(
+        super::super::vulkan_transformer::VulkanTransformerExecutor::load_llama(
+            weight_paths,
+            &config,
+        )?,
+    ))
 }
 
 impl ModelRuntime for Runtime {

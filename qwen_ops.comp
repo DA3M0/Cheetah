@@ -43,6 +43,20 @@ float load_weight(uint index, uint format) {
     return uintBitsToFloat(value << 16u);
 }
 
+float load_bias(uint index, uint format) {
+    if (format == 0u) {
+        return uintBitsToFloat(b4.data[index]);
+    }
+    uint packed = b4.data[index >> 1u];
+    uint component = index & 1u;
+    if (format == 2u) {
+        vec2 half_values = unpackHalf2x16(packed);
+        return component == 0u ? half_values.x : half_values.y;
+    }
+    uint value = component == 0u ? (packed & 0xffffu) : (packed >> 16u);
+    return uintBitsToFloat(value << 16u);
+}
+
 void run_rms_norm(uint row) {
     uint rows = params.p1;
     uint width = params.p2;
@@ -63,15 +77,57 @@ void run_rms_norm(uint row) {
     }
 }
 
-void run_elementwise(uint index, bool silu_multiply) {
+void run_layer_norm(uint row) {
+    uint rows = params.p1;
+    uint width = params.p2;
+    if (row >= rows) {
+        return;
+    }
+    uint start = row * width;
+    float mean = 0.0;
+    for (uint index = 0u; index < width; ++index) {
+        mean += uintBitsToFloat(b0.data[start + index]);
+    }
+    mean /= float(width);
+    float variance = 0.0;
+    for (uint index = 0u; index < width; ++index) {
+        float delta = uintBitsToFloat(b0.data[start + index]) - mean;
+        variance += delta * delta;
+    }
+    float inverse = inversesqrt(variance / float(width) +
+                                uintBitsToFloat(params.p3));
+    for (uint index = 0u; index < width; ++index) {
+        float normalized = (uintBitsToFloat(b0.data[start + index]) - mean) * inverse;
+        b2.data[start + index] =
+            floatBitsToUint(normalized * load_weight(index, params.p4) +
+                        load_bias(index, params.p4));
+    }
+}
+
+float gelu_erf(float value) {
+    float sign_value = value < 0.0 ? -1.0 : 1.0;
+    float x = abs(value) / sqrt(2.0);
+    float t = 1.0 / (1.0 + 0.3275911 * x);
+    float erf_value = 1.0 - (((((1.061405429 * t - 1.453152027) * t) +
+                                1.421413741) * t - 0.284496736) * t +
+                              0.254829592) * t * exp(-x * x);
+    return 0.5 * value * (1.0 + sign_value * erf_value);
+}
+
+void run_elementwise(uint index, uint operation) {
     uint count = params.p1;
     if (index >= count) {
         return;
     }
     float lhs = uintBitsToFloat(b0.data[index]);
     float rhs = uintBitsToFloat(b1.data[index]);
-    if (silu_multiply) {
+    if (operation == 2u) {
         lhs = lhs / (1.0 + exp(-lhs)) * rhs;
+    } else if (operation == 3u) {
+        lhs = gelu_erf(lhs) * rhs;
+    } else if (operation == 4u) {
+        float inner = 0.7978845608 * (lhs + 0.044715 * lhs * lhs * lhs);
+        lhs = (0.5 * lhs * (1.0 + tanh(inner))) * rhs;
     } else {
         lhs += rhs;
     }
@@ -84,6 +140,7 @@ void run_rotary(uint index) {
     uint query_heads = params.p3;
     uint kv_heads = params.p4;
     uint head_dim = params.p5;
+    uint rotary_dim = params.p7;
     uint query_count = sequence * query_heads * head_dim;
     uint key_count = sequence * kv_heads * head_dim;
     uint max_count = query_count + key_count;
@@ -94,8 +151,15 @@ void run_rotary(uint index) {
     uint heads = is_query ? query_heads : kv_heads;
     uint local_index = is_query ? index : index - query_count;
     uint dimension = local_index % head_dim;
-    uint half_dim = head_dim / 2u;
+    uint half_dim = rotary_dim / 2u;
     if (dimension >= half_dim) {
+        if (dimension >= rotary_dim) {
+            if (is_query) {
+                b2.data[index] = b0.data[index];
+            } else {
+                b3.data[local_index] = b1.data[local_index];
+            }
+        }
         return;
     }
     uint pair_dimension = dimension;
@@ -110,7 +174,7 @@ void run_rotary(uint index) {
                        ? uintBitsToFloat(b0.data[second_index])
                        : uintBitsToFloat(b1.data[second_index]);
     float frequency = pow(uintBitsToFloat(params.p6),
-                          -float(2u * pair_dimension) / float(head_dim));
+                          -float(2u * pair_dimension) / float(rotary_dim));
     float angle = float(offset + sequence_index) * frequency;
     float cosine = cos(angle);
     float sine = sin(angle);
@@ -186,13 +250,19 @@ void main() {
     uint index = gl_GlobalInvocationID.x;
     if (params.op == 0u) {
         run_rms_norm(index);
+    } else if (params.op == 7u) {
+        run_layer_norm(index);
     } else if (params.op == 1u) {
-        run_elementwise(index, false);
+        run_elementwise(index, 1u);
     } else if (params.op == 2u) {
-        run_elementwise(index, true);
+        run_elementwise(index, 2u);
     } else if (params.op == 3u) {
         run_rotary(index);
     } else if (params.op == 4u) {
         run_attention(index);
+    } else if (params.op == 5u) {
+        run_elementwise(index, 3u);
+    } else if (params.op == 6u) {
+        run_elementwise(index, 4u);
     }
 }

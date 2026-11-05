@@ -439,6 +439,7 @@ impl VulkanQwenExecutor {
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
                 hidden / self.config.num_attention_heads,
+                hidden / self.config.num_attention_heads,
                 self.config.rope_theta as f32,
             )?;
             layer.keys.extend_from_slice(&keys);

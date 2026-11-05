@@ -60,13 +60,17 @@ int vk_qwen_prepare(void);
 int vk_qwen_rms_norm(const float *input, const void *weight,
                      uint32_t weight_format, float *output, uint32_t rows,
                      uint32_t width, float epsilon);
+int vk_qwen_layer_norm(const float *input, const void *weight,
+                       const void *bias, uint32_t weight_format,
+                       float *output, uint32_t rows, uint32_t width,
+                       float epsilon);
 int vk_qwen_elementwise(const float *a, const float *b, float *output,
                         size_t count, uint32_t operation);
 int vk_qwen_rotary(const float *query, const float *keys,
                    float *query_output, float *key_output,
                    uint32_t sequence, uint32_t offset,
                    uint32_t query_heads, uint32_t kv_heads,
-                   uint32_t head_dim, float theta);
+                   uint32_t head_dim, uint32_t rotary_dim, float theta);
 int vk_qwen_attention(const float *query, const float *keys,
                       const float *values, float *output,
                       uint32_t sequence, uint32_t offset,

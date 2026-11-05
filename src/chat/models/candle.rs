@@ -107,6 +107,23 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_loader_registration_matches_compiled_support() {
+        #[cfg(feature = "vulkan")]
+        assert!(
+            super::super::REGISTRY
+                .iter()
+                .all(|registration| registration.vulkan_loader.is_some()
+                    && registration.shaders.contains(&"qwen_ops"))
+        );
+        #[cfg(not(feature = "vulkan"))]
+        assert!(
+            super::super::REGISTRY
+                .iter()
+                .all(|registration| registration.vulkan_loader.is_none())
+        );
+    }
+
+    #[test]
     fn tied_lm_head_uses_embedding_weights() {
         let device = Device::Cpu;
         let embeddings = Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &device).unwrap();

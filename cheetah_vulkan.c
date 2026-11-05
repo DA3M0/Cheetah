@@ -1238,6 +1238,44 @@ int vk_qwen_rms_norm(const float *input, const void *weight,
                             ceil_div_u32(rows, 64));
 }
 
+int vk_qwen_layer_norm(const float *input, const void *weight,
+                       const void *bias, uint32_t weight_format,
+                       float *output, uint32_t rows, uint32_t width,
+                       float epsilon) {
+    const void *sources[5] = {input, weight, NULL, NULL, bias};
+    void *destinations[5] = {NULL, NULL, output, NULL, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    size_t input_bytes;
+    size_t weight_element_size;
+    size_t weight_bytes;
+    if (input == NULL || weight == NULL || bias == NULL || output == NULL ||
+        rows == 0 || width == 0 || rows > INT_MAX || width > INT_MAX ||
+        weight_format > 2 || !isfinite(epsilon) || epsilon < 0.0f ||
+        matrix_byte_size((int)rows, (int)width, &input_bytes) != 0) {
+        report_error("invalid arguments to vk_qwen_layer_norm");
+        return -1;
+    }
+    weight_element_size = weight_format == 0 ? sizeof(float) : sizeof(uint16_t);
+    if ((size_t)width > SIZE_MAX / weight_element_size) {
+        report_error("layer normalization weight size overflows size_t");
+        return -1;
+    }
+    weight_bytes = (size_t)width * weight_element_size;
+    sizes[0] = input_bytes;
+    sizes[1] = weight_bytes;
+    sizes[2] = input_bytes;
+    sizes[3] = 0;
+    sizes[4] = weight_bytes;
+    parameters[0] = 7;
+    parameters[1] = rows;
+    parameters[2] = width;
+    memcpy(&parameters[3], &epsilon, sizeof(epsilon));
+    parameters[4] = weight_format;
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32(rows, 64));
+}
+
 int vk_qwen_elementwise(const float *a, const float *b, float *output,
                         size_t count, uint32_t operation) {
     const void *sources[5] = {a, b, NULL, NULL, NULL};
@@ -1246,7 +1284,8 @@ int vk_qwen_elementwise(const float *a, const float *b, float *output,
     uint32_t parameters[8] = {0};
     size_t bytes;
     if (a == NULL || b == NULL || output == NULL || count == 0 ||
-        (operation != 1 && operation != 2) ||
+        (operation != 1 && operation != 2 &&
+         operation != 5 && operation != 6) ||
         count > SIZE_MAX / sizeof(float)) {
         report_error("invalid arguments to vk_qwen_elementwise");
         return -1;
@@ -1268,7 +1307,7 @@ int vk_qwen_rotary(const float *query, const float *keys,
                    float *query_output, float *key_output,
                    uint32_t sequence, uint32_t offset,
                    uint32_t query_heads, uint32_t kv_heads,
-                   uint32_t head_dim, float theta) {
+                   uint32_t head_dim, uint32_t rotary_dim, float theta) {
     const void *sources[5] = {query, keys, NULL, NULL, NULL};
     void *destinations[5] = {NULL, NULL, query_output, key_output, NULL};
     size_t sizes[5];
@@ -1277,8 +1316,10 @@ int vk_qwen_rotary(const float *query, const float *keys,
     uint64_t key_count;
     if (query == NULL || keys == NULL || query_output == NULL ||
         key_output == NULL || sequence == 0 || query_heads == 0 ||
-        kv_heads == 0 || head_dim == 0 ||
+        kv_heads == 0 || head_dim == 0 || rotary_dim == 0 ||
+        rotary_dim > head_dim ||
         query_heads % kv_heads != 0 || (head_dim & 1U) != 0 ||
+        (rotary_dim & 1U) != 0 ||
         !isfinite(theta) || theta <= 0.0f) {
         report_error("invalid arguments to vk_qwen_rotary");
         return -1;
@@ -1302,6 +1343,7 @@ int vk_qwen_rotary(const float *query, const float *keys,
     parameters[4] = kv_heads;
     parameters[5] = head_dim;
     memcpy(&parameters[6], &theta, sizeof(theta));
+    parameters[7] = rotary_dim;
     return run_qwen_compute(sources, destinations, sizes, parameters,
                             ceil_div_u32((uint32_t)(query_count + key_count), 64));
 }

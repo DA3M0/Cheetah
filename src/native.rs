@@ -220,6 +220,16 @@ pub mod vulkan {
             width: u32,
             epsilon: f32,
         ) -> c_int;
+        fn vk_qwen_layer_norm(
+            input: *const f32,
+            weight: *const c_void,
+            bias: *const c_void,
+            weight_format: u32,
+            output: *mut f32,
+            rows: u32,
+            width: u32,
+            epsilon: f32,
+        ) -> c_int;
         fn vk_qwen_elementwise(
             a: *const f32,
             b: *const f32,
@@ -237,6 +247,7 @@ pub mod vulkan {
             query_heads: u32,
             kv_heads: u32,
             head_dim: u32,
+            rotary_dim: u32,
             theta: f32,
         ) -> c_int;
         fn vk_qwen_attention(
@@ -391,6 +402,114 @@ pub mod vulkan {
         )
     }
 
+    pub fn layer_norm_f32(
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        layer_norm(
+            input,
+            weight.as_ptr().cast(),
+            bias.as_ptr().cast(),
+            weight.len(),
+            bias.len(),
+            0,
+            rows,
+            width,
+            epsilon,
+        )
+    }
+
+    pub fn layer_norm_fp16(
+        input: &[f32],
+        weight: &[u16],
+        bias: &[u16],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        layer_norm(
+            input,
+            weight.as_ptr().cast(),
+            bias.as_ptr().cast(),
+            weight.len(),
+            bias.len(),
+            2,
+            rows,
+            width,
+            epsilon,
+        )
+    }
+
+    pub fn layer_norm_bf16(
+        input: &[f32],
+        weight: &[u16],
+        bias: &[u16],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        layer_norm(
+            input,
+            weight.as_ptr().cast(),
+            bias.as_ptr().cast(),
+            weight.len(),
+            bias.len(),
+            1,
+            rows,
+            width,
+            epsilon,
+        )
+    }
+
+    fn layer_norm(
+        input: &[f32],
+        weight: *const c_void,
+        bias: *const c_void,
+        weight_len: usize,
+        bias_len: usize,
+        format: u32,
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        let expected = rows
+            .checked_mul(width)
+            .ok_or_else(|| "Layer normalization dimensions overflow usize.".to_string())?;
+        if rows == 0
+            || width == 0
+            || input.len() != expected
+            || weight_len != width
+            || bias_len != width
+            || !epsilon.is_finite()
+            || epsilon < 0.0
+        {
+            return Err("Invalid Vulkan layer normalization input.".into());
+        }
+        let (rows, width) = (to_u32(rows)?, to_u32(width)?);
+        let mut output = vec![0.0; expected];
+        let _guard = VULKAN_LOCK
+            .lock()
+            .map_err(|_| "Vulkan backend lock is poisoned.".to_string())?;
+        let result = unsafe {
+            vk_qwen_layer_norm(
+                input.as_ptr(),
+                weight,
+                bias,
+                format,
+                output.as_mut_ptr(),
+                rows,
+                width,
+                epsilon,
+            )
+        };
+        check_native_result(result, "Vulkan layer normalization")?;
+        Ok(output)
+    }
+
     pub fn rms_norm_fp16(
         input: &[f32],
         weight: &[u16],
@@ -458,6 +577,10 @@ pub mod vulkan {
         elementwise(gate, up, 2)
     }
 
+    pub fn gelu_mul(gate: &[f32], up: &[f32], approximate: bool) -> Result<Vec<f32>, String> {
+        elementwise(gate, up, if approximate { 6 } else { 5 })
+    }
+
     fn elementwise(a: &[f32], b: &[f32], operation: u32) -> Result<Vec<f32>, String> {
         if a.is_empty() || a.len() != b.len() {
             return Err("Vulkan elementwise operands must have equal non-zero lengths.".into());
@@ -487,6 +610,7 @@ pub mod vulkan {
         query_heads: usize,
         kv_heads: usize,
         head_dim: usize,
+        rotary_dim: usize,
         theta: f32,
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let query_count = sequence
@@ -516,6 +640,7 @@ pub mod vulkan {
                 to_u32(query_heads)?,
                 to_u32(kv_heads)?,
                 to_u32(head_dim)?,
+                to_u32(rotary_dim)?,
                 theta,
             )
         };
@@ -703,7 +828,8 @@ pub mod vulkan {
             assert!((gated[0]).abs() < 1e-6);
             assert!((gated[1] - 3.0 / (1.0 + (-1.0f32).exp())).abs() < 1e-5);
 
-            let (query, keys) = rotary(&[1.0, 0.0], &[1.0, 0.0], 1, 1, 1, 1, 2, 10_000.0).unwrap();
+            let (query, keys) =
+                rotary(&[1.0, 0.0], &[1.0, 0.0], 1, 1, 1, 1, 2, 2, 10_000.0).unwrap();
             assert!((query[0] - 1.0f32.cos()).abs() < 1e-5);
             assert!((query[1] - 1.0f32.sin()).abs() < 1e-5);
             assert!((keys[0] - query[0]).abs() < 1e-6);

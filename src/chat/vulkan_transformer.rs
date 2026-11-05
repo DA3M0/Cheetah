@@ -9,23 +9,37 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct VulkanTransformerConfig {
+    family: &'static str,
     vocab_size: usize,
     hidden_size: usize,
     intermediate_size: usize,
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
+    head_dim: usize,
     max_position_embeddings: usize,
     rms_norm_eps: f32,
     rope_theta: f32,
     sliding_window: usize,
     num_local_experts: usize,
     num_experts_per_tok: usize,
+    activation: Activation,
+    norm_weight_offset: bool,
+    embedding_scale: bool,
+    tie_word_embeddings: bool,
+    attention_bias: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Activation {
+    Silu,
+    Gelu,
+    NewGelu,
 }
 
 impl VulkanTransformerConfig {
     pub(crate) fn mistral(raw: &Value) -> Result<Self, String> {
-        let config = Self::common(raw)?;
+        let config = Self::common(raw, "Mistral", false)?;
         if config.num_local_experts != 0 || config.num_experts_per_tok != 0 {
             return Err("Mistral config must not define MoE experts.".into());
         }
@@ -33,7 +47,7 @@ impl VulkanTransformerConfig {
     }
 
     pub(crate) fn mixtral(raw: &Value) -> Result<Self, String> {
-        let config = Self::common(raw)?;
+        let config = Self::common(raw, "Mixtral", false)?;
         if config.num_local_experts == 0
             || config.num_experts_per_tok == 0
             || config.num_experts_per_tok > config.num_local_experts
@@ -43,7 +57,32 @@ impl VulkanTransformerConfig {
         Ok(config)
     }
 
-    fn common(raw: &Value) -> Result<Self, String> {
+    pub(crate) fn llama(raw: &Value) -> Result<Self, String> {
+        let config = Self::common(raw, "Llama", false)?;
+        if raw
+            .get("rope_scaling")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err("Vulkan Llama does not support RoPE scaling.".into());
+        }
+        if config.num_local_experts != 0 || config.num_experts_per_tok != 0 {
+            return Err("Vulkan Llama does not support MoE experts.".into());
+        }
+        Ok(config)
+    }
+
+    pub(crate) fn gemma(raw: &Value) -> Result<Self, String> {
+        let mut config = Self::common(raw, "Gemma", true)?;
+        if config.num_local_experts != 0 || config.num_experts_per_tok != 0 {
+            return Err("Vulkan Gemma does not support MoE experts.".into());
+        }
+        config.norm_weight_offset = true;
+        config.embedding_scale = true;
+        config.tie_word_embeddings = true;
+        Ok(config)
+    }
+
+    fn common(raw: &Value, family: &'static str, gemma: bool) -> Result<Self, String> {
         let vocab_size = required_usize(raw, "vocab_size")?;
         let hidden_size = required_usize(raw, "hidden_size")?;
         let intermediate_size = required_usize(raw, "intermediate_size")?;
@@ -56,11 +95,24 @@ impl VulkanTransformerConfig {
             .transpose()
             .map_err(|_| "num_key_value_heads does not fit usize.".to_string())?
             .unwrap_or(num_attention_heads);
-        let max_position_embeddings = required_usize(raw, "max_position_embeddings")?;
+        let head_dim = raw
+            .get("head_dim")
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "head_dim does not fit usize.".to_string())?
+            .unwrap_or_else(|| hidden_size / num_attention_heads.max(1));
+        let max_position_embeddings = raw
+            .get("max_position_embeddings")
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "max_position_embeddings does not fit usize.".to_string())?
+            .unwrap_or(if gemma { 4096 } else { 0 });
         let rms_norm_eps = raw
             .get("rms_norm_eps")
             .and_then(Value::as_f64)
-            .unwrap_or(1e-5) as f32;
+            .unwrap_or(if gemma { 1e-6 } else { 1e-5 }) as f32;
         let rope_theta = raw
             .get("rope_theta")
             .and_then(Value::as_f64)
@@ -86,24 +138,147 @@ impl VulkanTransformerConfig {
             .transpose()
             .map_err(|_| "num_experts_per_tok does not fit usize.".to_string())?
             .unwrap_or(0);
-        if raw.get("hidden_act").and_then(Value::as_str) != Some("silu") {
-            return Err("Vulkan Mistral/Mixtral supports only the SiLU activation.".into());
-        }
+        let activation = match raw.get("hidden_act").and_then(Value::as_str) {
+            Some("silu") => Activation::Silu,
+            Some("gelu") => Activation::Gelu,
+            Some("gelu_new" | "gelu_pytorch_tanh") => Activation::NewGelu,
+            _ => {
+                return Err(format!(
+                    "Vulkan {family} does not support the configured activation."
+                ));
+            }
+        };
+        let attention_bias = raw
+            .get("attention_bias")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if vocab_size == 0
             || hidden_size == 0
             || intermediate_size == 0
             || num_hidden_layers == 0
             || num_attention_heads == 0
             || num_key_value_heads == 0
+            || head_dim == 0
             || max_position_embeddings == 0
-            || hidden_size % num_attention_heads != 0
+            || head_dim % 2 != 0
             || num_attention_heads % num_key_value_heads != 0
             || !rms_norm_eps.is_finite()
             || rms_norm_eps <= 0.0
             || !rope_theta.is_finite()
             || rope_theta <= 0.0
         {
-            return Err("Mistral/Mixtral model dimensions are inconsistent.".into());
+            return Err(format!(
+                "Vulkan {family} model dimensions are inconsistent."
+            ));
+        }
+        Ok(Self {
+            family,
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            max_position_embeddings,
+            rms_norm_eps,
+            rope_theta,
+            sliding_window,
+            num_local_experts,
+            num_experts_per_tok,
+            activation,
+            norm_weight_offset: false,
+            embedding_scale: false,
+            tie_word_embeddings: gemma
+                || raw
+                    .get("tie_word_embeddings")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            attention_bias,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VulkanPhiConfig {
+    vocab_size: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    max_position_embeddings: usize,
+    layer_norm_eps: f32,
+    rope_theta: f32,
+    qk_layernorm: bool,
+    tie_word_embeddings: bool,
+    activation: Activation,
+}
+
+impl VulkanPhiConfig {
+    pub(crate) fn parse(raw: &Value) -> Result<Self, String> {
+        let vocab_size = required_usize(raw, "vocab_size")?;
+        let hidden_size = required_usize(raw, "hidden_size")?;
+        let intermediate_size = required_usize(raw, "intermediate_size")?;
+        let num_hidden_layers = required_usize(raw, "num_hidden_layers")?;
+        let num_attention_heads = required_usize(raw, "num_attention_heads")?;
+        let num_key_value_heads = raw
+            .get("num_key_value_heads")
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "num_key_value_heads does not fit usize.".to_string())?
+            .unwrap_or(num_attention_heads);
+        let max_position_embeddings = required_usize(raw, "max_position_embeddings")?;
+        let layer_norm_eps = raw
+            .get("layer_norm_eps")
+            .and_then(Value::as_f64)
+            .unwrap_or(1e-5) as f32;
+        let rope_theta = raw
+            .get("rope_theta")
+            .and_then(Value::as_f64)
+            .unwrap_or(10_000.0) as f32;
+        let partial_rotary_factor = raw
+            .get("partial_rotary_factor")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.5);
+        let activation = match raw.get("hidden_act").and_then(Value::as_str) {
+            Some("gelu") => Activation::Gelu,
+            Some("gelu_new") => Activation::NewGelu,
+            Some("silu") => Activation::Silu,
+            _ => return Err("Vulkan Phi does not support the configured activation.".into()),
+        };
+        let head_dim = if num_attention_heads == 0 {
+            0
+        } else {
+            hidden_size / num_attention_heads
+        };
+        let rotary_dim = (partial_rotary_factor * head_dim as f64) as usize;
+        if vocab_size == 0
+            || hidden_size == 0
+            || intermediate_size == 0
+            || num_hidden_layers == 0
+            || num_attention_heads == 0
+            || num_key_value_heads == 0
+            || hidden_size % num_attention_heads.max(1) != 0
+            || num_attention_heads % num_key_value_heads.max(1) != 0
+            || head_dim == 0
+            || rotary_dim == 0
+            || rotary_dim > head_dim
+            || rotary_dim % 2 != 0
+            || max_position_embeddings == 0
+            || !partial_rotary_factor.is_finite()
+            || !layer_norm_eps.is_finite()
+            || layer_norm_eps <= 0.0
+            || !rope_theta.is_finite()
+            || rope_theta <= 0.0
+            || raw
+                .get("rope_scaling")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err("Vulkan Phi model dimensions or RoPE settings are inconsistent.".into());
         }
         Ok(Self {
             vocab_size,
@@ -112,12 +287,20 @@ impl VulkanTransformerConfig {
             num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
+            head_dim,
+            rotary_dim,
             max_position_embeddings,
-            rms_norm_eps,
+            layer_norm_eps,
             rope_theta,
-            sliding_window,
-            num_local_experts,
-            num_experts_per_tok,
+            qk_layernorm: raw
+                .get("qk_layernorm")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            tie_word_embeddings: raw
+                .get("tie_word_embeddings")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            activation,
         })
     }
 }
@@ -184,6 +367,21 @@ impl WeightData {
         }
     }
 
+    fn add_one(&self) -> Self {
+        Self::F32(
+            (0..self.len())
+                .map(|index| self.value(index) + 1.0)
+                .collect(),
+        )
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16(values) | Self::BF16(values) => values.len(),
+        }
+    }
+
     fn rms_norm(
         &self,
         input: &[f32],
@@ -201,6 +399,28 @@ impl WeightData {
             Self::BF16(weights) => {
                 cheetah::native::vulkan::rms_norm_bf16(input, weights, rows, width, epsilon)
             }
+        }
+    }
+
+    fn layer_norm(
+        &self,
+        bias: &Self,
+        input: &[f32],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        match (self, bias) {
+            (Self::F32(weights), Self::F32(bias)) => {
+                cheetah::native::vulkan::layer_norm_f32(input, weights, bias, rows, width, epsilon)
+            }
+            (Self::F16(weights), Self::F16(bias)) => {
+                cheetah::native::vulkan::layer_norm_fp16(input, weights, bias, rows, width, epsilon)
+            }
+            (Self::BF16(weights), Self::BF16(bias)) => {
+                cheetah::native::vulkan::layer_norm_bf16(input, weights, bias, rows, width, epsilon)
+            }
+            _ => Err("Layer normalization weight and bias dtypes do not match.".into()),
         }
     }
 
@@ -279,6 +499,7 @@ struct Linear {
     input_size: usize,
     output_size: usize,
     weight: WeightData,
+    bias: Option<WeightData>,
 }
 
 impl Linear {
@@ -293,8 +514,20 @@ impl Linear {
                 input.len()
             ));
         }
-        self.weight
-            .linear(input, rows, self.input_size, self.output_size)
+        let mut output = self
+            .weight
+            .linear(input, rows, self.input_size, self.output_size)?;
+        if let Some(bias) = &self.bias {
+            if bias.len() != self.output_size {
+                return Err(format!("Invalid bias shape for '{}'.", self.name));
+            }
+            for row in output.chunks_exact_mut(self.output_size) {
+                for (value, index) in row.iter_mut().zip(0..self.output_size) {
+                    *value += bias.value(index);
+                }
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -311,6 +544,7 @@ enum FeedForward {
         gate: Linear,
         up: Linear,
         down: Linear,
+        activation: Activation,
     },
     Sparse {
         router: Linear,
@@ -322,10 +556,19 @@ enum FeedForward {
 impl FeedForward {
     fn forward(&self, input: &[f32], rows: usize, hidden_size: usize) -> Result<Vec<f32>, String> {
         match self {
-            Self::Dense { gate, up, down } => {
+            Self::Dense {
+                gate,
+                up,
+                down,
+                activation,
+            } => {
                 let gate = gate.forward(input, rows)?;
                 let up = up.forward(input, rows)?;
-                let activated = cheetah::native::vulkan::silu_mul(&gate, &up)?;
+                let activated = match activation {
+                    Activation::Silu => cheetah::native::vulkan::silu_mul(&gate, &up)?,
+                    Activation::Gelu => cheetah::native::vulkan::gelu_mul(&gate, &up, false)?,
+                    Activation::NewGelu => cheetah::native::vulkan::gelu_mul(&gate, &up, true)?,
+                };
                 down.forward(&activated, rows)
             }
             Self::Sparse {
@@ -458,6 +701,20 @@ impl VulkanTransformerExecutor {
         Self::load(paths, config, true)
     }
 
+    pub(crate) fn load_llama(
+        paths: &[PathBuf],
+        config: &VulkanTransformerConfig,
+    ) -> Result<Self, String> {
+        Self::load(paths, config, false)
+    }
+
+    pub(crate) fn load_gemma(
+        paths: &[PathBuf],
+        config: &VulkanTransformerConfig,
+    ) -> Result<Self, String> {
+        Self::load(paths, config, false)
+    }
+
     fn load(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
@@ -489,7 +746,7 @@ impl VulkanTransformerExecutor {
         config: &VulkanTransformerConfig,
         sparse: bool,
     ) -> Result<Self, String> {
-        let head_dim = config.hidden_size / config.num_attention_heads;
+        let head_dim = config.head_dim;
         let kv_size = config.num_key_value_heads * head_dim;
         let mut weights = load_weights(paths)?;
         let embedding = take_weight(
@@ -500,12 +757,28 @@ impl VulkanTransformerExecutor {
         .data;
         let final_norm =
             take_weight(&mut weights, "model.norm.weight", &[config.hidden_size])?.data;
-        let lm_head = take_weight(
-            &mut weights,
-            "lm_head.weight",
-            &[config.vocab_size, config.hidden_size],
-        )?
-        .data;
+        let final_norm = if config.norm_weight_offset {
+            final_norm.add_one()
+        } else {
+            final_norm
+        };
+        let lm_head = match weights.remove("lm_head.weight") {
+            Some(head) => {
+                validate_shape(
+                    "lm_head.weight",
+                    &head.shape,
+                    &[config.vocab_size, config.hidden_size],
+                )?;
+                head.data
+            }
+            None if config.tie_word_embeddings => embedding.clone(),
+            None => {
+                return Err(format!(
+                    "Vulkan {} checkpoint is missing tensor 'lm_head.weight'.",
+                    config.family
+                ));
+            }
+        };
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{index}");
@@ -515,12 +788,22 @@ impl VulkanTransformerExecutor {
                 &[config.hidden_size],
             )?
             .data;
+            let input_norm = if config.norm_weight_offset {
+                input_norm.add_one()
+            } else {
+                input_norm
+            };
             let post_attention_norm = take_weight(
                 &mut weights,
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 &[config.hidden_size],
             )?
             .data;
+            let post_attention_norm = if config.norm_weight_offset {
+                post_attention_norm.add_one()
+            } else {
+                post_attention_norm
+            };
             let attention = format!("{prefix}.self_attn");
             let feed_forward = if sparse {
                 load_sparse_feed_forward(&mut weights, &prefix, config)?
@@ -531,19 +814,23 @@ impl VulkanTransformerExecutor {
                         &format!("{prefix}.mlp.gate_proj"),
                         config.hidden_size,
                         config.intermediate_size,
+                        false,
                     )?,
                     up: take_linear(
                         &mut weights,
                         &format!("{prefix}.mlp.up_proj"),
                         config.hidden_size,
                         config.intermediate_size,
+                        false,
                     )?,
                     down: take_linear(
                         &mut weights,
                         &format!("{prefix}.mlp.down_proj"),
                         config.intermediate_size,
                         config.hidden_size,
+                        false,
                     )?,
+                    activation: config.activation,
                 }
             };
             layers.push(Layer {
@@ -553,25 +840,29 @@ impl VulkanTransformerExecutor {
                     &mut weights,
                     &format!("{attention}.q_proj"),
                     config.hidden_size,
-                    config.hidden_size,
+                    config.num_attention_heads * head_dim,
+                    config.attention_bias,
                 )?,
                 k_proj: take_linear(
                     &mut weights,
                     &format!("{attention}.k_proj"),
                     config.hidden_size,
                     kv_size,
+                    config.attention_bias,
                 )?,
                 v_proj: take_linear(
                     &mut weights,
                     &format!("{attention}.v_proj"),
                     config.hidden_size,
                     kv_size,
+                    config.attention_bias,
                 )?,
                 o_proj: take_linear(
                     &mut weights,
                     &format!("{attention}.o_proj"),
+                    config.num_attention_heads * head_dim,
                     config.hidden_size,
-                    config.hidden_size,
+                    config.attention_bias,
                 )?,
                 feed_forward,
                 keys: Vec::new(),
@@ -599,7 +890,10 @@ impl VulkanTransformerExecutor {
             .dims2()
             .map_err(|error| format!("Invalid Vulkan transformer input: {error}"))?;
         if batch != 1 || sequence == 0 {
-            return Err("Vulkan Mistral/Mixtral requires a non-empty batch of size one.".into());
+            return Err(format!(
+                "Vulkan {} requires a non-empty batch of size one.",
+                self.config.family
+            ));
         }
         let last_position = offset
             .checked_add(sequence)
@@ -609,9 +903,7 @@ impl VulkanTransformerExecutor {
         }
         let expected_cache = offset
             .checked_mul(self.config.num_key_value_heads)
-            .and_then(|count| {
-                count.checked_mul(self.config.hidden_size / self.config.num_attention_heads)
-            })
+            .and_then(|count| count.checked_mul(self.config.head_dim))
             .ok_or_else(|| "Vulkan transformer cache size overflow.".to_string())?;
         if self
             .layers
@@ -634,7 +926,12 @@ impl VulkanTransformerExecutor {
             }
             let start = token * hidden;
             for index in 0..hidden {
-                activations.push(self.embedding.value(start + index));
+                let value = self.embedding.value(start + index);
+                activations.push(if self.config.embedding_scale {
+                    value * (hidden as f32).sqrt()
+                } else {
+                    value
+                });
             }
         }
 
@@ -656,7 +953,8 @@ impl VulkanTransformerExecutor {
                 offset,
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
-                hidden / self.config.num_attention_heads,
+                self.config.head_dim,
+                self.config.head_dim,
                 self.config.rope_theta,
             )?;
             layer.keys.extend_from_slice(&keys);
@@ -670,7 +968,7 @@ impl VulkanTransformerExecutor {
                 offset + sequence,
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
-                hidden / self.config.num_attention_heads,
+                self.config.head_dim,
                 self.config.sliding_window,
             )?;
             let attention = layer.o_proj.forward(&attention, sequence)?;
@@ -710,6 +1008,7 @@ fn load_sparse_feed_forward(
         &format!("{moe_prefix}.gate"),
         config.hidden_size,
         config.num_local_experts,
+        false,
     )?;
     let mut experts = Vec::with_capacity(config.num_local_experts);
     for index in 0..config.num_local_experts {
@@ -720,18 +1019,21 @@ fn load_sparse_feed_forward(
                 &format!("{expert_prefix}.w1"),
                 config.hidden_size,
                 config.intermediate_size,
+                false,
             )?,
             up: take_linear(
                 weights,
                 &format!("{expert_prefix}.w3"),
                 config.hidden_size,
                 config.intermediate_size,
+                false,
             )?,
             down: take_linear(
                 weights,
                 &format!("{expert_prefix}.w2"),
                 config.intermediate_size,
                 config.hidden_size,
+                false,
             )?,
         });
     }
@@ -800,20 +1102,373 @@ fn take_weight(
     Ok(weight)
 }
 
+fn validate_shape(name: &str, actual: &[usize], expected: &[usize]) -> Result<(), String> {
+    if actual != expected {
+        return Err(format!(
+            "Tensor '{name}' has shape {actual:?}; expected {expected:?}."
+        ));
+    }
+    Ok(())
+}
+
 fn take_linear(
     weights: &mut HashMap<String, NamedWeight>,
     prefix: &str,
     input_size: usize,
     output_size: usize,
+    with_bias: bool,
 ) -> Result<Linear, String> {
     let weight_name = format!("{prefix}.weight");
     let weight = take_weight(weights, &weight_name, &[output_size, input_size])?;
+    let bias_name = format!("{prefix}.bias");
+    let bias = match weights.remove(&bias_name) {
+        Some(bias) => {
+            if bias.shape != [output_size] {
+                return Err(format!(
+                    "Tensor '{bias_name}' has shape {:?}; expected [{output_size}].",
+                    bias.shape
+                ));
+            }
+            Some(bias.data)
+        }
+        None if with_bias => {
+            return Err(format!(
+                "Vulkan checkpoint is missing tensor '{bias_name}'."
+            ));
+        }
+        None => None,
+    };
     Ok(Linear {
         name: prefix.to_owned(),
         input_size,
         output_size,
         weight: weight.data,
+        bias,
     })
+}
+
+#[derive(Clone)]
+struct PhiNorm {
+    weight: WeightData,
+    bias: WeightData,
+}
+
+impl PhiNorm {
+    fn forward(
+        &self,
+        input: &[f32],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        self.weight
+            .layer_norm(&self.bias, input, rows, width, epsilon)
+    }
+}
+
+fn take_phi_norm(
+    weights: &mut HashMap<String, NamedWeight>,
+    prefix: &str,
+    width: usize,
+) -> Result<PhiNorm, String> {
+    let weight_name = format!("{prefix}.weight");
+    let bias_name = format!("{prefix}.bias");
+    Ok(PhiNorm {
+        weight: take_weight(weights, &weight_name, &[width])?.data,
+        bias: take_weight(weights, &bias_name, &[width])?.data,
+    })
+}
+
+#[derive(Clone)]
+struct PhiLayer {
+    input_norm: PhiNorm,
+    q_norm: Option<PhiNorm>,
+    k_norm: Option<PhiNorm>,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    dense: Linear,
+    fc1: Linear,
+    fc2: Linear,
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+#[derive(Clone)]
+pub(crate) struct VulkanPhiExecutor {
+    config: VulkanPhiConfig,
+    embedding: WeightData,
+    layers: Vec<PhiLayer>,
+    final_norm: PhiNorm,
+    lm_head: Linear,
+}
+
+impl super::models::ModelRuntime for VulkanPhiExecutor {
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
+        VulkanPhiExecutor::forward(self, input, offset)
+    }
+
+    fn clear_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.keys.clear();
+            layer.values.clear();
+        }
+    }
+
+    fn device_name(&self) -> &'static str {
+        "Vulkan"
+    }
+}
+
+impl VulkanPhiExecutor {
+    pub(crate) fn load(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
+        let result = (|| {
+            cheetah::native::vulkan::initialize()?;
+            cheetah::native::vulkan::prepare()?;
+            Self::load_initialized(paths, config)
+        })();
+        if result.is_err()
+            && let Err(shutdown_error) = cheetah::native::vulkan::shutdown()
+        {
+            eprintln!(
+                "{}",
+                color::stderr(
+                    &format!(
+                        "cheetah: Vulkan cleanup after Phi startup failure also failed ({shutdown_error})."
+                    ),
+                    Color::Red
+                )
+            );
+        }
+        result
+    }
+
+    fn load_initialized(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
+        let mut weights = load_weights(paths)?;
+        let embedding = take_weight(
+            &mut weights,
+            "model.embed_tokens.weight",
+            &[config.vocab_size, config.hidden_size],
+        )?
+        .data;
+        let final_norm = take_phi_norm(&mut weights, "model.final_layernorm", config.hidden_size)?;
+        let lm_head = if weights.contains_key("lm_head.weight") {
+            take_linear(
+                &mut weights,
+                "lm_head",
+                config.hidden_size,
+                config.vocab_size,
+                true,
+            )?
+        } else if config.tie_word_embeddings {
+            Linear {
+                name: "lm_head".into(),
+                input_size: config.hidden_size,
+                output_size: config.vocab_size,
+                weight: embedding.clone(),
+                bias: None,
+            }
+        } else {
+            return Err("Vulkan Phi checkpoint is missing tensor 'lm_head.weight'.".into());
+        };
+        let qk_norm_size = config.head_dim;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for index in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{index}");
+            let attention = format!("{prefix}.self_attn");
+            let input_norm = take_phi_norm(
+                &mut weights,
+                &format!("{prefix}.input_layernorm"),
+                config.hidden_size,
+            )?;
+            let (q_norm, k_norm) = if config.qk_layernorm {
+                (
+                    Some(take_phi_norm(
+                        &mut weights,
+                        &format!("{attention}.q_layernorm"),
+                        qk_norm_size,
+                    )?),
+                    Some(take_phi_norm(
+                        &mut weights,
+                        &format!("{attention}.k_layernorm"),
+                        qk_norm_size,
+                    )?),
+                )
+            } else {
+                (None, None)
+            };
+            layers.push(PhiLayer {
+                input_norm,
+                q_norm,
+                k_norm,
+                q_proj: take_linear(
+                    &mut weights,
+                    &format!("{attention}.q_proj"),
+                    config.hidden_size,
+                    config.num_attention_heads * config.head_dim,
+                    true,
+                )?,
+                k_proj: take_linear(
+                    &mut weights,
+                    &format!("{attention}.k_proj"),
+                    config.hidden_size,
+                    config.num_key_value_heads * config.head_dim,
+                    true,
+                )?,
+                v_proj: take_linear(
+                    &mut weights,
+                    &format!("{attention}.v_proj"),
+                    config.hidden_size,
+                    config.num_key_value_heads * config.head_dim,
+                    true,
+                )?,
+                dense: take_linear(
+                    &mut weights,
+                    &format!("{attention}.dense"),
+                    config.num_attention_heads * config.head_dim,
+                    config.hidden_size,
+                    true,
+                )?,
+                fc1: take_linear(
+                    &mut weights,
+                    &format!("{prefix}.mlp.fc1"),
+                    config.hidden_size,
+                    config.intermediate_size,
+                    true,
+                )?,
+                fc2: take_linear(
+                    &mut weights,
+                    &format!("{prefix}.mlp.fc2"),
+                    config.intermediate_size,
+                    config.hidden_size,
+                    true,
+                )?,
+                keys: Vec::new(),
+                values: Vec::new(),
+            });
+        }
+        Ok(Self {
+            config: config.clone(),
+            embedding,
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+
+    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
+        let (batch, sequence) = input
+            .dims2()
+            .map_err(|error| format!("Invalid Vulkan Phi input: {error}"))?;
+        if batch != 1 || sequence == 0 {
+            return Err("Vulkan Phi currently requires a non-empty batch of size one.".into());
+        }
+        let last_position = offset
+            .checked_add(sequence)
+            .ok_or_else(|| "Vulkan Phi sequence position overflow.".to_string())?;
+        if last_position > self.config.max_position_embeddings {
+            return Err("Vulkan Phi input exceeds max_position_embeddings.".into());
+        }
+        let expected_cache = offset
+            .checked_mul(self.config.num_key_value_heads)
+            .and_then(|count| count.checked_mul(self.config.head_dim))
+            .ok_or_else(|| "Vulkan Phi cache size overflow.".to_string())?;
+        if self
+            .layers
+            .first()
+            .is_some_and(|layer| layer.keys.len() != expected_cache)
+        {
+            return Err("Vulkan Phi KV cache position does not match the input offset.".into());
+        }
+        let token_ids = input
+            .to_vec2::<u32>()
+            .map_err(|error| format!("Cannot read Vulkan Phi token IDs: {error}"))?;
+        let hidden = self.config.hidden_size;
+        let mut activations = Vec::with_capacity(sequence * hidden);
+        for token_id in &token_ids[0] {
+            let token = *token_id as usize;
+            if token >= self.config.vocab_size {
+                return Err(format!("Token ID {token} exceeds the Phi vocabulary."));
+            }
+            let start = token * hidden;
+            activations.extend((0..hidden).map(|index| self.embedding.value(start + index)));
+        }
+
+        for layer in &mut self.layers {
+            let residual = activations.clone();
+            let normalized = layer.input_norm.forward(
+                &activations,
+                sequence,
+                hidden,
+                self.config.layer_norm_eps,
+            )?;
+            let mut query = layer.q_proj.forward(&normalized, sequence)?;
+            let mut keys = layer.k_proj.forward(&normalized, sequence)?;
+            let values = layer.v_proj.forward(&normalized, sequence)?;
+            if let Some(norm) = &layer.q_norm {
+                query = norm.forward(
+                    &query,
+                    sequence * self.config.num_attention_heads,
+                    self.config.head_dim,
+                    self.config.layer_norm_eps,
+                )?;
+            }
+            if let Some(norm) = &layer.k_norm {
+                keys = norm.forward(
+                    &keys,
+                    sequence * self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.layer_norm_eps,
+                )?;
+            }
+            (query, keys) = cheetah::native::vulkan::rotary(
+                &query,
+                &keys,
+                sequence,
+                offset,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                self.config.rotary_dim,
+                self.config.rope_theta,
+            )?;
+            layer.keys.extend_from_slice(&keys);
+            layer.values.extend_from_slice(&values);
+            let attention = cheetah::native::vulkan::attention(
+                &query,
+                &layer.keys,
+                &layer.values,
+                sequence,
+                offset,
+                offset + sequence,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                0,
+            )?;
+            let attention = layer.dense.forward(&attention, sequence)?;
+            let mut feed_forward = layer.fc1.forward(&normalized, sequence)?;
+            let ones = vec![1.0; feed_forward.len()];
+            feed_forward = match self.config.activation {
+                Activation::Silu => cheetah::native::vulkan::silu_mul(&feed_forward, &ones)?,
+                Activation::Gelu => cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, false)?,
+                Activation::NewGelu => {
+                    cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, true)?
+                }
+            };
+            feed_forward = layer.fc2.forward(&feed_forward, sequence)?;
+            let residual_attention = cheetah::native::vulkan::add(&residual, &attention)?;
+            activations = cheetah::native::vulkan::add(&residual_attention, &feed_forward)?;
+        }
+
+        let last = &activations[(sequence - 1) * hidden..sequence * hidden];
+        let normalized = self
+            .final_norm
+            .forward(last, 1, hidden, self.config.layer_norm_eps)?;
+        let logits = self.lm_head.forward(&normalized, 1)?;
+        Tensor::from_vec(logits, (1, 1, self.config.vocab_size), &Device::Cpu)
+            .map_err(|error| format!("Cannot create Vulkan Phi logits: {error}"))
+    }
 }
 
 #[cfg(test)]
@@ -830,23 +1485,31 @@ mod tests {
             input_size: size,
             output_size: size,
             weight: WeightData::F32(matrix.into()),
+            bias: None,
         }
     }
 
     fn tiny_executor(sparse: bool) -> VulkanTransformerExecutor {
         let config = VulkanTransformerConfig {
+            family: "Test",
             vocab_size: 2,
             hidden_size: 2,
             intermediate_size: 2,
             num_hidden_layers: 1,
             num_attention_heads: 1,
             num_key_value_heads: 1,
+            head_dim: 2,
             max_position_embeddings: 4,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
             sliding_window: 4,
             num_local_experts: usize::from(sparse) * 2,
             num_experts_per_tok: usize::from(sparse),
+            activation: Activation::Silu,
+            norm_weight_offset: false,
+            embedding_scale: false,
+            tie_word_embeddings: false,
+            attention_bias: false,
         };
         let feed_forward = if sparse {
             FeedForward::Sparse {
@@ -855,6 +1518,7 @@ mod tests {
                     input_size: 2,
                     output_size: 2,
                     weight: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
+                    bias: None,
                 },
                 experts: (0..2)
                     .map(|index| Expert {
@@ -870,6 +1534,7 @@ mod tests {
                 gate: identity_linear("dense_gate", 2),
                 up: identity_linear("dense_up", 2),
                 down: identity_linear("dense_down", 2),
+                activation: Activation::Silu,
             }
         };
         VulkanTransformerExecutor {
