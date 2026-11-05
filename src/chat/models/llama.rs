@@ -43,13 +43,42 @@ fn load_vulkan(
     _config_bytes: &[u8],
     raw_config: Value,
 ) -> Result<Box<dyn ModelRuntime>, String> {
-    let config =
-        super::super::vulkan_transformer::VulkanTransformerConfig::llama(&raw_config)?;
+    use super::super::vulkan_transformer::{
+        TransformerFeatures, VulkanTransformerConfig, VulkanTransformerExecutor,
+    };
+
+    if raw_config
+        .get("rope_scaling")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("Vulkan Llama does not support RoPE scaling.".into());
+    }
+    if raw_config
+        .get("num_local_experts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        != 0
+        || raw_config
+            .get("num_experts_per_tok")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            != 0
+    {
+        return Err("Vulkan Llama does not support MoE experts.".into());
+    }
+    let mut features = TransformerFeatures::standard("Llama");
+    features.attention_bias = raw_config
+        .get("attention_bias")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    features.attention_output_bias = features.attention_bias;
+    features.tie_word_embeddings = raw_config
+        .get("tie_word_embeddings")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let config = VulkanTransformerConfig::from_raw(&raw_config, features)?;
     Ok(Box::new(
-        super::super::vulkan_transformer::VulkanTransformerExecutor::load_llama(
-            weight_paths,
-            &config,
-        )?,
+        VulkanTransformerExecutor::load(weight_paths, &config)?,
     ))
 }
 

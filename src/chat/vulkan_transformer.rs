@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct VulkanTransformerConfig {
-    family: &'static str,
     vocab_size: usize,
     hidden_size: usize,
     intermediate_size: usize,
@@ -21,68 +20,107 @@ pub(crate) struct VulkanTransformerConfig {
     rms_norm_eps: f32,
     rope_theta: f32,
     sliding_window: usize,
-    num_local_experts: usize,
-    num_experts_per_tok: usize,
     activation: Activation,
-    norm_weight_offset: bool,
-    embedding_scale: bool,
-    tie_word_embeddings: bool,
-    attention_bias: bool,
+    pub(crate) features: TransformerFeatures,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransformerFeatures {
+    pub(crate) model_name: &'static str,
+    pub(crate) attention_bias: bool,
+    pub(crate) attention_output_bias: bool,
+    pub(crate) head_dim_override: Option<usize>,
+    pub(crate) norm_weight_offset: bool,
+    pub(crate) embedding_scale: bool,
+    pub(crate) tie_word_embeddings: bool,
+    pub(crate) max_position_embeddings_default: Option<usize>,
+    pub(crate) rms_norm_eps_default: Option<f32>,
+    pub(crate) layout: TransformerWeightLayout,
+    pub(crate) feed_forward: TransformerFeedForwardFeatures,
+}
+
+impl TransformerFeatures {
+    pub(crate) fn standard(model_name: &'static str) -> Self {
+        Self {
+            model_name,
+            attention_bias: false,
+            attention_output_bias: false,
+            head_dim_override: None,
+            norm_weight_offset: false,
+            embedding_scale: false,
+            tie_word_embeddings: false,
+            max_position_embeddings_default: None,
+            rms_norm_eps_default: None,
+            layout: TransformerWeightLayout::default(),
+            feed_forward: TransformerFeedForwardFeatures::Dense,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransformerWeightLayout {
+    pub(crate) embedding: &'static str,
+    pub(crate) final_norm: &'static str,
+    pub(crate) lm_head: &'static str,
+    pub(crate) layer_prefix: &'static str,
+    pub(crate) input_norm: &'static str,
+    pub(crate) post_attention_norm: &'static str,
+    pub(crate) attention_prefix: &'static str,
+    pub(crate) q_proj: &'static str,
+    pub(crate) k_proj: &'static str,
+    pub(crate) v_proj: &'static str,
+    pub(crate) o_proj: &'static str,
+    pub(crate) dense_gate: &'static str,
+    pub(crate) dense_up: &'static str,
+    pub(crate) dense_down: &'static str,
+}
+
+impl Default for TransformerWeightLayout {
+    fn default() -> Self {
+        Self {
+            embedding: "model.embed_tokens.weight",
+            final_norm: "model.norm.weight",
+            lm_head: "lm_head.weight",
+            layer_prefix: "model.layers",
+            input_norm: "input_layernorm.weight",
+            post_attention_norm: "post_attention_layernorm.weight",
+            attention_prefix: "self_attn",
+            q_proj: "q_proj",
+            k_proj: "k_proj",
+            v_proj: "v_proj",
+            o_proj: "o_proj",
+            dense_gate: "mlp.gate_proj",
+            dense_up: "mlp.up_proj",
+            dense_down: "mlp.down_proj",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TransformerFeedForwardFeatures {
+    Dense,
+    MixtureOfExperts {
+        num_experts: usize,
+        top_k: usize,
+        activation: Activation,
+        router: &'static str,
+        experts_prefix: &'static str,
+        gate: &'static str,
+        up: &'static str,
+        down: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Activation {
+pub(crate) enum Activation {
     Silu,
     Gelu,
     NewGelu,
 }
 
 impl VulkanTransformerConfig {
-    pub(crate) fn mistral(raw: &Value) -> Result<Self, String> {
-        let config = Self::common(raw, "Mistral", false)?;
-        if config.num_local_experts != 0 || config.num_experts_per_tok != 0 {
-            return Err("Mistral config must not define MoE experts.".into());
-        }
-        Ok(config)
-    }
-
-    pub(crate) fn mixtral(raw: &Value) -> Result<Self, String> {
-        let config = Self::common(raw, "Mixtral", false)?;
-        if config.num_local_experts == 0
-            || config.num_experts_per_tok == 0
-            || config.num_experts_per_tok > config.num_local_experts
-        {
-            return Err("Mixtral expert counts are inconsistent.".into());
-        }
-        Ok(config)
-    }
-
-    pub(crate) fn llama(raw: &Value) -> Result<Self, String> {
-        let config = Self::common(raw, "Llama", false)?;
-        if raw
-            .get("rope_scaling")
-            .is_some_and(|value| !value.is_null())
-        {
-            return Err("Vulkan Llama does not support RoPE scaling.".into());
-        }
-        if config.num_local_experts != 0 || config.num_experts_per_tok != 0 {
-            return Err("Vulkan Llama does not support MoE experts.".into());
-        }
-        Ok(config)
-    }
-
-    pub(crate) fn gemma(raw: &Value) -> Result<Self, String> {
-        let mut config = Self::common(raw, "Gemma", true)?;
-        if config.num_local_experts != 0 || config.num_experts_per_tok != 0 {
-            return Err("Vulkan Gemma does not support MoE experts.".into());
-        }
-        config.norm_weight_offset = true;
-        config.embedding_scale = true;
-        config.tie_word_embeddings = true;
-        Ok(config)
-    }
-
-    fn common(raw: &Value, family: &'static str, gemma: bool) -> Result<Self, String> {
+    pub(crate) fn from_raw(raw: &Value, features: TransformerFeatures) -> Result<Self, String> {
+        let model_name = features.model_name;
         let vocab_size = required_usize(raw, "vocab_size")?;
         let hidden_size = required_usize(raw, "hidden_size")?;
         let intermediate_size = required_usize(raw, "intermediate_size")?;
@@ -95,24 +133,30 @@ impl VulkanTransformerConfig {
             .transpose()
             .map_err(|_| "num_key_value_heads does not fit usize.".to_string())?
             .unwrap_or(num_attention_heads);
-        let head_dim = raw
-            .get("head_dim")
-            .and_then(Value::as_u64)
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| "head_dim does not fit usize.".to_string())?
-            .unwrap_or_else(|| hidden_size / num_attention_heads.max(1));
+        let head_dim = if let Some(head_dim) = features.head_dim_override {
+            head_dim
+        } else {
+            raw.get("head_dim")
+                .and_then(Value::as_u64)
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| "head_dim does not fit usize.".to_string())?
+                .unwrap_or_else(|| hidden_size / num_attention_heads.max(1))
+        };
         let max_position_embeddings = raw
             .get("max_position_embeddings")
             .and_then(Value::as_u64)
             .map(usize::try_from)
             .transpose()
             .map_err(|_| "max_position_embeddings does not fit usize.".to_string())?
-            .unwrap_or(if gemma { 4096 } else { 0 });
+            .or(features.max_position_embeddings_default)
+            .unwrap_or(0);
         let rms_norm_eps = raw
             .get("rms_norm_eps")
             .and_then(Value::as_f64)
-            .unwrap_or(if gemma { 1e-6 } else { 1e-5 }) as f32;
+            .map(|value| value as f32)
+            .or(features.rms_norm_eps_default)
+            .unwrap_or(1e-5);
         let rope_theta = raw
             .get("rope_theta")
             .and_then(Value::as_f64)
@@ -124,34 +168,25 @@ impl VulkanTransformerConfig {
             .transpose()
             .map_err(|_| "sliding_window does not fit usize.".to_string())?
             .unwrap_or(max_position_embeddings);
-        let num_local_experts = raw
-            .get("num_local_experts")
-            .and_then(Value::as_u64)
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| "num_local_experts does not fit usize.".to_string())?
-            .unwrap_or(0);
-        let num_experts_per_tok = raw
-            .get("num_experts_per_tok")
-            .and_then(Value::as_u64)
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| "num_experts_per_tok does not fit usize.".to_string())?
-            .unwrap_or(0);
         let activation = match raw.get("hidden_act").and_then(Value::as_str) {
             Some("silu") => Activation::Silu,
             Some("gelu") => Activation::Gelu,
             Some("gelu_new" | "gelu_pytorch_tanh") => Activation::NewGelu,
             _ => {
                 return Err(format!(
-                    "Vulkan {family} does not support the configured activation."
+                    "Vulkan {model_name} does not support the configured activation."
                 ));
             }
         };
-        let attention_bias = raw
-            .get("attention_bias")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        if let TransformerFeedForwardFeatures::MixtureOfExperts {
+            num_experts, top_k, ..
+        } = &features.feed_forward
+            && (*num_experts == 0 || *top_k == 0 || *top_k > *num_experts)
+        {
+            return Err(format!(
+                "Vulkan {model_name} MoE expert counts are inconsistent."
+            ));
+        }
         if vocab_size == 0
             || hidden_size == 0
             || intermediate_size == 0
@@ -168,11 +203,10 @@ impl VulkanTransformerConfig {
             || rope_theta <= 0.0
         {
             return Err(format!(
-                "Vulkan {family} model dimensions are inconsistent."
+                "Vulkan {model_name} model dimensions are inconsistent."
             ));
         }
         Ok(Self {
-            family,
             vocab_size,
             hidden_size,
             intermediate_size,
@@ -184,17 +218,8 @@ impl VulkanTransformerConfig {
             rms_norm_eps,
             rope_theta,
             sliding_window,
-            num_local_experts,
-            num_experts_per_tok,
             activation,
-            norm_weight_offset: false,
-            embedding_scale: false,
-            tie_word_embeddings: gemma
-                || raw
-                    .get("tie_word_embeddings")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            attention_bias,
+            features,
         })
     }
 }
@@ -305,7 +330,7 @@ impl VulkanPhiConfig {
     }
 }
 
-fn required_usize(config: &Value, name: &str) -> Result<usize, String> {
+pub(crate) fn required_usize(config: &Value, name: &str) -> Result<usize, String> {
     config
         .get(name)
         .and_then(Value::as_u64)
@@ -354,7 +379,7 @@ impl WeightData {
                 }
             }
             dtype => Err(format!(
-                "Vulkan Mistral/Mixtral supports F32, F16, or BF16 weights; tensor '{name}' uses {dtype:?}."
+                "Vulkan models support F32, F16, or BF16 weights; tensor '{name}' uses {dtype:?}."
             )),
         }
     }
@@ -546,10 +571,11 @@ enum FeedForward {
         down: Linear,
         activation: Activation,
     },
-    Sparse {
+    MixtureOfExperts {
         router: Linear,
         experts: Vec<Expert>,
         top_k: usize,
+        activation: Activation,
     },
 }
 
@@ -564,17 +590,14 @@ impl FeedForward {
             } => {
                 let gate = gate.forward(input, rows)?;
                 let up = up.forward(input, rows)?;
-                let activated = match activation {
-                    Activation::Silu => cheetah::native::vulkan::silu_mul(&gate, &up)?,
-                    Activation::Gelu => cheetah::native::vulkan::gelu_mul(&gate, &up, false)?,
-                    Activation::NewGelu => cheetah::native::vulkan::gelu_mul(&gate, &up, true)?,
-                };
+                let activated = apply_activation(*activation, &gate, &up)?;
                 down.forward(&activated, rows)
             }
-            Self::Sparse {
+            Self::MixtureOfExperts {
                 router,
                 experts,
                 top_k,
+                activation,
             } => {
                 let router_logits = router.forward(input, rows)?;
                 let mut output = vec![0.0; rows * hidden_size];
@@ -596,7 +619,7 @@ impl FeedForward {
                     }
                     let gate = expert.gate.forward(&expert_input, selected_rows.len())?;
                     let up = expert.up.forward(&expert_input, selected_rows.len())?;
-                    let activated = cheetah::native::vulkan::silu_mul(&gate, &up)?;
+                    let activated = apply_activation(*activation, &gate, &up)?;
                     let expert_output = expert.down.forward(&activated, selected_rows.len())?;
                     for (selected_index, (row, route_weight)) in
                         selected_rows.into_iter().enumerate()
@@ -617,12 +640,20 @@ impl FeedForward {
     }
 }
 
+fn apply_activation(activation: Activation, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
+    match activation {
+        Activation::Silu => cheetah::native::vulkan::silu_mul(gate, up),
+        Activation::Gelu => cheetah::native::vulkan::gelu_mul(gate, up, false),
+        Activation::NewGelu => cheetah::native::vulkan::gelu_mul(gate, up, true),
+    }
+}
+
 fn select_experts(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f32)>, String> {
     if logits.is_empty() || top_k == 0 || top_k > logits.len() {
-        return Err("Invalid Mixtral router logits or expert count.".into());
+        return Err("Invalid MoE router logits or expert count.".into());
     }
     if logits.iter().any(|logit| !logit.is_finite()) {
-        return Err("Mixtral router produced a non-finite score.".into());
+        return Err("MoE router produced a non-finite score.".into());
     }
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let probabilities = logits
@@ -631,7 +662,7 @@ fn select_experts(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f32)>, Str
         .collect::<Vec<_>>();
     let denominator: f32 = probabilities.iter().sum();
     if !denominator.is_finite() || denominator <= 0.0 {
-        return Err("Mixtral router probability normalization failed.".into());
+        return Err("MoE router probability normalization failed.".into());
     }
     let mut order = (0..logits.len()).collect::<Vec<_>>();
     order.sort_by(|left, right| logits[*right].total_cmp(&logits[*left]));
@@ -642,7 +673,7 @@ fn select_experts(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f32)>, Str
         .collect::<Vec<_>>();
     let selected_sum: f32 = selected.iter().map(|(_, weight)| weight).sum();
     if !selected_sum.is_finite() || selected_sum <= 0.0 {
-        return Err("Mixtral selected expert weights could not be normalized.".into());
+        return Err("MoE selected expert weights could not be normalized.".into());
     }
     for (_, weight) in &mut selected {
         *weight /= selected_sum;
@@ -687,43 +718,14 @@ impl super::models::ModelRuntime for VulkanTransformerExecutor {
 }
 
 impl VulkanTransformerExecutor {
-    pub(crate) fn load_mistral(
+    pub(crate) fn load(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
-    ) -> Result<Self, String> {
-        Self::load(paths, config, false)
-    }
-
-    pub(crate) fn load_mixtral(
-        paths: &[PathBuf],
-        config: &VulkanTransformerConfig,
-    ) -> Result<Self, String> {
-        Self::load(paths, config, true)
-    }
-
-    pub(crate) fn load_llama(
-        paths: &[PathBuf],
-        config: &VulkanTransformerConfig,
-    ) -> Result<Self, String> {
-        Self::load(paths, config, false)
-    }
-
-    pub(crate) fn load_gemma(
-        paths: &[PathBuf],
-        config: &VulkanTransformerConfig,
-    ) -> Result<Self, String> {
-        Self::load(paths, config, false)
-    }
-
-    fn load(
-        paths: &[PathBuf],
-        config: &VulkanTransformerConfig,
-        sparse: bool,
     ) -> Result<Self, String> {
         let result = (|| {
             cheetah::native::vulkan::initialize()?;
             cheetah::native::vulkan::prepare()?;
-            Self::load_initialized(paths, config, sparse)
+            Self::load_initialized(paths, config)
         })();
         if result.is_err()
             && let Err(shutdown_error) = cheetah::native::vulkan::shutdown()
@@ -744,125 +746,144 @@ impl VulkanTransformerExecutor {
     fn load_initialized(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
-        sparse: bool,
     ) -> Result<Self, String> {
         let head_dim = config.head_dim;
         let kv_size = config.num_key_value_heads * head_dim;
+        let layout = &config.features.layout;
         let mut weights = load_weights(paths)?;
         let embedding = take_weight(
             &mut weights,
-            "model.embed_tokens.weight",
+            layout.embedding,
             &[config.vocab_size, config.hidden_size],
         )?
         .data;
-        let final_norm =
-            take_weight(&mut weights, "model.norm.weight", &[config.hidden_size])?.data;
-        let final_norm = if config.norm_weight_offset {
+        let final_norm = take_weight(&mut weights, layout.final_norm, &[config.hidden_size])?.data;
+        let final_norm = if config.features.norm_weight_offset {
             final_norm.add_one()
         } else {
             final_norm
         };
-        let lm_head = match weights.remove("lm_head.weight") {
+        let lm_head = match weights.remove(layout.lm_head) {
             Some(head) => {
                 validate_shape(
-                    "lm_head.weight",
+                    layout.lm_head,
                     &head.shape,
                     &[config.vocab_size, config.hidden_size],
                 )?;
                 head.data
             }
-            None if config.tie_word_embeddings => embedding.clone(),
+            None if config.features.tie_word_embeddings => embedding.clone(),
             None => {
                 return Err(format!(
-                    "Vulkan {} checkpoint is missing tensor 'lm_head.weight'.",
-                    config.family
+                    "Vulkan {} checkpoint is missing tensor '{}'.",
+                    config.features.model_name, layout.lm_head
                 ));
             }
         };
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
-            let prefix = format!("model.layers.{index}");
+            let prefix = format!("{}.{index}", layout.layer_prefix);
             let input_norm = take_weight(
                 &mut weights,
-                &format!("{prefix}.input_layernorm.weight"),
+                &format!("{prefix}.{}", layout.input_norm),
                 &[config.hidden_size],
             )?
             .data;
-            let input_norm = if config.norm_weight_offset {
+            let input_norm = if config.features.norm_weight_offset {
                 input_norm.add_one()
             } else {
                 input_norm
             };
             let post_attention_norm = take_weight(
                 &mut weights,
-                &format!("{prefix}.post_attention_layernorm.weight"),
+                &format!("{prefix}.{}", layout.post_attention_norm),
                 &[config.hidden_size],
             )?
             .data;
-            let post_attention_norm = if config.norm_weight_offset {
+            let post_attention_norm = if config.features.norm_weight_offset {
                 post_attention_norm.add_one()
             } else {
                 post_attention_norm
             };
-            let attention = format!("{prefix}.self_attn");
-            let feed_forward = if sparse {
-                load_sparse_feed_forward(&mut weights, &prefix, config)?
-            } else {
-                FeedForward::Dense {
+            let attention = format!("{prefix}.{}", layout.attention_prefix);
+            let feed_forward = match &config.features.feed_forward {
+                TransformerFeedForwardFeatures::Dense => FeedForward::Dense {
                     gate: take_linear(
                         &mut weights,
-                        &format!("{prefix}.mlp.gate_proj"),
+                        &format!("{prefix}.{}", layout.dense_gate),
                         config.hidden_size,
                         config.intermediate_size,
                         false,
                     )?,
                     up: take_linear(
                         &mut weights,
-                        &format!("{prefix}.mlp.up_proj"),
+                        &format!("{prefix}.{}", layout.dense_up),
                         config.hidden_size,
                         config.intermediate_size,
                         false,
                     )?,
                     down: take_linear(
                         &mut weights,
-                        &format!("{prefix}.mlp.down_proj"),
+                        &format!("{prefix}.{}", layout.dense_down),
                         config.intermediate_size,
                         config.hidden_size,
                         false,
                     )?,
                     activation: config.activation,
-                }
+                },
+                TransformerFeedForwardFeatures::MixtureOfExperts {
+                    num_experts,
+                    top_k,
+                    activation,
+                    router,
+                    experts_prefix,
+                    gate,
+                    up,
+                    down,
+                } => load_moe_feed_forward(
+                    &mut weights,
+                    &prefix,
+                    config,
+                    *num_experts,
+                    *top_k,
+                    *activation,
+                    router,
+                    experts_prefix,
+                    gate,
+                    up,
+                    down,
+                )?,
             };
             layers.push(Layer {
                 input_norm,
                 post_attention_norm,
                 q_proj: take_linear(
                     &mut weights,
-                    &format!("{attention}.q_proj"),
+                    &format!("{attention}.{}", layout.q_proj),
                     config.hidden_size,
                     config.num_attention_heads * head_dim,
-                    config.attention_bias,
+                    config.features.attention_bias,
                 )?,
                 k_proj: take_linear(
                     &mut weights,
-                    &format!("{attention}.k_proj"),
+                    &format!("{attention}.{}", layout.k_proj),
                     config.hidden_size,
                     kv_size,
-                    config.attention_bias,
+                    config.features.attention_bias,
                 )?,
                 v_proj: take_linear(
                     &mut weights,
-                    &format!("{attention}.v_proj"),
+                    &format!("{attention}.{}", layout.v_proj),
                     config.hidden_size,
                     kv_size,
-                    config.attention_bias,
+                    config.features.attention_bias,
                 )?,
                 o_proj: take_linear(
                     &mut weights,
-                    &format!("{attention}.o_proj"),
+                    &format!("{attention}.{}", layout.o_proj),
                     config.num_attention_heads * head_dim,
                     config.hidden_size,
-                    config.attention_bias,
+                    config.features.attention_output_bias,
                 )?,
                 feed_forward,
                 keys: Vec::new(),
@@ -892,7 +913,7 @@ impl VulkanTransformerExecutor {
         if batch != 1 || sequence == 0 {
             return Err(format!(
                 "Vulkan {} requires a non-empty batch of size one.",
-                self.config.family
+                self.config.features.model_name
             ));
         }
         let last_position = offset
@@ -927,7 +948,7 @@ impl VulkanTransformerExecutor {
             let start = token * hidden;
             for index in 0..hidden {
                 let value = self.embedding.value(start + index);
-                activations.push(if self.config.embedding_scale {
+                activations.push(if self.config.features.embedding_scale {
                     value * (hidden as f32).sqrt()
                 } else {
                     value
@@ -997,50 +1018,58 @@ impl VulkanTransformerExecutor {
     }
 }
 
-fn load_sparse_feed_forward(
+fn load_moe_feed_forward(
     weights: &mut HashMap<String, NamedWeight>,
     prefix: &str,
     config: &VulkanTransformerConfig,
+    num_experts: usize,
+    top_k: usize,
+    activation: Activation,
+    router_layout: &str,
+    experts_layout: &str,
+    gate_layout: &str,
+    up_layout: &str,
+    down_layout: &str,
 ) -> Result<FeedForward, String> {
-    let moe_prefix = format!("{prefix}.block_sparse_moe");
     let router = take_linear(
         weights,
-        &format!("{moe_prefix}.gate"),
+        &format!("{prefix}.{router_layout}"),
         config.hidden_size,
-        config.num_local_experts,
+        num_experts,
         false,
     )?;
-    let mut experts = Vec::with_capacity(config.num_local_experts);
-    for index in 0..config.num_local_experts {
-        let expert_prefix = format!("{moe_prefix}.experts.{index}");
+    let mut experts = Vec::with_capacity(num_experts);
+    for index in 0..num_experts {
+        let expert_prefix = format!("{prefix}.{experts_layout}.{index}");
         experts.push(Expert {
             gate: take_linear(
                 weights,
-                &format!("{expert_prefix}.w1"),
+                &format!("{expert_prefix}.{gate_layout}"),
                 config.hidden_size,
                 config.intermediate_size,
                 false,
             )?,
             up: take_linear(
                 weights,
-                &format!("{expert_prefix}.w3"),
+                &format!("{expert_prefix}.{up_layout}"),
                 config.hidden_size,
                 config.intermediate_size,
                 false,
             )?,
             down: take_linear(
                 weights,
-                &format!("{expert_prefix}.w2"),
+                &format!("{expert_prefix}.{down_layout}"),
                 config.intermediate_size,
                 config.hidden_size,
                 false,
             )?,
         });
     }
-    Ok(FeedForward::Sparse {
+    Ok(FeedForward::MixtureOfExperts {
         router,
         experts,
-        top_k: config.num_experts_per_tok,
+        top_k,
+        activation,
     })
 }
 
@@ -1489,9 +1518,12 @@ mod tests {
         }
     }
 
-    fn tiny_executor(sparse: bool) -> VulkanTransformerExecutor {
+    fn tiny_executor(
+        feed_forward_features: TransformerFeedForwardFeatures,
+    ) -> VulkanTransformerExecutor {
+        let mut features = TransformerFeatures::standard("Test");
+        features.feed_forward = feed_forward_features;
         let config = VulkanTransformerConfig {
-            family: "Test",
             vocab_size: 2,
             hidden_size: 2,
             intermediate_size: 2,
@@ -1503,39 +1535,39 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
             sliding_window: 4,
-            num_local_experts: usize::from(sparse) * 2,
-            num_experts_per_tok: usize::from(sparse),
             activation: Activation::Silu,
-            norm_weight_offset: false,
-            embedding_scale: false,
-            tie_word_embeddings: false,
-            attention_bias: false,
+            features,
         };
-        let feed_forward = if sparse {
-            FeedForward::Sparse {
+        let feed_forward = match &config.features.feed_forward {
+            TransformerFeedForwardFeatures::Dense => FeedForward::Dense {
+                gate: identity_linear("dense_gate", 2),
+                up: identity_linear("dense_up", 2),
+                down: identity_linear("dense_down", 2),
+                activation: Activation::Silu,
+            },
+            TransformerFeedForwardFeatures::MixtureOfExperts {
+                num_experts,
+                top_k,
+                activation,
+                ..
+            } => FeedForward::MixtureOfExperts {
                 router: Linear {
                     name: "router".into(),
                     input_size: 2,
-                    output_size: 2,
+                    output_size: *num_experts,
                     weight: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
                     bias: None,
                 },
-                experts: (0..2)
+                experts: (0..*num_experts)
                     .map(|index| Expert {
                         gate: identity_linear(&format!("expert_{index}_gate"), 2),
                         up: identity_linear(&format!("expert_{index}_up"), 2),
                         down: identity_linear(&format!("expert_{index}_down"), 2),
                     })
                     .collect(),
-                top_k: 1,
-            }
-        } else {
-            FeedForward::Dense {
-                gate: identity_linear("dense_gate", 2),
-                up: identity_linear("dense_up", 2),
-                down: identity_linear("dense_down", 2),
-                activation: Activation::Silu,
-            }
+                top_k: *top_k,
+                activation: *activation,
+            },
         };
         VulkanTransformerExecutor {
             config,
@@ -1557,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn mixtral_router_selects_top_k_and_renormalizes_weights() {
+    fn moe_router_selects_top_k_and_renormalizes_weights() {
         let selected = select_experts(&[0.0, 1.0, 2.0, -3.0], 2).unwrap();
         assert_eq!(
             selected.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
@@ -1569,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn mixtral_router_rejects_invalid_scores_and_k() {
+    fn moe_router_rejects_invalid_scores_and_k() {
         assert!(select_experts(&[], 1).is_err());
         assert!(select_experts(&[1.0], 0).is_err());
         assert!(select_experts(&[1.0], 2).is_err());
@@ -1577,42 +1609,200 @@ mod tests {
     }
 
     #[test]
-    fn parses_mistral_and_mixtral_runtime_config() {
-        let mistral = serde_json::json!({
-            "vocab_size": 32000,
-            "hidden_size": 4096,
-            "intermediate_size": 14336,
-            "num_hidden_layers": 32,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
-            "max_position_embeddings": 32768,
+    fn parses_common_and_moe_transformer_configurations() {
+        let raw = serde_json::json!({
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 24,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
             "hidden_act": "silu",
-            "sliding_window": 4096
+            "sliding_window": 32
         });
-        let config = VulkanTransformerConfig::mistral(&mistral).unwrap();
-        assert_eq!(config.num_key_value_heads, 8);
-        assert_eq!(config.sliding_window, 4096);
+        let config =
+            VulkanTransformerConfig::from_raw(&raw, TransformerFeatures::standard("Dense"))
+                .unwrap();
+        assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.sliding_window, 32);
 
-        let mut mixtral = mistral;
-        mixtral["num_local_experts"] = Value::from(8);
-        mixtral["num_experts_per_tok"] = Value::from(2);
-        assert_eq!(
-            VulkanTransformerConfig::mixtral(&mixtral)
-                .unwrap()
-                .num_local_experts,
-            8
-        );
-        assert!(VulkanTransformerConfig::mistral(&mixtral).is_err());
+        let mut features = TransformerFeatures::standard("Sparse");
+        features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
+            num_experts: 8,
+            top_k: 2,
+            activation: Activation::Silu,
+            router: "moe.router",
+            experts_prefix: "moe.experts",
+            gate: "gate",
+            up: "up",
+            down: "down",
+        };
+        let config = VulkanTransformerConfig::from_raw(&raw, features.clone()).unwrap();
+        assert!(matches!(
+            config.features.feed_forward,
+            TransformerFeedForwardFeatures::MixtureOfExperts {
+                num_experts: 8,
+                top_k: 2,
+                ..
+            }
+        ));
+
+        features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
+            num_experts: 2,
+            top_k: 3,
+            activation: Activation::Silu,
+            router: "moe.router",
+            experts_prefix: "moe.experts",
+            gate: "gate",
+            up: "up",
+            down: "down",
+        };
+        assert!(VulkanTransformerConfig::from_raw(&raw, features).is_err());
+    }
+
+    #[test]
+    fn feature_values_override_common_configuration() {
+        let raw = serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 12,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000.0,
+            "tie_word_embeddings": true
+        });
+        let mut features = TransformerFeatures::standard("Configured");
+        features.attention_bias = true;
+        features.tie_word_embeddings = true;
+        let config = VulkanTransformerConfig::from_raw(&raw, features).unwrap();
+        assert_eq!(config.head_dim, 2);
+        assert_eq!(config.sliding_window, 64);
+        assert!(config.features.tie_word_embeddings);
+        assert!(config.features.attention_bias);
+        assert!(!config.features.attention_output_bias);
+    }
+
+    #[test]
+    fn loads_moe_weights_from_configured_tensor_layout() {
+        let raw = serde_json::json!({
+            "vocab_size": 2,
+            "hidden_size": 2,
+            "intermediate_size": 2,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 4,
+            "hidden_act": "silu"
+        });
+        let mut features = TransformerFeatures::standard("Configured");
+        features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
+            num_experts: 1,
+            top_k: 1,
+            activation: Activation::Silu,
+            router: "router",
+            experts_prefix: "experts",
+            gate: "gate",
+            up: "up",
+            down: "down",
+        };
+        let config = VulkanTransformerConfig::from_raw(&raw, features).unwrap();
+        let mut weights = HashMap::new();
+        for (name, shape, values) in [
+            ("layers.0.router.weight", vec![1, 2], vec![1.0, 0.0]),
+            ("layers.0.experts.0.gate.weight", vec![2, 2], vec![1.0; 4]),
+            ("layers.0.experts.0.up.weight", vec![2, 2], vec![1.0; 4]),
+            ("layers.0.experts.0.down.weight", vec![2, 2], vec![1.0; 4]),
+        ] {
+            weights.insert(
+                name.to_owned(),
+                NamedWeight {
+                    shape,
+                    data: WeightData::F32(values.into()),
+                },
+            );
+        }
+        let TransformerFeedForwardFeatures::MixtureOfExperts {
+            num_experts,
+            top_k,
+            activation,
+            router,
+            experts_prefix,
+            gate,
+            up,
+            down,
+        } = &config.features.feed_forward
+        else {
+            unreachable!();
+        };
+        let feed_forward = load_moe_feed_forward(
+            &mut weights,
+            "layers.0",
+            &config,
+            *num_experts,
+            *top_k,
+            *activation,
+            router,
+            experts_prefix,
+            gate,
+            up,
+            down,
+        )
+        .unwrap();
+        assert!(weights.is_empty());
+        assert!(matches!(
+            feed_forward,
+            FeedForward::MixtureOfExperts {
+                ref router,
+                ref experts,
+                top_k: 1,
+                ..
+            } if router.name == "layers.0.router"
+                && experts[0].gate.name == "layers.0.experts.0.gate"
+                && experts[0].up.name == "layers.0.experts.0.up"
+                && experts[0].down.name == "layers.0.experts.0.down"
+        ));
     }
 
     #[test]
     #[ignore = "requires a Vulkan compute device"]
-    fn tiny_dense_and_sparse_models_forward_and_reset_cache() {
+    fn linear_splits_large_sequences_into_bounded_row_tiles() {
+        cheetah::native::vulkan::initialize().unwrap();
+        cheetah::native::vulkan::prepare().unwrap();
+        let weight = WeightData::F32(vec![2.0, -1.0].into());
+        let output = weight.linear(&vec![3.0; 65], 65, 1, 2).unwrap();
+        cheetah::native::vulkan::shutdown().unwrap();
+        assert_eq!(output.len(), 130);
+        for row in output.chunks_exact(2) {
+            assert_eq!(row, &[6.0, -3.0]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan compute device"]
+    fn tiny_dense_and_moe_models_forward_and_reset_cache() {
         cheetah::native::vulkan::initialize().unwrap();
         cheetah::native::vulkan::prepare().unwrap();
         let device = Device::Cpu;
-        for sparse in [false, true] {
-            let mut model = tiny_executor(sparse);
+        let feed_forward_features = [
+            TransformerFeedForwardFeatures::Dense,
+            TransformerFeedForwardFeatures::MixtureOfExperts {
+                num_experts: 2,
+                top_k: 1,
+                activation: Activation::Silu,
+                router: "moe.router",
+                experts_prefix: "moe.experts",
+                gate: "gate",
+                up: "up",
+                down: "down",
+            },
+        ];
+        for features in feed_forward_features {
+            let mut model = tiny_executor(features);
             let first = Tensor::new(&[[0u32]], &device).unwrap();
             let logits = model.forward(&first, 0).unwrap();
             assert_eq!(logits.dims(), [1, 1, 2]);

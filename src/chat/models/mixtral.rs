@@ -88,14 +88,43 @@ fn load_vulkan(
     _config_bytes: &[u8],
     raw_config: Value,
 ) -> Result<Box<dyn ModelRuntime>, String> {
-    let config =
-        super::super::vulkan_transformer::VulkanTransformerConfig::mixtral(&raw_config)?;
-    Ok(Box::new(
-        super::super::vulkan_transformer::VulkanTransformerExecutor::load_mixtral(
-            weight_paths,
-            &config,
-        )?,
-    ))
+    let config = vulkan_config(&raw_config)?;
+    Ok(Box::new(super::super::vulkan_transformer::VulkanTransformerExecutor::load(
+        weight_paths,
+        &config,
+    )?))
+}
+
+#[cfg(feature = "vulkan")]
+fn vulkan_config(
+    raw_config: &Value,
+) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
+    use super::super::vulkan_transformer::{
+        Activation, TransformerFeatures, TransformerFeedForwardFeatures,
+        VulkanTransformerConfig, required_usize,
+    };
+
+    let num_experts = required_usize(raw_config, "num_local_experts")?;
+    let top_k = required_usize(raw_config, "num_experts_per_tok")?;
+    if top_k > num_experts {
+        return Err("Mixtral expert counts are inconsistent.".into());
+    }
+    let mut features = TransformerFeatures::standard("Mixtral");
+    features.tie_word_embeddings = raw_config
+        .get("tie_word_embeddings")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
+        num_experts,
+        top_k,
+        activation: Activation::Silu,
+        router: "block_sparse_moe.gate",
+        experts_prefix: "block_sparse_moe.experts",
+        gate: "w1",
+        up: "w3",
+        down: "w2",
+    };
+    VulkanTransformerConfig::from_raw(raw_config, features)
 }
 
 #[cfg(test)]
@@ -121,6 +150,56 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(config, mixtral::Config::v0_1_8x7b(false));
+    }
+
+    #[cfg(all(test, feature = "vulkan"))]
+    mod vulkan_tests {
+        use super::*;
+        use crate::chat::vulkan_transformer::TransformerFeedForwardFeatures;
+
+        #[test]
+        fn mixtral_vulkan_features_configure_moe_tensor_layout() {
+            let config = vulkan_config(&serde_json::json!({
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 24,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                "hidden_act": "silu",
+                "num_local_experts": 8,
+                "num_experts_per_tok": 2
+            }))
+            .unwrap();
+            assert!(matches!(
+                config.features.feed_forward,
+                TransformerFeedForwardFeatures::MixtureOfExperts {
+                    num_experts: 8,
+                    top_k: 2,
+                    router: "block_sparse_moe.gate",
+                    experts_prefix: "block_sparse_moe.experts",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn mixtral_vulkan_features_reject_invalid_expert_counts() {
+            let raw = serde_json::json!({
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 24,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                "hidden_act": "silu",
+                "num_local_experts": 2,
+                "num_experts_per_tok": 3
+            });
+            assert!(vulkan_config(&raw).is_err());
+        }
     }
 
     #[test]

@@ -3,8 +3,6 @@
 mod engine;
 mod models;
 #[cfg(feature = "vulkan")]
-mod vulkan_qwen;
-#[cfg(feature = "vulkan")]
 mod vulkan_transformer;
 
 pub(crate) use engine::{ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice};

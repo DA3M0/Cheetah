@@ -123,9 +123,9 @@ To opt into Vulkan inference, the model registration must provide both:
 1. A `vulkan_loader` that initializes and loads a Vulkan executor, returning it as `Box<dyn ModelRuntime>`.
 2. The shader stem(s) used by that executor in `shaders`.
 
-The executor must implement the same `ModelRuntime` interface as the Candle model. Follow the Vulkan initialization, resource ownership, tensor validation, and error-handling patterns in `src/chat/vulkan_qwen.rs`; the Candle loader remains necessary for CPU/CUDA/Metal and Vulkan fallback. `vulkan_loader` should be `None` when the model has no Vulkan implementation. Shader presence alone does not activate Vulkan inference.
+The executor must implement the same `ModelRuntime` interface as the Candle model. Follow the shared Vulkan initialization, resource ownership, tensor validation, and error-handling patterns in `src/chat/vulkan_transformer.rs`; the Candle loader remains necessary for CPU/CUDA/Metal and Vulkan fallback. `vulkan_loader` should be `None` when the model has no Vulkan implementation. Shader presence alone does not activate Vulkan inference.
 
-Qwen2 demonstrates a feature-gated loader in `src/chat/models/qwen2.rs` and its executor in `src/chat/vulkan_qwen.rs`. Mistral and Mixtral use the shared native operator executor in `src/chat/vulkan_transformer.rs`; Mixtral's sparse expert router and top-k dispatch are model-specific. These implementations list the shared `shared_ops` shader registration because they call its native compute operators; shader names do not describe the model architecture. A new executor may be implemented in its registration module or in a shared chat module. If adding a separate module under `src/chat/`, declare it in `src/chat/mod.rs`; do not place a helper `.rs` next to model registrations unless it also defines a complete model registration.
+Qwen2, Gemma, Llama, Mistral, and Mixtral construct `TransformerFeatures` in their registration modules and use the shared transformer executor in `src/chat/vulkan_transformer.rs`. A registration starts with `TransformerFeatures::standard(...)`, adjusts architecture behavior and tensor-layout fields, then builds a `VulkanTransformerConfig` with `VulkanTransformerConfig::from_raw(&raw_config, features)`. Dense models use the default dense feed-forward feature; MoE models describe expert count, top-k routing, activation, and router/expert tensor names in `TransformerFeedForwardFeatures::MixtureOfExperts`. The executor's single `load(weight_paths, &config)` entry point then loads according to that data, without architecture-specific branches or a separate sparse flag. These registrations list the shared `shared_ops` shader because they call its native compute operators; shader names do not describe model architecture. A new executor may be implemented in its registration module or in a shared chat module. If adding a separate module under `src/chat/`, declare it in `src/chat/mod.rs`; do not place a helper `.rs` next to model registrations unless it also defines a complete model registration.
 
 Build and select Vulkan explicitly:
 
@@ -166,8 +166,8 @@ Before submitting, check that:
 | Model | Candle CPU/CUDA/Metal | Vulkan |
 | --- | --- | --- |
 | Qwen2 | Yes | Yes |
-| Gemma | Yes | No |
-| Llama | Yes | No |
+| Gemma | Yes | Yes |
+| Llama | Yes | Yes |
 | Phi | Yes | No |
-| Mistral | Standard 7B configs supported by Candle 0.4.1 | Standard Mistral 7B configs |
+| Mistral | Standard 7B configs supported by Candle 0.4.1 | Standard Mistral 7B configs; F32/F16/BF16 weights |
 | Mixtral | Configs supported by Candle 0.4.1 | Sparse expert routing; F32/F16/BF16 weights |

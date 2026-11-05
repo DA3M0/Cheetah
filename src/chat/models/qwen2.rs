@@ -82,10 +82,86 @@ fn load_vulkan(
     _config_bytes: &[u8],
     raw_config: Value,
 ) -> Result<Box<dyn ModelRuntime>, String> {
-    let config: qwen2::Config = serde_json::from_value(raw_config)
-        .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
-    Ok(Box::new(super::super::vulkan_qwen::VulkanQwenExecutor::load(
+    let config = vulkan_config(&raw_config)?;
+    Ok(Box::new(super::super::vulkan_transformer::VulkanTransformerExecutor::load(
         weight_paths,
         &config,
     )?))
+}
+
+#[cfg(feature = "vulkan")]
+fn vulkan_config(
+    raw_config: &Value,
+) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
+    use super::super::vulkan_transformer::{
+        TransformerFeatures, VulkanTransformerConfig, required_usize,
+    };
+
+    let hidden_size = required_usize(raw_config, "hidden_size")?;
+    let num_attention_heads = required_usize(raw_config, "num_attention_heads")?;
+    if num_attention_heads == 0 || hidden_size % num_attention_heads != 0 {
+        return Err("Qwen2 attention dimensions are inconsistent.".into());
+    }
+    if raw_config
+        .get("num_local_experts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        != 0
+        || raw_config
+            .get("num_experts_per_tok")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            != 0
+    {
+        return Err("Qwen2 config must not define MoE experts.".into());
+    }
+    let mut features = TransformerFeatures::standard("Qwen2");
+    features.attention_bias = true;
+    features.head_dim_override = Some(hidden_size / num_attention_heads);
+    features.tie_word_embeddings = raw_config
+        .get("tie_word_embeddings")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    VulkanTransformerConfig::from_raw(raw_config, features)
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod vulkan_tests {
+    use super::*;
+
+    #[test]
+    fn qwen2_features_include_attention_bias_and_tied_embeddings() {
+        let config = vulkan_config(&serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 12,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+            "hidden_act": "silu",
+            "tie_word_embeddings": true
+        }))
+        .unwrap();
+        assert!(config.features.attention_bias);
+        assert!(!config.features.attention_output_bias);
+        assert!(config.features.tie_word_embeddings);
+    }
+
+    #[test]
+    fn qwen2_features_reject_inconsistent_attention_dimensions() {
+        assert!(
+            vulkan_config(&serde_json::json!({
+                "vocab_size": 16,
+                "hidden_size": 9,
+                "intermediate_size": 12,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                "hidden_act": "silu"
+            }))
+            .is_err()
+        );
+    }
 }
