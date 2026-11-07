@@ -1,6 +1,6 @@
 # Cheetah
 
-Cheetah is a local language-model CLI and OpenAI-compatible API gateway written in Rust and C. It runs Safetensors decoder models using Candle on CPU, CUDA, or Metal; an optional Vulkan backend provides Qwen2, supported Mistral 7B, and Mixtral inference. Cheetah can also prepare model weights for mmap-friendly loading and inspect Safetensors files.
+Cheetah is a local language-model CLI and OpenAI-compatible API gateway written in Rust and C. It runs Safetensors decoder models using Candle on CPU, CUDA, or Metal; an optional Vulkan backend supports Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral inference. Cheetah can also prepare model weights for mmap-friendly loading and inspect Safetensors files.
 
 The quickest way to start a chat is to pass a Hugging Face model directory:
 
@@ -94,7 +94,7 @@ cargo build --release --features vulkan
 CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/qwen2-model
 ```
 
-You also need a Vulkan-capable device and its driver. If `glslc` is not on `PATH`, set `GLSLC` to its executable path before building. The Vulkan backend supports Qwen2, standard Mistral 7B configurations, and Mixtral; other registered models use Candle backends. Vulkan builds on platforms other than Linux require a compatible Vulkan SDK and loader and are not covered by the package commands above.
+You also need a Vulkan-capable device and its driver. If `glslc` is not on `PATH`, set `GLSLC` to its executable path before building. Vulkan inference is available for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral when built with `--features vulkan`; support still depends on compatible model configuration and weights. Vulkan builds on platforms other than Linux require a compatible Vulkan SDK and loader and are not covered by the package commands above.
 
 On Windows, GPU builds under WSL2 additionally require the relevant GPU and driver support to be available inside WSL; the Linux commands alone do not install or configure that support.
 
@@ -106,9 +106,9 @@ On Windows, GPU builds under WSL2 additionally require the relevant GPU and driv
 
 ### Vulkan
 
-The optional Vulkan feature uses native C compute operators for Qwen2, Mistral, and Mixtral. See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
+The optional Vulkan feature uses native C compute operators for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral. See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
 
-The Vulkan paths support F32, F16, and BF16 weights. Mistral uses the standard 7B configuration presets supported by Candle 0.4.1; Mixtral uses the Mixtral sparse-expert architecture and its configured top-k routing. Unsupported configurations, unavailable Vulkan devices, or initialization and model-loading errors report a diagnostic and fall back to Candle on CPU. An error during active Vulkan inference is returned rather than silently switching devices. Gemma, Llama, and Phi currently use Candle backends only.
+The Vulkan paths support F32, F16, and BF16 weights. Mixtral uses the sparse-expert architecture and its configured top-k routing. Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and fall back to Candle on CPU. An error during active Vulkan inference is returned rather than silently switching devices.
 
 Vulkan operator tests that exercise a real device are ignored by default and require a Vulkan compute device and `glslc`:
 
@@ -265,7 +265,7 @@ The server loads one model at a time. Generation requests are queued in arrival 
 
 ## Supported models and limitations
 
-- **Inference:** Safetensors decoder models registered for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral architectures. Candle CPU, CUDA, and Metal support depends on the selected architecture and compiled backend. Vulkan inference supports Qwen2, standard Mistral 7B configs, and Mixtral with F32, F16, or BF16 weights.
+- **Inference:** Safetensors decoder models registered for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral architectures. Candle CPU, CUDA, and Metal support depends on the selected architecture and compiled backend. Vulkan inference supports all six registered architectures with F32, F16, or BF16 weights, subject to model configuration compatibility.
 - **Inspection and preparation:** Safetensors model directories and weight files.
 - **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
 
