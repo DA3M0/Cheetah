@@ -14,34 +14,99 @@ The directory should contain `config.json`, `tokenizer.json`, and either `model.
 
 ## Build
 
-The default build uses Candle's CPU backend:
+### Beginner-friendly build guide
+
+The default build uses the CPU backend and is the easiest way to get started. Build commands below are run from a terminal in the repository directory.
+
+#### 1. Install the prerequisites
+
+- **Rust and Cargo:** install the latest stable toolchain with [rustup](https://rustup.rs/). This project uses Rust 2024 edition (Rust 1.85 or newer). Check your installation with `rustc --version` and `cargo --version`.
+- **Git:** required to download the source code.
+- **A native C compiler and linker:** the build compiles a small C component.
+
+On Ubuntu or Debian, install the native build tools with:
+
+```sh
+sudo apt update
+sudo apt install -y build-essential git
+```
+
+On macOS, install Apple's command-line build tools:
+
+```sh
+xcode-select --install
+```
+
+On Windows, use **WSL2 with Ubuntu** and follow the Linux instructions inside the WSL terminal. Native Windows builds are not currently documented or verified; the C initialization code uses POSIX APIs.
+
+#### 2. Download the source code
+
+```sh
+git clone https://github.com/DA3M0/cheetah.git
+cd cheetah
+```
+
+If you already have the source code, open a terminal in that directory instead.
+
+#### 3. Build the CPU version
 
 ```sh
 cargo build --release
 ```
 
-The executable is created at `target/release/cheetah`. GPU backends are selected at runtime and must also be enabled at build time:
+The first build downloads and compiles Rust dependencies and may take a while. When it finishes successfully, the executable is `target/release/cheetah`. Check that it runs:
 
 ```sh
-# NVIDIA CUDA
+./target/release/cheetah help
+```
+
+To start chatting, you also need a supported model directory or Safetensors file:
+
+```sh
+./target/release/cheetah /path/to/model
+```
+
+Without `CHEETAH_DEVICE`, Cheetah uses CPU.
+
+#### Optional: build with a GPU backend
+
+GPU support must be compiled in and selected at runtime. Build only the backend you intend to use; each option has additional platform-specific requirements.
+
+**NVIDIA CUDA (Linux):** install a compatible NVIDIA driver and CUDA Toolkit first. Check that `nvidia-smi` and `nvcc --version` work, then build and run:
+
+```sh
 cargo build --release --features cuda
 CHEETAH_DEVICE=cuda ./target/release/cheetah /path/to/model
+```
 
-# Apple Metal (macOS)
+**Apple Metal (macOS):** install Xcode command-line tools, then build and run:
+
+```sh
 cargo build --release --features metal
 CHEETAH_DEVICE=metal ./target/release/cheetah /path/to/model
 ```
 
-Without `CHEETAH_DEVICE`, Cheetah uses CPU. CUDA and Metal require their respective local toolchains and compatible runtime/driver installations.
-
-### Vulkan
-
-The optional Vulkan feature uses native C compute operators for Qwen2, Mistral, and Mixtral. It requires a Vulkan development environment (headers, loader/runtime, and a C compiler); the compute shaders are compiled with `glslc`.
+**Vulkan:** install a Vulkan development environment with headers, the loader/runtime, a C compiler, and `glslc`. On Ubuntu or Debian, the development packages are:
 
 ```sh
+sudo apt install -y build-essential libvulkan-dev glslc
 cargo build --release --features vulkan
 CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/qwen2-model
 ```
+
+You also need a Vulkan-capable device and its driver. If `glslc` is not on `PATH`, set `GLSLC` to its executable path before building. The Vulkan backend supports Qwen2, standard Mistral 7B configurations, and Mixtral; other registered models use Candle backends. Vulkan builds on platforms other than Linux require a compatible Vulkan SDK and loader and are not covered by the package commands above.
+
+On Windows, GPU builds under WSL2 additionally require the relevant GPU and driver support to be available inside WSL; the Linux commands alone do not install or configure that support.
+
+#### Troubleshooting
+
+- If `cargo` or `rustc` is not found, install Rust with rustup and reopen the terminal so its `PATH` changes take effect.
+- If the build reports that a C compiler is missing, install the native build tools listed above.
+- If a GPU build fails, check that its platform-specific toolkit, headers, libraries, and runtime/driver are installed. For Vulkan, also verify that `glslc` is available or set `GLSLC`.
+
+### Vulkan
+
+The optional Vulkan feature uses native C compute operators for Qwen2, Mistral, and Mixtral. See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
 
 The Vulkan paths support F32, F16, and BF16 weights. Mistral uses the standard 7B configuration presets supported by Candle 0.4.1; Mixtral uses the Mixtral sparse-expert architecture and its configured top-k routing. Unsupported configurations, unavailable Vulkan devices, or initialization and model-loading errors report a diagnostic and fall back to Candle on CPU. An error during active Vulkan inference is returned rather than silently switching devices. Gemma, Llama, and Phi currently use Candle backends only.
 
