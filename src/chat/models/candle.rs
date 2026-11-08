@@ -70,6 +70,8 @@ mod tests {
         for architecture in [
             "Qwen2ForCausalLM",
             "qwen2",
+            "Qwen3ForCausalLM",
+            "qwen3",
             "GemmaForCausalLM",
             "gemma",
             "LlamaForCausalLM",
@@ -95,6 +97,7 @@ mod tests {
             !registration.architectures.is_empty() && !registration.stop_markers.is_empty()
         }));
         assert_eq!(super::super::qwen2::REGISTRATION.chat_template.id, "qwen");
+        assert_eq!(super::super::qwen3::REGISTRATION.chat_template.id, "qwen");
         assert_eq!(
             super::super::mistral::REGISTRATION.chat_template.id,
             "mistral"

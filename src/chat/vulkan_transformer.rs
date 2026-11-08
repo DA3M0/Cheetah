@@ -29,6 +29,7 @@ pub(crate) struct TransformerFeatures {
     pub(crate) model_name: &'static str,
     pub(crate) attention_bias: bool,
     pub(crate) attention_output_bias: bool,
+    pub(crate) qk_norm: bool,
     pub(crate) head_dim_override: Option<usize>,
     pub(crate) norm_weight_offset: bool,
     pub(crate) embedding_scale: bool,
@@ -45,6 +46,7 @@ impl TransformerFeatures {
             model_name,
             attention_bias: false,
             attention_output_bias: false,
+            qk_norm: false,
             head_dim_override: None,
             norm_weight_offset: false,
             embedding_scale: false,
@@ -70,6 +72,8 @@ pub(crate) struct TransformerWeightLayout {
     pub(crate) k_proj: &'static str,
     pub(crate) v_proj: &'static str,
     pub(crate) o_proj: &'static str,
+    pub(crate) q_norm: &'static str,
+    pub(crate) k_norm: &'static str,
     pub(crate) dense_gate: &'static str,
     pub(crate) dense_up: &'static str,
     pub(crate) dense_down: &'static str,
@@ -89,6 +93,8 @@ impl Default for TransformerWeightLayout {
             k_proj: "k_proj",
             v_proj: "v_proj",
             o_proj: "o_proj",
+            q_norm: "q_norm",
+            k_norm: "k_norm",
             dense_gate: "mlp.gate_proj",
             dense_up: "mlp.up_proj",
             dense_down: "mlp.down_proj",
@@ -685,6 +691,8 @@ fn select_experts(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f32)>, Str
 struct Layer {
     input_norm: WeightData,
     post_attention_norm: WeightData,
+    q_norm: Option<WeightData>,
+    k_norm: Option<WeightData>,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -806,6 +814,30 @@ impl VulkanTransformerExecutor {
                 post_attention_norm
             };
             let attention = format!("{prefix}.{}", layout.attention_prefix);
+            let q_norm = if config.features.qk_norm {
+                Some(
+                    take_weight(
+                        &mut weights,
+                        &format!("{attention}.{}.weight", layout.q_norm),
+                        &[head_dim],
+                    )?
+                    .data,
+                )
+            } else {
+                None
+            };
+            let k_norm = if config.features.qk_norm {
+                Some(
+                    take_weight(
+                        &mut weights,
+                        &format!("{attention}.{}.weight", layout.k_norm),
+                        &[head_dim],
+                    )?
+                    .data,
+                )
+            } else {
+                None
+            };
             let feed_forward = match &config.features.feed_forward {
                 TransformerFeedForwardFeatures::Dense => FeedForward::Dense {
                     gate: take_linear(
@@ -857,6 +889,8 @@ impl VulkanTransformerExecutor {
             layers.push(Layer {
                 input_norm,
                 post_attention_norm,
+                q_norm,
+                k_norm,
                 q_proj: take_linear(
                     &mut weights,
                     &format!("{attention}.{}", layout.q_proj),
@@ -967,6 +1001,22 @@ impl VulkanTransformerExecutor {
             let mut query = layer.q_proj.forward(&normalized, sequence)?;
             let mut keys = layer.k_proj.forward(&normalized, sequence)?;
             let values = layer.v_proj.forward(&normalized, sequence)?;
+            if let Some(norm) = &layer.q_norm {
+                query = norm.rms_norm(
+                    &query,
+                    sequence * self.config.num_attention_heads,
+                    self.config.head_dim,
+                    self.config.rms_norm_eps,
+                )?;
+            }
+            if let Some(norm) = &layer.k_norm {
+                keys = norm.rms_norm(
+                    &keys,
+                    sequence * self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.rms_norm_eps,
+                )?;
+            }
             (query, keys) = cheetah::native::vulkan::rotary(
                 &query,
                 &keys,
@@ -1575,6 +1625,8 @@ mod tests {
             layers: vec![Layer {
                 input_norm: WeightData::F32(vec![1.0, 1.0].into()),
                 post_attention_norm: WeightData::F32(vec![1.0, 1.0].into()),
+                q_norm: None,
+                k_norm: None,
                 q_proj: identity_linear("q_proj", 2),
                 k_proj: identity_linear("k_proj", 2),
                 v_proj: identity_linear("v_proj", 2),

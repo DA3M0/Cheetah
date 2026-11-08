@@ -1,15 +1,47 @@
 //! Safe Rust adapters for C APIs declared by the root-level C headers.
 
-use std::ffi::CString;
+use indicatif::ProgressBar;
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::path::Path;
 use std::sync::Mutex;
 
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
+struct InitProgress {
+    bar: ProgressBar,
+    phase: String,
+}
+
 unsafe extern "C" {
-    fn cheetah_init_model(src_dir: *const c_char, dst_dir: *const c_char) -> i32;
+    fn cheetah_init_model_with_progress(
+        src_dir: *const c_char,
+        dst_dir: *const c_char,
+        progress_fn: extern "C" fn(*const c_char, usize, usize, *mut c_void),
+        user_data: *mut c_void,
+    ) -> i32;
+}
+
+extern "C" fn report_init_progress(
+    phase: *const c_char,
+    current: usize,
+    total: usize,
+    user_data: *mut c_void,
+) {
+    if phase.is_null() || user_data.is_null() {
+        return;
+    }
+
+    let progress = unsafe { &mut *user_data.cast::<InitProgress>() };
+    let phase = unsafe { CStr::from_ptr(phase) }.to_string_lossy();
+    if progress.phase != phase {
+        progress.phase = phase.into_owned();
+        progress.bar.set_message(progress.phase.clone());
+        progress.bar.set_length(total as u64);
+        progress.bar.set_position(0);
+    }
+    progress.bar.set_position(current as u64);
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString, String> {
@@ -42,14 +74,32 @@ pub fn init_model_with_metadata(
     let _guard = INIT_LOCK
         .lock()
         .map_err(|_| "Native model initializer lock is poisoned.".to_string())?;
-    let result = unsafe { cheetah_init_model(src_dir.as_ptr(), dst_dir.as_ptr()) };
+    let mut progress = InitProgress {
+        bar: ProgressBar::new(0),
+        phase: String::new(),
+    };
+    let result = unsafe {
+        cheetah_init_model_with_progress(
+            src_dir.as_ptr(),
+            dst_dir.as_ptr(),
+            report_init_progress,
+            (&mut progress as *mut InitProgress).cast(),
+        )
+    };
     if result == 0 {
-        if let Some(metadata) = metadata {
+        let result = if let Some(metadata) = metadata {
             update_manifest_metadata(&dst_dir_path, metadata)
         } else {
             Ok(())
+        };
+        if result.is_ok() {
+            progress.bar.finish_with_message("Initialization complete");
+        } else {
+            progress.bar.abandon_with_message("Initialization failed");
         }
+        result
     } else {
+        progress.bar.abandon_with_message("Initialization failed");
         Err("Cheetah model preparation failed; see the native diagnostic above.".into())
     }
 }
@@ -105,6 +155,26 @@ fn update_manifest_metadata(dst_dir: &Path, metadata: ModelMetadata) -> Result<(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn initializer_progress_callback_tracks_phase_and_position() {
+        let mut progress = InitProgress {
+            bar: ProgressBar::hidden(),
+            phase: String::new(),
+        };
+        let user_data = (&mut progress as *mut InitProgress).cast();
+        let parsing = CString::new("parsing").unwrap();
+        report_init_progress(parsing.as_ptr(), 2, 4, user_data);
+        assert_eq!(progress.phase, "parsing");
+        assert_eq!(progress.bar.length(), Some(4));
+        assert_eq!(progress.bar.position(), 2);
+
+        let writing = CString::new("writing").unwrap();
+        report_init_progress(writing.as_ptr(), 1, 3, user_data);
+        assert_eq!(progress.phase, "writing");
+        assert_eq!(progress.bar.length(), Some(3));
+        assert_eq!(progress.bar.position(), 1);
+    }
 
     fn temporary_directory() -> std::path::PathBuf {
         let nonce = SystemTime::now()

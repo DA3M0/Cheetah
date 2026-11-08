@@ -125,4 +125,27 @@ mod tests {
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    fn init_metadata_comes_from_qwen3_registration() {
+        let directory = std::env::temp_dir().join(format!(
+            "cheetah-init-qwen3-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("config.json"),
+            r#"{"architectures":["Qwen3ForCausalLM"]}"#,
+        )
+        .unwrap();
+
+        let metadata = model_metadata_for_init(&directory).unwrap().unwrap();
+        assert_eq!(metadata.chat_template, "qwen");
+        assert_eq!(metadata.stop_markers, ["<|im_end|>"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

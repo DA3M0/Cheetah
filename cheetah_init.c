@@ -104,6 +104,8 @@ typedef struct ModelInfo {
     char *chat_template;
     const char *stop_markers[8];
     size_t stop_marker_count;
+    cheetah_progress_fn progress_fn;
+    void *progress_user_data;
 } ModelInfo;
 
 static void set_error(const char *message) {
@@ -1410,6 +1412,10 @@ static int build_and_write_shards(ModelInfo *model, const char *weights_dir,
             return -1;
     }
     for (i = 0; i < model->shard_count; ++i) {
+        if (model->progress_fn) {
+            model->progress_fn("writing", i + 1, model->shard_count,
+                               model->progress_user_data);
+        }
         if (write_safetensors_shard(model, i, aligned_buffer) != 0) return -1;
     }
     return 0;
@@ -2024,6 +2030,12 @@ static void free_model_info(ModelInfo *model) {
 }
 
 int cheetah_init_model(const char *src_dir, const char *dst_dir) {
+    return cheetah_init_model_with_progress(src_dir, dst_dir, NULL, NULL);
+}
+
+int cheetah_init_model_with_progress(const char *src_dir, const char *dst_dir,
+                                     cheetah_progress_fn progress_fn,
+                                     void *user_data) {
     char **source_files = NULL;
     size_t source_count = 0;
     size_t source_index;
@@ -2041,6 +2053,9 @@ int cheetah_init_model(const char *src_dir, const char *dst_dir) {
     void *aligned_buffer = NULL;
     ModelInfo model = {0};
     int result = -1;
+
+    model.progress_fn = progress_fn;
+    model.progress_user_data = user_data;
 
     if (src_dir == NULL || dst_dir == NULL ||
         src_dir[0] == '\0' || dst_dir[0] == '\0') {
@@ -2105,6 +2120,10 @@ int cheetah_init_model(const char *src_dir, const char *dst_dir) {
         goto done;
     }
     for (source_index = 0; source_index < source_count; ++source_index) {
+        if (model.progress_fn) {
+            model.progress_fn("parsing", source_index + 1, source_count,
+                              model.progress_user_data);
+        }
         if (process_safetensors_file(source_files[source_index], &model) != 0) {
             goto done;
         }
@@ -2119,6 +2138,9 @@ int cheetah_init_model(const char *src_dir, const char *dst_dir) {
     if (model.chat_template == NULL) {
         set_error("out of memory while preparing chat template");
         goto done;
+    }
+    if (model.progress_fn) {
+        model.progress_fn("preparing", 1, 1, model.progress_user_data);
     }
     if (build_and_write_shards(&model, weights_dir,
                                (unsigned char *)aligned_buffer) != 0) goto done;
@@ -2145,6 +2167,9 @@ int cheetah_init_model(const char *src_dir, const char *dst_dir) {
             }
             free(legacy_manifest);
         }
+    }
+    if (model.progress_fn) {
+        model.progress_fn("complete", 1, 1, model.progress_user_data);
     }
     result = 0;
     CHEETAH_FPRINTF(stderr, CHEETAH_COLOR_GREEN,
