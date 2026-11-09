@@ -4,7 +4,6 @@ mod http;
 mod openai;
 mod queue;
 
-use crate::chat::Engine;
 use crate::cli::ServeOptions;
 use crate::color::{self, Color};
 use crate::options::ChatOptions;
@@ -35,7 +34,11 @@ pub fn serve(options: ServeOptions, chat_options: ChatOptions) -> Result<(), Str
         )
     );
 
-    let engine = Engine::load(&model_path, chat_options.threads, chat_options.ctx_size)?;
+    let engine = crate::chat::load_engine_with_progress(
+        &model_path,
+        chat_options.threads,
+        chat_options.ctx_size,
+    )?;
     let api_key = resolve_api_key(&options)?;
 
     let addr = format!("{}:{}", options.host, options.port);

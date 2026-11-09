@@ -10,9 +10,11 @@ use rand::rngs::StdRng;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget};
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,60 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: content.into(),
+        }
+    }
+}
+
+fn log_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    format!("[{:.3}]", now)
+}
+
+fn create_spinner(message: &'static str) -> ProgressBar {
+    let draw_target = if std::io::stdout().is_terminal() {
+        ProgressDrawTarget::stdout()
+    } else {
+        ProgressDrawTarget::hidden()
+    };
+    let bar = ProgressBar::new_spinner();
+    bar.set_draw_target(draw_target);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid spinner style"),
+    );
+    bar.enable_steady_tick(Duration::from_millis(80));
+    bar.set_message(message);
+    bar
+}
+
+pub(crate) fn load_engine_with_progress(
+    path: &Path,
+    threads: Option<usize>,
+    ctx_size: usize,
+) -> Result<Engine, String> {
+    println!(
+        "{} {}",
+        log_timestamp(),
+        color::stdout(
+            &format!("loading model: {}", path.display()),
+            Color::Cyan,
+        )
+    );
+
+    let spinner = create_spinner("loading model");
+    let result = Engine::load(path, threads, ctx_size);
+    match result {
+        Ok(engine) => {
+            let loaded = format!("loaded: {}", engine.model_id());
+            spinner.finish_with_message(std::borrow::Cow::from(loaded));
+            Ok(engine)
+        }
+        Err(error) => {
+            spinner.abandon_with_message("model load failed");
+            Err(error)
         }
     }
 }
@@ -706,11 +762,7 @@ pub(super) fn chat(
             path.display()
         ));
     }
-    eprintln!(
-        "{}",
-        color::stderr(&format!("Loading model: {}", path.display()), Color::Cyan)
-    );
-    let engine = Engine::load(path, options.threads, options.ctx_size)?;
+    let engine = load_engine_with_progress(path, options.threads, options.ctx_size)?;
     println!(
         "{}",
         color::stdout(

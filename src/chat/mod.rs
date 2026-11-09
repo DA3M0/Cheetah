@@ -5,7 +5,7 @@ mod models;
 #[cfg(feature = "vulkan")]
 mod vulkan_transformer;
 
-pub(crate) use engine::{ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice};
+pub(crate) use engine::{ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice, load_engine_with_progress};
 
 pub fn chat(
     path: &std::path::Path,

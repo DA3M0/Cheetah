@@ -1,6 +1,6 @@
 //! Safe Rust adapters for C APIs declared by the root-level C headers.
 
-use indicatif::ProgressBar;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_void};
@@ -10,8 +10,35 @@ use std::sync::Mutex;
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 struct InitProgress {
-    bar: ProgressBar,
-    phase: String,
+    bars: MultiProgress,
+    parse_bar: Option<ProgressBar>,
+    write_bar: Option<ProgressBar>,
+}
+
+impl InitProgress {
+    fn new() -> Self {
+        Self {
+            bars: MultiProgress::new(),
+            parse_bar: None,
+            write_bar: None,
+        }
+    }
+
+    fn style() -> ProgressStyle {
+        ProgressStyle::with_template(
+            "{pos:>7}/{len:<7} [{bar:40.cyan}] {msg}",
+        )
+        .expect("valid indicatif style")
+        .progress_chars("##-")
+    }
+
+    fn start_bar(&mut self, total: usize, message: &'static str) -> ProgressBar {
+        let bar = self.bars.add(ProgressBar::new(total as u64));
+        bar.set_style(Self::style());
+        bar.set_message(message);
+        bar.set_position(0);
+        bar
+    }
 }
 
 unsafe extern "C" {
@@ -35,13 +62,58 @@ extern "C" fn report_init_progress(
 
     let progress = unsafe { &mut *user_data.cast::<InitProgress>() };
     let phase = unsafe { CStr::from_ptr(phase) }.to_string_lossy();
-    if progress.phase != phase {
-        progress.phase = phase.into_owned();
-        progress.bar.set_message(progress.phase.clone());
-        progress.bar.set_length(total as u64);
-        progress.bar.set_position(0);
+
+    match phase.as_ref() {
+        // 解析源 safetensors：按源文件数更新。
+        "parsing" => {
+            let mut parse_bar = progress.parse_bar.take();
+            if parse_bar.is_none() {
+                parse_bar = Some(
+                    progress.start_bar(total, "Parsing safetensors files..."),
+                );
+            }
+            if let Some(bar) = parse_bar.as_mut() {
+                bar.set_position(current as u64);
+            }
+            progress.parse_bar = parse_bar;
+        }
+        // 写入预处理分片：结束解析条，再创建写入条。
+        "writing" => {
+            let mut parse_bar = progress.parse_bar.take();
+            if let Some(bar) = parse_bar.as_mut() {
+                bar.finish_with_message("Parsing complete");
+            }
+            let write_bar = progress.start_bar(total, "Writing prepared shards...");
+            progress.write_bar = Some(write_bar);
+            if let Some(bar) = progress.write_bar.as_mut() {
+                bar.set_position(current as u64);
+            }
+        }
+        // 权重准备：保持当前条的状态，避免 1/1 短暂闪烁。
+        "preparing" => {
+            let mut parse_bar = progress.parse_bar.take();
+            if let Some(bar) = parse_bar.as_mut() {
+                bar.finish_with_message("Preparing weights...");
+            }
+        }
+        // 完成：结束写入条并给出最终状态。
+        "complete" => {
+            let mut write_bar = progress.write_bar.take();
+            if let Some(bar) = write_bar.as_mut() {
+                bar.finish_with_message("Initialization complete");
+            }
+            progress.write_bar = write_bar;
+
+            if progress.write_bar.is_none() {
+                let mut parse_bar = progress.parse_bar.take();
+                if let Some(bar) = parse_bar.as_mut() {
+                    bar.finish_with_message("Initialization complete");
+                }
+                progress.parse_bar = parse_bar;
+            }
+        }
+        _ => {}
     }
-    progress.bar.set_position(current as u64);
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString, String> {
@@ -51,7 +123,6 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
     CString::new(path).map_err(|_| "Path contains an interior NUL byte.".to_string())
 }
 
-#[derive(Clone, Copy)]
 pub struct ModelMetadata {
     pub chat_template: &'static str,
     pub stop_markers: &'static [&'static str],
@@ -74,10 +145,8 @@ pub fn init_model_with_metadata(
     let _guard = INIT_LOCK
         .lock()
         .map_err(|_| "Native model initializer lock is poisoned.".to_string())?;
-    let mut progress = InitProgress {
-        bar: ProgressBar::new(0),
-        phase: String::new(),
-    };
+
+    let mut progress = InitProgress::new();
     let result = unsafe {
         cheetah_init_model_with_progress(
             src_dir.as_ptr(),
@@ -86,21 +155,54 @@ pub fn init_model_with_metadata(
             (&mut progress as *mut InitProgress).cast(),
         )
     };
+
     if result == 0 {
+        // The C path above normally ends with the "complete" callback; finish
+        // any bar that is still open so the final status line is always shown.
+        let mut write_bar = progress.write_bar.take();
+        if let Some(bar) = write_bar.as_mut() {
+            bar.finish_with_message("Initialization complete");
+        }
+        progress.write_bar = write_bar;
+
+        if progress.write_bar.is_none() {
+            let mut parse_bar = progress.parse_bar.take();
+            if let Some(bar) = parse_bar.as_mut() {
+                bar.finish_with_message("Initialization complete");
+            }
+            progress.parse_bar = parse_bar;
+        }
+
         let result = if let Some(metadata) = metadata {
             update_manifest_metadata(&dst_dir_path, metadata)
         } else {
             Ok(())
         };
+
         if result.is_ok() {
-            progress.bar.finish_with_message("Initialization complete");
+            for bar in [&mut progress.parse_bar, &mut progress.write_bar] {
+                if let Some(b) = bar {
+                    if !b.is_finished() {
+                        b.finish_with_message("Initialization complete");
+                    }
+                }
+            }
         } else {
-            progress.bar.abandon_with_message("Initialization failed");
+            abandon_bars(&mut progress);
         }
+
         result
     } else {
-        progress.bar.abandon_with_message("Initialization failed");
+        abandon_bars(&mut progress);
         Err("Cheetah model preparation failed; see the native diagnostic above.".into())
+    }
+}
+
+fn abandon_bars(progress: &mut InitProgress) {
+    for bar in [&mut progress.parse_bar, &mut progress.write_bar] {
+        if let Some(b) = bar {
+            b.abandon_with_message("Initialization failed");
+        }
     }
 }
 
@@ -158,22 +260,18 @@ mod tests {
 
     #[test]
     fn initializer_progress_callback_tracks_phase_and_position() {
-        let mut progress = InitProgress {
-            bar: ProgressBar::hidden(),
-            phase: String::new(),
-        };
+        let mut progress = InitProgress::new();
         let user_data = (&mut progress as *mut InitProgress).cast();
         let parsing = CString::new("parsing").unwrap();
         report_init_progress(parsing.as_ptr(), 2, 4, user_data);
-        assert_eq!(progress.phase, "parsing");
-        assert_eq!(progress.bar.length(), Some(4));
-        assert_eq!(progress.bar.position(), 2);
+        assert_eq!(progress.parse_bar.as_ref().map(|b| b.length()), Some(Some(4)));
+        assert_eq!(progress.parse_bar.as_ref().map(|b| b.position()), Some(2));
 
         let writing = CString::new("writing").unwrap();
         report_init_progress(writing.as_ptr(), 1, 3, user_data);
-        assert_eq!(progress.phase, "writing");
-        assert_eq!(progress.bar.length(), Some(3));
-        assert_eq!(progress.bar.position(), 1);
+        assert!(progress.parse_bar.is_none());
+        assert_eq!(progress.write_bar.as_ref().map(|b| b.length()), Some(Some(3)));
+        assert_eq!(progress.write_bar.as_ref().map(|b| b.position()), Some(1));
     }
 
     fn temporary_directory() -> std::path::PathBuf {
