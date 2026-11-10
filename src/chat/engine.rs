@@ -4,6 +4,7 @@ use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
 use candle_core::{Device, Tensor};
 use candle_transformers::models::llama;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rand::SeedableRng;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
@@ -14,7 +15,6 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget};
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +49,7 @@ fn create_spinner(message: &'static str) -> ProgressBar {
     let bar = ProgressBar::new_spinner();
     bar.set_draw_target(draw_target);
     bar.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .expect("valid spinner style"),
+        ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("valid spinner style"),
     );
     bar.enable_steady_tick(Duration::from_millis(80));
     bar.set_message(message);
@@ -65,18 +64,15 @@ pub(crate) fn load_engine_with_progress(
     println!(
         "{} {}",
         log_timestamp(),
-        color::stdout(
-            &format!("loading model: {}", path.display()),
-            Color::Cyan,
-        )
+        color::stdout(&format!("loading model: {}", path.display()), Color::Cyan,)
     );
 
     let spinner = create_spinner("loading model");
     let result = Engine::load(path, threads, ctx_size);
     match result {
         Ok(engine) => {
-            let loaded = format!("loaded: {}", engine.model_id());
-            spinner.finish_with_message(std::borrow::Cow::from(loaded));
+            spinner.finish_with_message(format!("loaded: {}", engine.model_id()));
+            print_model_info(&engine);
             Ok(engine)
         }
         Err(error) => {
@@ -84,6 +80,19 @@ pub(crate) fn load_engine_with_progress(
             Err(error)
         }
     }
+}
+
+fn print_model_info(engine: &Engine) {
+    println!();
+    println!(
+        "{} {}",
+        log_timestamp(),
+        color::stdout(&format!("model loaded: {}", engine.model_id()), Color::Cyan,),
+    );
+    if let Some(architecture) = engine.model_architecture() {
+        println!("  architecture: {architecture}");
+    }
+    println!("  device:       {}", engine.device_name());
 }
 
 pub trait TextSink {
@@ -165,6 +174,7 @@ pub struct Engine {
     model: Mutex<LoadedModel>,
     tokenizer: Tokenizer,
     model_id: String,
+    architecture: Option<String>,
     prompt_renderer: super::models::PromptRenderer,
     max_position_embeddings: usize,
     eos_token_ids: HashSet<u32>,
@@ -215,8 +225,9 @@ impl Engine {
             .as_ref()
             .and_then(|architectures| architectures.first())
             .map(String::as_str)
-            .unwrap_or(config.model_type.as_str());
-        let registration = super::models::registration_for_architecture(architecture)?;
+            .unwrap_or(config.model_type.as_str())
+            .to_owned();
+        let registration = super::models::registration_for_architecture(&architecture)?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer_bytes = fs::read(&tokenizer_path).map_err(|error| {
@@ -249,7 +260,7 @@ impl Engine {
             registration.chat_template.render
         };
         let (device, model) =
-            super::models::load_model(&weight_paths, &config_bytes, raw_config, architecture)?;
+            super::models::load_model(&weight_paths, &config_bytes, raw_config, &architecture)?;
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {
             match value {
@@ -288,6 +299,7 @@ impl Engine {
                 .and_then(|name| name.to_str())
                 .unwrap_or("model")
                 .to_owned(),
+            architecture: Some(architecture),
             prompt_renderer,
             max_position_embeddings: config.max_position_embeddings.min(ctx_size).min(
                 if config.model_type == "llama" {
@@ -303,6 +315,10 @@ impl Engine {
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    pub fn model_architecture(&self) -> Option<&str> {
+        self.architecture.as_deref()
     }
 
     pub fn device_name(&self) -> &'static str {

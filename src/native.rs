@@ -25,11 +25,9 @@ impl InitProgress {
     }
 
     fn style() -> ProgressStyle {
-        ProgressStyle::with_template(
-            "{pos:>7}/{len:<7} [{bar:40.cyan}] {msg}",
-        )
-        .expect("valid indicatif style")
-        .progress_chars("##-")
+        ProgressStyle::with_template("{pos:>7}/{len:<7} [{bar:40.cyan}] {msg}")
+            .expect("valid indicatif style")
+            .progress_chars("##-")
     }
 
     fn start_bar(&mut self, total: usize, message: &'static str) -> ProgressBar {
@@ -68,9 +66,7 @@ extern "C" fn report_init_progress(
         "parsing" => {
             let mut parse_bar = progress.parse_bar.take();
             if parse_bar.is_none() {
-                parse_bar = Some(
-                    progress.start_bar(total, "Parsing safetensors files..."),
-                );
+                parse_bar = Some(progress.start_bar(total, "Parsing safetensors files..."));
             }
             if let Some(bar) = parse_bar.as_mut() {
                 bar.set_position(current as u64);
@@ -165,14 +161,6 @@ pub fn init_model_with_metadata(
         }
         progress.write_bar = write_bar;
 
-        if progress.write_bar.is_none() {
-            let mut parse_bar = progress.parse_bar.take();
-            if let Some(bar) = parse_bar.as_mut() {
-                bar.finish_with_message("Initialization complete");
-            }
-            progress.parse_bar = parse_bar;
-        }
-
         let result = if let Some(metadata) = metadata {
             update_manifest_metadata(&dst_dir_path, metadata)
         } else {
@@ -264,13 +252,19 @@ mod tests {
         let user_data = (&mut progress as *mut InitProgress).cast();
         let parsing = CString::new("parsing").unwrap();
         report_init_progress(parsing.as_ptr(), 2, 4, user_data);
-        assert_eq!(progress.parse_bar.as_ref().map(|b| b.length()), Some(Some(4)));
+        assert_eq!(
+            progress.parse_bar.as_ref().map(|b| b.length()),
+            Some(Some(4))
+        );
         assert_eq!(progress.parse_bar.as_ref().map(|b| b.position()), Some(2));
 
         let writing = CString::new("writing").unwrap();
         report_init_progress(writing.as_ptr(), 1, 3, user_data);
         assert!(progress.parse_bar.is_none());
-        assert_eq!(progress.write_bar.as_ref().map(|b| b.length()), Some(Some(3)));
+        assert_eq!(
+            progress.write_bar.as_ref().map(|b| b.length()),
+            Some(Some(3))
+        );
         assert_eq!(progress.write_bar.as_ref().map(|b| b.position()), Some(1));
     }
 
