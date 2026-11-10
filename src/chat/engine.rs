@@ -1,4 +1,5 @@
 use super::models::ModelRuntime;
+use crate::ant::{Ant, AntSettings};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
@@ -60,6 +61,7 @@ pub(crate) fn load_engine_with_progress(
     path: &Path,
     threads: Option<usize>,
     ctx_size: usize,
+    ant: Option<&AntSettings>,
 ) -> Result<Engine, String> {
     println!(
         "{} {}",
@@ -68,7 +70,7 @@ pub(crate) fn load_engine_with_progress(
     );
 
     let spinner = create_spinner("loading model");
-    let result = Engine::load(path, threads, ctx_size);
+    let result = Engine::load(path, threads, ctx_size, ant);
     match result {
         Ok(engine) => {
             spinner.finish_with_message(format!("loaded: {}", engine.model_id()));
@@ -93,6 +95,19 @@ fn print_model_info(engine: &Engine) {
         println!("  architecture: {architecture}");
     }
     println!("  device:       {}", engine.device_name());
+    if !engine.ant_plan.is_empty() {
+        println!("  ant plan:     {} resident unit(s)", engine.ant_plan.len());
+        println!(
+            "  ant resident: {} bytes within budget {}",
+            engine.ant_resident_bytes, engine.ant_budget_bytes
+        );
+        if engine.ant_resident_bytes > engine.ant_budget_bytes {
+            println!(
+                "  ant warning:  resident bytes {} exceed vram budget {}",
+                engine.ant_resident_bytes, engine.ant_budget_bytes
+            );
+        }
+    }
 }
 
 pub trait TextSink {
@@ -179,6 +194,9 @@ pub struct Engine {
     max_position_embeddings: usize,
     eos_token_ids: HashSet<u32>,
     stop_markers: Vec<String>,
+    ant_plan: std::collections::HashMap<String, String>,
+    ant_resident_bytes: u64,
+    ant_budget_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +214,12 @@ fn default_context_size() -> usize {
 }
 
 impl Engine {
-    pub fn load(path: &Path, threads: Option<usize>, ctx_size: usize) -> Result<Self, String> {
+    pub fn load(
+        path: &Path,
+        threads: Option<usize>,
+        ctx_size: usize,
+        ant: Option<&AntSettings>,
+    ) -> Result<Self, String> {
         if ctx_size == 0 {
             return Err("--ctx-size must be greater than 0.".into());
         }
@@ -291,6 +314,32 @@ impl Engine {
                 eos_token_ids.insert(*id);
             }
         }
+        let mut ant_plan = std::collections::HashMap::new();
+        let mut ant_resident_bytes = 0u64;
+        let mut ant_budget_bytes = AntSettings::default().vram_pool_bytes;
+        if let Some(settings) = ant {
+            ant_budget_bytes = settings.vram_pool_bytes;
+            if settings.enabled {
+                // Ant: derive the atomic-unit residency plan from the units manifest.
+                //  Ant: 从 units manifest 派生原子单元驻留计划。
+                if let Ok(manager) = Ant::with_settings(settings) {
+                    if let Ok(units) = manager.units_for_model(&model_dir) {
+                        let plan = manager.plan_residency(&units);
+                        for unit in &units {
+                            let tier = plan
+                                .get(&unit.unit_id)
+                                .and_then(|tier| Some(tier.as_str()))
+                                .unwrap_or("vram");
+                            ant_plan.insert(unit.unit_id.clone(), tier.to_string());
+                            if tier != "disk" {
+                                ant_resident_bytes =
+                                    ant_resident_bytes.saturating_add(unit.byte_size());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(Self {
             model: Mutex::new(LoadedModel { model, device }),
             tokenizer,
@@ -310,6 +359,9 @@ impl Engine {
             ),
             eos_token_ids,
             stop_markers,
+            ant_plan,
+            ant_resident_bytes,
+            ant_budget_bytes,
         })
     }
 
@@ -771,6 +823,7 @@ pub(super) fn chat(
     options: ChatOptions,
     mut archive: ContextArchive,
     store: ContextStore,
+    ant: Option<&AntSettings>,
 ) -> Result<(), String> {
     if !path.is_dir() && path.extension().and_then(|ext| ext.to_str()) != Some("safetensors") {
         return Err(format!(
@@ -778,7 +831,7 @@ pub(super) fn chat(
             path.display()
         ));
     }
-    let engine = load_engine_with_progress(path, options.threads, options.ctx_size)?;
+    let engine = load_engine_with_progress(path, options.threads, options.ctx_size, ant)?;
     println!(
         "{}",
         color::stdout(

@@ -17,6 +17,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cheetah_color.h");
     println!("cargo:rerun-if-changed=cheetah_vulkan.c");
     println!("cargo:rerun-if-changed=cheetah_vulkan.h");
+    println!("cargo:rerun-if-changed=cheetah_memory.c");
+    println!("cargo:rerun-if-changed=cheetah_memory.h");
     println!("cargo:rerun-if-changed=matmul.comp");
     println!("cargo:rerun-if-changed=matmul_bf16.comp");
     println!("cargo:rerun-if-changed=shared_ops.comp");
@@ -24,6 +26,7 @@ fn main() {
 
     cc::Build::new()
         .file("cheetah_init.c")
+        .file("cheetah_memory.c")
         .include(".")
         .warnings(true)
         .extra_warnings(true)

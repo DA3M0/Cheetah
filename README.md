@@ -177,6 +177,36 @@ cheetah inspect /path/to/prepared-model
 
 The destination is generated model data: initialization replaces unsharded Safetensors weight files there and manages stale generated shards.
 
+## Ant memory optimization
+
+Ant is Cheetah's extremely fine-grained model memory optimization for local inference. After `cheetah init`, Safetensors weights are split into atomic units, and each unit is assigned a residency tier:
+
+- **VRAM (tier 0):** resident in GPU memory; the preferred fast path.
+- **RAM (tier 1):** resident in system memory.
+- **Disk (tier 2):** not resident; paged in on demand.
+
+### Current V1 implementation
+
+- `cheetah init` prepares a model directory into atomic units and emits the units manifest.
+- Effective Ant settings are resolved from user-managed defaults and CLI overrides, then applied when loading the model.
+- `cheetah chat` warns when the target model has not been prepared for Ant memory optimization; run `cheetah init` first.
+- The Candle backend in V1 performs a full model load and derives the residency plan from the Ant units manifest when Ant is enabled, reporting the resident byte count against the configured VRAM budget.
+
+Ant CLI overrides for chat include `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, and `--ant-allow-vram-swap <bool>`.
+
+### V1 not implemented
+
+- Tier-based partial loading in the Candle backend (VRAM → RAM → disk routing into the actual inference loader).
+- Budget enforcement driving eviction, paging, or swap during generation.
+- Ant wiring for the OpenAI-compatible server (`serve`).
+
+### Future goals
+
+- Load only resident units into the selected device and page in on demand for non-resident tiers.
+- Apply the configured eviction policy and prefetch stages automatically.
+- Drive load decisions from the memory budget with per-request residency overrides.
+- Extend residency handling to the Vulkan and quantized backends.
+
 ## Model inspection
 
 ```sh

@@ -1,0 +1,393 @@
+//! Ant: extremely fine-grained model memory optimization for Cheetah.
+
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::path::Path;
+use cheetah::native::{self, AntFfiSettings};
+
+pub const CHEETAH_UNITS_FILENAME: &str = "cheetah_units.json";
+pub const CHEETAH_ANT_SETTINGS_FILENAME: &str = "cheetah_ant_settings.json";
+
+#[derive(Debug, Clone)]
+pub struct AntSettings {
+    pub enabled: bool,
+    pub vram_pool_bytes: u64,
+    pub ram_budget_bytes: u64,
+    pub disk_dir: Option<String>,
+    pub resident_units: Vec<String>,
+    pub eviction_policy: String,
+    pub prefetch_stages: i32,
+    pub allow_vram_swap: bool,
+}
+
+impl Default for AntSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            vram_pool_bytes: 8 * 1024 * 1024 * 1024,
+            ram_budget_bytes: 16 * 1024 * 1024 * 1024,
+            disk_dir: None,
+            resident_units: Vec::new(),
+            eviction_policy: "lru".to_string(),
+            prefetch_stages: 2,
+            allow_vram_swap: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AntUnit {
+    pub unit_id: String,
+    pub name: String,
+    #[serde(default)] pub dtype: String,
+    #[serde(default)] pub shape: Vec<u64>,
+    #[serde(default)] pub bytes: u64,
+    pub source_file: String,
+    pub source_offset: u64,
+    pub shard: String,
+    #[serde(default)] pub layer_id: i32,
+}
+
+impl AntUnit {
+    pub fn byte_size(&self) -> u64 {
+        self.bytes
+    }
+}
+
+pub struct Ant {
+    handle: *mut std::os::raw::c_void,
+    settings: AntSettings,
+}
+
+impl Ant {
+    pub fn new() -> Result<Self, String> {
+        let handle = native::ant_new()?;
+        Ok(Self {
+            handle,
+            settings: AntSettings::default(),
+        })
+    }
+
+    pub fn with_settings(settings: &AntSettings) -> Result<Self, String> {
+        let mut ant = Self::new()?;
+        ant.set_settings(settings)?;
+        Ok(ant)
+    }
+
+    pub fn set_settings(&mut self, settings: &AntSettings) -> Result<(), String> {
+        self.settings = settings.clone();
+        let ffi = AntFfiSettings {
+            enabled: i32::from(settings.enabled),
+            vram_pool_bytes: settings.vram_pool_bytes,
+            ram_budget_bytes: settings.ram_budget_bytes,
+            disk_dir: std::ptr::null(),
+            resident_units: std::ptr::null(),
+            resident_units_count: 0,
+            eviction_policy: std::ptr::null(),
+            prefetch_stages: settings.prefetch_stages,
+            allow_vram_swap: i32::from(settings.allow_vram_swap),
+        };
+        native::ant_set_settings(self.handle, &ffi)
+    }
+
+    pub fn settings(&self) -> &AntSettings {
+        &self.settings
+    }
+
+    pub fn load_model(&self, dst_dir: &Path) -> Result<(), String> {
+        native::ant_load_model(self.handle, dst_dir)
+    }
+
+    pub fn unit_tier(&self, dst_dir: &Path, unit_id: &str) -> Result<i32, String> {
+        native::ant_unit_tier(self.handle, dst_dir, unit_id)
+    }
+
+    pub fn unit_pin(&self, unit_id: &str, pin: bool) -> Result<(), String> {
+        native::ant_unit_pin(self.handle, unit_id, pin)
+    }
+
+    pub fn evict_unit(&self, dst_dir: &Path, unit_id: &str) -> Result<(), String> {
+        native::ant_evict_unit(self.handle, dst_dir, unit_id)
+    }
+
+    pub fn page_in(&self, unit_id: &str, tier: i32) -> Result<(), String> {
+        native::ant_page_in(self.handle, unit_id, tier)
+    }
+
+    pub fn model_is_initialized(&self, dst_dir: &Path) -> bool {
+        native::ant_model_is_initialized(self.handle, dst_dir)
+    }
+
+    pub fn requires_init(&self) -> bool {
+        native::ant_requires_init(self.handle)
+    }
+
+    pub fn not_initialized_warning(&self, model_id: &str, dst_dir: &Path) {
+        native::ant_model_not_initialized_warning(model_id, dst_dir);
+    }
+
+    pub fn write_settings_for_model(&self, dst_dir: &Path, settings: &AntSettings) -> Result<(), String> {
+        let path = dst_dir.join(CHEETAH_ANT_SETTINGS_FILENAME);
+        let document = serde_json::json!({
+            "enabled": settings.enabled,
+            "vram_pool_bytes": settings.vram_pool_bytes,
+            "ram_budget_bytes": settings.ram_budget_bytes,
+            "disk_dir": settings.disk_dir,
+            "resident_units": settings.resident_units,
+            "eviction_policy": settings.eviction_policy,
+            "prefetch_stages": settings.prefetch_stages,
+            "allow_vram_swap": settings.allow_vram_swap,
+        });
+        let bytes = serde_json::to_vec_pretty(&document)
+            .map_err(|error| format!("Failed to encode Ant settings: {error}"))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| format!("Failed to write {}: {error}", path.display()))
+    }
+
+    pub fn settings_for_model(&self, dst_dir: &Path) -> Result<AntSettings, String> {
+        let path = dst_dir.join(CHEETAH_ANT_SETTINGS_FILENAME);
+        let settings = if path.exists() {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Invalid Ant settings: {error}"))?;
+            let mut settings = AntSettings::default();
+            if let Some(object) = value.as_object() {
+                if let Some(enabled) = object.get("enabled").and_then(serde_json::Value::as_bool) {
+                    settings.enabled = enabled;
+                }
+                if let Some(vram) = object.get("vram_pool_bytes").and_then(serde_json::Value::as_u64) {
+                    settings.vram_pool_bytes = vram;
+                }
+                if let Some(ram) = object.get("ram_budget_bytes").and_then(serde_json::Value::as_u64) {
+                    settings.ram_budget_bytes = ram;
+                }
+                if let Some(disk) = object.get("disk_dir").and_then(serde_json::Value::as_str) {
+                    settings.disk_dir = Some(disk.to_string());
+                }
+                if let Some(resident) = object.get("resident_units").and_then(serde_json::Value::as_array) {
+                    settings.resident_units = resident
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                }
+                if let Some(policy) = object.get("eviction_policy").and_then(serde_json::Value::as_str) {
+                    settings.eviction_policy = policy.to_string();
+                }
+                if let Some(prefetch) = object.get("prefetch_stages").and_then(serde_json::Value::as_i64) {
+                    settings.prefetch_stages = prefetch as i32;
+                }
+                if let Some(swap) = object.get("allow_vram_swap").and_then(serde_json::Value::as_bool) {
+                    settings.allow_vram_swap = swap;
+                }
+            }
+            settings
+        } else {
+            AntSettings::default()
+        };
+        Ok(settings)
+    }
+
+    pub fn units_for_model(&self, dst_dir: &Path) -> Result<Vec<AntUnit>, String> {
+        let path = dst_dir.join(CHEETAH_UNITS_FILENAME);
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        let document: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Invalid Ant units manifest: {error}"))?;
+        let array = document
+            .as_array()
+            .ok_or_else(|| "Ant units manifest must be a JSON array.".to_string())?;
+        let mut units = Vec::with_capacity(array.len());
+        for entry in array {
+            let unit_id = entry
+                .get("unit_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if unit_id.is_empty() {
+                continue;
+            }
+            let name = entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&unit_id)
+                .to_string();
+            let dtype = entry
+                .get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("f32")
+                .to_string();
+            let shape = entry
+                .get("shape")
+                .and_then(serde_json::Value::as_array)
+                .map(|shape| {
+                    shape
+                        .iter()
+                        .filter_map(serde_json::Value::as_u64)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let bytes_size = entry
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let source_file = entry
+                .get("source_file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let source_offset = entry
+                .get("source_offset")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let shard = entry
+                .get("shard")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let layer_id = entry
+                .get("layer_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0) as i32;
+            units.push(AntUnit {
+                unit_id,
+                name,
+                dtype,
+                shape,
+                bytes: bytes_size,
+                source_file,
+                source_offset,
+                shard,
+                layer_id,
+            });
+        }
+        Ok(units)
+    }
+
+    pub fn plan_residency(&self, units: &[AntUnit]) -> BTreeMap<String, String> {
+        let mut plan = BTreeMap::new();
+        if !self.settings.enabled {
+            return plan;
+        }
+        let vram_pool = self.settings.vram_pool_bytes;
+        let ram_budget = self.settings.ram_budget_bytes;
+        let mut vram_used: u64 = 0;
+        let mut ram_used: u64 = 0;
+        let pinned: Vec<String> = self.settings.resident_units.clone();
+        let pinned_set: HashSet<String> = pinned.iter().cloned().collect();
+        let mut ordered: Vec<&AntUnit> = units.iter().collect();
+        ordered.sort_by(|a, b| {
+            let pa = pinned_set.contains(&a.unit_id);
+            let pb = pinned_set.contains(&b.unit_id);
+            if pa != pb {
+                return pb.cmp(&pa);
+            }
+            a.unit_id.cmp(&b.unit_id)
+        });
+        for unit in ordered {
+            let bytes = unit.byte_size();
+            let tier = if pinned_set.contains(&unit.unit_id) {
+                "vram"
+            } else if bytes > vram_pool {
+                "disk"
+            } else if vram_used + bytes <= vram_pool {
+                vram_used += bytes;
+                "vram"
+            } else if ram_used + bytes <= ram_budget {
+                ram_used += bytes;
+                "ram"
+            } else {
+                "disk"
+            };
+            plan.insert(unit.unit_id.clone(), tier.to_string());
+        }
+        plan
+    }
+}
+
+impl Drop for Ant {
+    fn drop(&mut self) {
+        native::ant_delete(self.handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(unit_id: &str, bytes: u64) -> AntUnit {
+        AntUnit {
+            unit_id: unit_id.to_string(),
+            name: unit_id.to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![1],
+            bytes,
+            source_file: String::new(),
+            source_offset: 0,
+            shard: String::new(),
+            layer_id: 0,
+        }
+    }
+
+    #[test]
+    fn plan_residency_assigns_vram_then_ram_then_disk() {
+        let ant = Ant::with_settings(&AntSettings::default()).expect("ant manager");
+        let units = vec![
+            unit("model.layers.0.mlp.gate_proj", 1024),
+            unit("model.layers.0.mlp.up_proj", 1024),
+        ];
+        let plan = ant.plan_residency(&units);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan["model.layers.0.mlp.gate_proj"], "vram");
+        assert_eq!(plan["model.layers.0.mlp.up_proj"], "vram");
+    }
+
+    #[test]
+    fn plan_residency_respects_disabled_ant() {
+        let mut settings = AntSettings::default();
+        settings.enabled = false;
+        let ant = Ant::with_settings(&settings).expect("ant manager");
+        let units = vec![unit("model.layers.0.mlp.gate_proj", 1024)];
+        let plan = ant.plan_residency(&units);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn settings_for_model_reads_user_managed_file() {
+        let ant = Ant::with_settings(&AntSettings::default()).expect("ant manager");
+        let dir = std::env::temp_dir().join(format!("cheetah-ant-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CHEETAH_ANT_SETTINGS_FILENAME);
+        std::fs::write(&path, r#"{"enabled":false,"vram_pool_bytes":1024}"#).unwrap();
+        let settings = ant.settings_for_model(&dir).expect("settings");
+        assert!(!settings.enabled);
+        assert_eq!(settings.vram_pool_bytes, 1024);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ant_lifecycle_against_real_prepared_model() {
+        let ant = Ant::with_settings(&AntSettings::default()).expect("ant manager");
+        let dst = std::path::Path::new("/home/benny/models/qwen-0.5b-prepared");
+        assert!(ant.load_model(dst).is_ok());
+        assert!(ant.model_is_initialized(dst));
+        let units = ant.units_for_model(dst).expect("units");
+        assert_eq!(units.len(), 290);
+        let plan = ant.plan_residency(&units);
+        assert_eq!(plan.len(), 290);
+        let tier = ant.unit_tier(dst, "model.embed_tokens.weight").expect("tier");
+        assert_eq!(tier, 0);
+        ant.unit_pin("model.embed_tokens.weight", true).expect("pin");
+        assert_eq!(
+            ant.unit_tier(dst, "model.embed_tokens.weight").expect("tier"),
+            1
+        );
+        ant.evict_unit(dst, "model.embed_tokens.weight").expect("evict");
+        assert_eq!(
+            ant.unit_tier(dst, "model.embed_tokens.weight").expect("tier"),
+            2
+        );
+    }
+}

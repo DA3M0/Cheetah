@@ -1,5 +1,6 @@
 //! Cheetah's Candle/Safetensors command-line interface.
 
+mod ant;
 mod chat;
 mod cli;
 mod color;
@@ -38,6 +39,7 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             Path::new("."),
             ChatOptions::default(),
             cli::ContextCliOptions::default(),
+            cli::AntCliOptions::default(),
         );
     };
 
@@ -63,8 +65,8 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
         "load" | "inspect" => run_inspect_command(&args[1..]),
         "init" | "prepare" => run_init_command(&args[1..]),
         "chat" => {
-            let (path, options, context_options) = cli::parse_chat_args(&args[1..])?;
-            run_chat(&path, options, context_options)
+            let (path, options, context_options, ant_options) = cli::parse_chat_args(&args[1..])?;
+            run_chat(&path, options, context_options, ant_options)
         }
         "context" => {
             let (operation, options) = cli::parse_context_args(&args[1..])?;
@@ -72,11 +74,11 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
         }
         "serve" => {
             let (serve_options, chat_options) = cli::parse_serve_args(&args[1..])?;
-            runtime(serve::serve(serve_options, chat_options))
+            runtime(serve::serve(serve_options, chat_options, None))
         }
         value if !value.starts_with('-') => {
-            let (path, options, context_options) = cli::parse_chat_args(&args)?;
-            run_chat(&path, options, context_options)
+            let (path, options, context_options, ant_options) = cli::parse_chat_args(&args)?;
+            run_chat(&path, options, context_options, ant_options)
         }
         other => Err(RunError::usage(format!(
             "Unknown command '{other}'. Run `cheetah help` for usage."
@@ -85,22 +87,46 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
 }
 
 fn run_init_command(args: &[String]) -> Result<(), RunError> {
-    if args.len() != 2 || args.iter().any(String::is_empty) {
+    let mut positional: Vec<String> = Vec::new();
+    let mut flag_args: Vec<String> = Vec::new();
+    for arg in args {
+        if arg.starts_with('-') {
+            flag_args.push(arg.clone());
+        } else {
+            positional.push(arg.clone());
+        }
+    }
+    if positional.len() != 2 || positional.iter().any(String::is_empty) {
         return Err(RunError::usage(
-            "Usage: cheetah init <source-dir> <destination-dir>",
+            "Usage: cheetah init <source-dir> <destination-dir> [--ant <bool>] [--ant-vram <bytes>] ...",
         ));
     }
-    let source = Path::new(&args[0]);
-    let metadata = runtime(chat::model_metadata_for_init(source))?;
-    runtime(native::init_model_with_metadata(
-        source,
-        Path::new(&args[1]),
-        metadata,
-    ))?;
+    let source = PathBuf::from(&positional[0]);
+    let metadata = runtime(chat::model_metadata_for_init(&source))?;
+    let destination = PathBuf::from(&positional[1]);
+    runtime(native::init_model_with_metadata(&source, &destination, metadata))?;
+
+    // Ant: after native preparation, route each atomic unit through the
+    // built-in residency planner (VRAM -> RAM -> disk).
+    let ant_options = cli::parse_ant_args(&flag_args)?;
+    let settings = ant_options.resolve();
+    let ant = runtime(ant::Ant::with_settings(&settings))?;
+    runtime(ant.write_settings_for_model(&destination, &settings))?;
+    let units = runtime(ant.units_for_model(&destination))?;
+    let plan = ant.plan_residency(&units);
+    for (unit_id, tier) in &plan {
+        let tier_value = match tier.as_str() {
+            "vram" => 0i32,
+            "ram" => 1i32,
+            _ => 2i32,
+        };
+        let _ = ant.page_in(unit_id, tier_value);
+    }
+
     println!(
         "{}",
         color::stdout(
-            &format!("Model prepared in '{}'.", args[1]),
+            &format!("Model prepared in '{}'.", positional[1]),
             color::Color::Green
         )
     );
@@ -138,7 +164,48 @@ fn run_chat(
     path: &Path,
     requested_options: ChatOptions,
     context_options: cli::ContextCliOptions,
+    ant_options: cli::AntCliOptions,
 ) -> Result<(), RunError> {
+    // Ant: resolve effective memory settings from user-managed defaults, then CLI overrides.
+    // Ant: 先读取用户管理的默认设置，再叠加命令行覆盖项。
+    let mut settings = ant::AntSettings::default();
+    let probe_ant = runtime(ant::Ant::with_settings(&ant::AntSettings::default()))?;
+    if let Ok(user_settings) = probe_ant.settings_for_model(path) {
+        if user_settings.enabled {
+            settings = user_settings;
+        }
+    }
+    if let Some(enabled) = ant_options.enabled {
+        settings.enabled = enabled;
+    }
+    if let Some(vram) = ant_options.vram_pool_bytes {
+        settings.vram_pool_bytes = vram;
+    }
+    if let Some(ram) = ant_options.ram_budget_bytes {
+        settings.ram_budget_bytes = ram;
+    }
+    if let Some(disk_dir) = ant_options.disk_dir.clone() {
+        settings.disk_dir = Some(disk_dir);
+    }
+    if !ant_options.resident_units.is_empty() {
+        settings.resident_units = ant_options.resident_units.clone();
+    }
+    if let Some(policy) = ant_options.eviction_policy.clone() {
+        settings.eviction_policy = policy;
+    }
+    if let Some(prefetch) = ant_options.prefetch_stages {
+        settings.prefetch_stages = prefetch as i32;
+    }
+    if let Some(swap) = ant_options.allow_vram_swap {
+        settings.allow_vram_swap = swap;
+    }
+
+    // Ant: warn when the target model has not been prepared for Ant memory management.
+    let ant_manager = runtime(ant::Ant::with_settings(&settings))?;
+    if !ant_manager.model_is_initialized(path) {
+        ant_manager.not_initialized_warning(&path.display().to_string(), path);
+    }
+
     // A named archive supplies its saved options unless the caller explicitly provided chat options.
     // 恢复已命名会话时默认采用归档选项；只有命令行显式指定推理参数时才进行一致性校验。
     let chat_options_specified = context_options.chat_options_specified;
@@ -152,7 +219,7 @@ fn run_chat(
     } else {
         runtime(archive.validate_for_launch(path, &requested_options, chat_options_specified))?
     };
-    runtime(chat::chat(path, options, archive, store))
+    runtime(chat::chat(path, options, archive, store, Some(&settings)))
 }
 
 fn run_context_command(
@@ -231,6 +298,17 @@ Chat options:\n\
   --system \"...\"       System prompt, included only in the first turn\n\
   --context <name>     Resume a saved chat context\n\
   --context-dir <path> Context archive directory (also used by /save)\n\
+\n\
+Ant memory options (cheetah init <source-dir> <destination-dir> | cheetah chat <model-path>):\n\
+  --ant <bool>          Enable/disable Ant memory optimization (default: true)\n\
+  --ant-vram <bytes>    VRAM pool size override in bytes (default: 8GiB)\n\
+  --ant-ram <bytes>     RAM budget override in bytes (default: 16GiB)\n\
+  --ant-disk-dir <path> Disk residency directory override\n\
+  --ant-resident <id>   Repeatable unit id to keep resident\n\
+  --ant-eviction-policy <policy> Eviction policy override\n\
+  --ant-prefetch-stages <n> Prefetch stages override\n\
+  --ant-allow-vram-swap <bool> Allow VRAM swap override\n\
+User-managed defaults live in <model-dir>/cheetah_ant_settings.json.\n\
 \n\
 Server options (cheetah serve):\n\
   --model <name>        Model name or Safetensors model path (legacy syntax)\n\

@@ -48,6 +48,122 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+#[repr(C)]
+pub struct AntFfiSettings {
+    pub enabled: i32,
+    pub vram_pool_bytes: u64,
+    pub ram_budget_bytes: u64,
+    pub disk_dir: *const std::os::raw::c_char,
+    pub resident_units: *const *const std::os::raw::c_char,
+    pub resident_units_count: usize,
+    pub eviction_policy: *const std::os::raw::c_char,
+    pub prefetch_stages: i32,
+    pub allow_vram_swap: i32,
+}
+
+unsafe extern "C" {
+    fn cheetah_ant_new() -> *mut std::os::raw::c_void;
+    fn cheetah_ant_delete(ant: *mut std::os::raw::c_void);
+    fn cheetah_ant_set_settings(ant: *mut std::os::raw::c_void, settings: *const AntFfiSettings) -> i32;
+    fn cheetah_ant_load_model(ant: *mut std::os::raw::c_void, dst_dir: *const std::os::raw::c_char) -> i32;
+    fn cheetah_ant_unit_tier(ant: *const std::os::raw::c_void, dst_dir: *const std::os::raw::c_char, unit_id: *const std::os::raw::c_char, tier_out: *mut i32) -> i32;
+    fn cheetah_ant_unit_pin(ant: *const std::os::raw::c_void, unit_id: *const std::os::raw::c_char, pin: i32) -> i32;
+    fn cheetah_ant_evict_unit(ant: *const std::os::raw::c_void, dst_dir: *const std::os::raw::c_char, unit_id: *const std::os::raw::c_char) -> i32;
+    fn cheetah_ant_page_in(ant: *const std::os::raw::c_void, unit_id: *const std::os::raw::c_char, tier: i32) -> i32;
+    fn cheetah_ant_model_is_initialized(ant: *const std::os::raw::c_void, dst_dir: *const std::os::raw::c_char) -> i32;
+    fn cheetah_ant_requires_init(ant: *const std::os::raw::c_void) -> i32;
+    fn cheetah_ant_model_not_initialized_warning(model_id: *const std::os::raw::c_char, dst_dir: *const std::os::raw::c_char);
+}
+
+pub fn ant_new() -> Result<*mut std::os::raw::c_void, String> {
+    let ptr = unsafe { cheetah_ant_new() };
+    if ptr.is_null() {
+        Err("Failed to create the Ant memory manager.".to_string())
+    } else {
+        Ok(ptr)
+    }
+}
+
+pub fn ant_delete(ant: *mut std::os::raw::c_void) {
+    unsafe { cheetah_ant_delete(ant) };
+}
+
+pub fn ant_set_settings(ant: *mut std::os::raw::c_void, settings: &AntFfiSettings) -> Result<(), String> {
+    let status = unsafe { cheetah_ant_set_settings(ant, settings) };
+    if status != 0 {
+        return Err("Cheetah Ant set settings failed.".to_string());
+    }
+    Ok(())
+}
+
+pub fn ant_load_model(ant: *mut std::os::raw::c_void, dst_dir: &Path) -> Result<(), String> {
+    let dst_dir_c = path_to_cstring(dst_dir)?;
+    let status = unsafe { cheetah_ant_load_model(ant, dst_dir_c.as_ptr()) };
+    if status != 0 {
+        return Err("Cheetah Ant model load failed.".to_string());
+    }
+    Ok(())
+}
+
+pub fn ant_unit_tier(ant: *mut std::os::raw::c_void, dst_dir: &Path, unit_id: &str) -> Result<i32, String> {
+    let dst_dir_c = path_to_cstring(dst_dir)?;
+    let unit_id_c = CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
+    let mut tier_out: std::os::raw::c_int = 0;
+    let status = unsafe { cheetah_ant_unit_tier(ant, dst_dir_c.as_ptr(), unit_id_c.as_ptr(), &mut tier_out) };
+    if status != 0 {
+        return Err("Cheetah Ant unit tier query failed.".to_string());
+    }
+    Ok(tier_out as i32)
+}
+
+pub fn ant_unit_pin(ant: *mut std::os::raw::c_void, unit_id: &str, pin: bool) -> Result<(), String> {
+    let unit_id_c = CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
+    let status = unsafe { cheetah_ant_unit_pin(ant, unit_id_c.as_ptr(), if pin { 1i32 } else { 0i32 }) };
+    if status != 0 {
+        return Err("Cheetah Ant unit pin failed.".to_string());
+    }
+    Ok(())
+}
+
+pub fn ant_evict_unit(ant: *mut std::os::raw::c_void, dst_dir: &Path, unit_id: &str) -> Result<(), String> {
+    let dst_dir_c = path_to_cstring(dst_dir)?;
+    let unit_id_c = CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
+    let status = unsafe { cheetah_ant_evict_unit(ant, dst_dir_c.as_ptr(), unit_id_c.as_ptr()) };
+    if status != 0 {
+        return Err("Cheetah Ant unit evict failed.".to_string());
+    }
+    Ok(())
+}
+
+pub fn ant_page_in(ant: *mut std::os::raw::c_void, unit_id: &str, tier: i32) -> Result<(), String> {
+    let unit_id_c = CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
+    let status = unsafe { cheetah_ant_page_in(ant, unit_id_c.as_ptr(), tier) };
+    if status != 0 {
+        return Err("Cheetah Ant unit page-in failed.".to_string());
+    }
+    Ok(())
+}
+
+pub fn ant_model_is_initialized(ant: *mut std::os::raw::c_void, dst_dir: &Path) -> bool {
+    let dst_dir_c = path_to_cstring(dst_dir);
+    let dst_ptr = dst_dir_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+    let status = unsafe { cheetah_ant_model_is_initialized(ant, dst_ptr) };
+    status == 1
+}
+
+pub fn ant_requires_init(ant: *mut std::os::raw::c_void) -> bool {
+    let status = unsafe { cheetah_ant_requires_init(ant) };
+    status != 0
+}
+
+pub fn ant_model_not_initialized_warning(model_id: &str, dst_dir: &Path) {
+    let model_id_c = CString::new(model_id).ok();
+    let dst_dir_c = path_to_cstring(dst_dir).ok();
+    if let (Some(model_id_c), Some(dst_dir_c)) = (model_id_c, dst_dir_c) {
+        unsafe { cheetah_ant_model_not_initialized_warning(model_id_c.as_ptr(), dst_dir_c.as_ptr()) };
+    }
+}
+
 extern "C" fn report_init_progress(
     phase: *const c_char,
     current: usize,

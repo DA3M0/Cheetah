@@ -14,8 +14,9 @@ pub fn chat(
     options: crate::options::ChatOptions,
     archive: crate::context::ContextArchive,
     store: crate::context::ContextStore,
+    ant: Option<&crate::ant::AntSettings>,
 ) -> Result<(), String> {
-    engine::chat(path, options, archive, store)
+    engine::chat(path, options, archive, store, ant)
 }
 
 pub(crate) fn model_metadata_for_init(

@@ -14,7 +14,11 @@ use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-pub fn serve(options: ServeOptions, chat_options: ChatOptions) -> Result<(), String> {
+pub fn serve(
+    options: ServeOptions,
+    chat_options: ChatOptions,
+    ant: Option<&crate::ant::AntSettings>,
+) -> Result<(), String> {
     // Refuse unauthenticated non-loopback listeners to prevent accidental network exposure.
     // 未启用鉴权时拒绝监听非回环地址，避免服务意外暴露到网络。
     if options.api_key.is_none() && !options.generate_key && !is_loopback(&options.host) {
@@ -38,6 +42,7 @@ pub fn serve(options: ServeOptions, chat_options: ChatOptions) -> Result<(), Str
         &model_path,
         chat_options.threads,
         chat_options.ctx_size,
+        ant,
     )?;
     let api_key = resolve_api_key(&options)?;
 

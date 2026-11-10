@@ -1,5 +1,6 @@
 //! Command-line argument parsing and runtime options.
 
+use crate::ant::AntSettings;
 use crate::options::ChatOptions;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -77,10 +78,11 @@ impl std::fmt::Display for RunError {
 
 pub fn parse_chat_args(
     args: &[String],
-) -> Result<(PathBuf, ChatOptions, ContextCliOptions), RunError> {
+) -> Result<(PathBuf, ChatOptions, ContextCliOptions, AntCliOptions), RunError> {
     let mut path = None;
     let mut options = ChatOptions::default();
     let mut context = ContextCliOptions::default();
+    let mut ant = AntCliOptions::default();
     let mut index = 0;
     // Track explicit inference flags separately so restored archives can distinguish defaults from overrides.
     // 单独记录用户显式传入的推理参数，以便恢复归档时区分默认值与命令行覆盖值。
@@ -152,6 +154,38 @@ pub fn parse_chat_args(
                     return Err(RunError::usage("--context-dir can only be specified once."));
                 }
             }
+            "--ant" => {
+                index += 1;
+                ant.enabled = Some(parse_bool_option(args, index, "--ant")?);
+            }
+            "--ant-vram" => {
+                index += 1;
+                ant.vram_pool_bytes = Some(parse_u64_option(args, index, "--ant-vram")?);
+            }
+            "--ant-ram" => {
+                index += 1;
+                ant.ram_budget_bytes = Some(parse_u64_option(args, index, "--ant-ram")?);
+            }
+            "--ant-disk-dir" => {
+                index += 1;
+                ant.disk_dir = Some(parse_text_option(args, index, "--ant-disk-dir")?);
+            }
+            "--ant-resident" => {
+                index += 1;
+                ant.resident_units.push(parse_text_option(args, index, "--ant-resident")?);
+            }
+            "--ant-eviction-policy" => {
+                index += 1;
+                ant.eviction_policy = Some(parse_text_option(args, index, "--ant-eviction-policy")?);
+            }
+            "--ant-prefetch-stages" => {
+                index += 1;
+                ant.prefetch_stages = Some(parse_nonnegative_option(args, index, "--ant-prefetch-stages")? as i64);
+            }
+            "--ant-allow-vram-swap" => {
+                index += 1;
+                ant.allow_vram_swap = Some(parse_bool_option(args, index, "--ant-allow-vram-swap")?);
+            }
             option if option.starts_with('-') => {
                 return Err(RunError::usage(format!(
                     "Unknown option '{option}'. Run `cheetah help` for usage."
@@ -171,7 +205,7 @@ pub fn parse_chat_args(
             "Specify a Safetensors model directory or file. Usage: cheetah <model-path> [options]. Run `cheetah help` for all options.",
         )
     })?;
-    Ok((path, options, context))
+    Ok((path, options, context, ant))
 }
 
 pub fn parse_context_args(
@@ -496,6 +530,113 @@ fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<Stri
     })
 }
 
+/// 解析布尔开关值,接受 true/false/1/0/yes/no/on/off。
+fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool, RunError> {
+    let value = parse_text_option(args, index, option)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(RunError::usage(format!(
+            "{option} expects a boolean value (true/false); received '{value}'."
+        ))),
+    }
+}
+
+/// Ant 内存优化的命令行覆盖项;`None` 表示未指定，交由用户配置/默认值处理。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AntCliOptions {
+    pub enabled: Option<bool>,
+    pub vram_pool_bytes: Option<u64>,
+    pub ram_budget_bytes: Option<u64>,
+    pub disk_dir: Option<String>,
+    pub resident_units: Vec<String>,
+    pub eviction_policy: Option<String>,
+    pub prefetch_stages: Option<i64>,
+    pub allow_vram_swap: Option<bool>,
+}
+
+impl AntCliOptions {
+    /// 合并为完整的 AntSettings(未指定项回落到默认值)。
+    pub fn resolve(&self) -> AntSettings {
+        let mut settings = AntSettings::default();
+        if let Some(enabled) = self.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(vram) = self.vram_pool_bytes {
+            settings.vram_pool_bytes = vram;
+        }
+        if let Some(ram) = self.ram_budget_bytes {
+            settings.ram_budget_bytes = ram;
+        }
+        if let Some(disk_dir) = self.disk_dir.clone() {
+            settings.disk_dir = Some(disk_dir);
+        }
+        if !self.resident_units.is_empty() {
+            settings.resident_units = self.resident_units.clone();
+        }
+        if let Some(policy) = self.eviction_policy.clone() {
+            settings.eviction_policy = policy;
+        }
+        if let Some(prefetch) = self.prefetch_stages {
+            settings.prefetch_stages = prefetch as i32;
+        }
+        if let Some(swap) = self.allow_vram_swap {
+            settings.allow_vram_swap = swap;
+        }
+        settings
+    }
+}
+
+/// 解析 Ant 内存优化参数:`--ant <bool>` 以及预算/驻留类覆盖项。
+pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
+    let mut options = AntCliOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--ant" => {
+                index += 1;
+                options.enabled = Some(parse_bool_option(args, index, option)?);
+            }
+            "--ant-vram" => {
+                index += 1;
+                options.vram_pool_bytes = Some(parse_u64_option(args, index, option)?);
+            }
+            "--ant-ram" => {
+                index += 1;
+                options.ram_budget_bytes = Some(parse_u64_option(args, index, option)?);
+            }
+            "--ant-disk-dir" => {
+                index += 1;
+                options.disk_dir = Some(parse_text_option(args, index, option)?);
+            }
+            "--ant-resident" => {
+                index += 1;
+                options.resident_units.push(parse_text_option(args, index, option)?);
+            }
+            "--ant-eviction-policy" => {
+                index += 1;
+                options.eviction_policy = Some(parse_text_option(args, index, option)?);
+            }
+            "--ant-prefetch-stages" => {
+                index += 1;
+                options.prefetch_stages = Some(parse_nonnegative_option(args, index, option)? as i64);
+            }
+            "--ant-allow-vram-swap" => {
+                index += 1;
+                options.allow_vram_swap = Some(parse_bool_option(args, index, option)?);
+            }
+            _ => {
+                return Err(RunError::usage(format!(
+                    "Unknown Ant option '{option}'. Run `cheetah help` for usage."
+                )))
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
 /// 解析下界为 `min` 的浮点数(拒绝 NaN)。
 fn parse_float_option(
     args: &[String],
@@ -564,7 +705,7 @@ mod tests {
             "--ctx-size",
             "16384",
         ]);
-        let (path, options, context) = parse_chat_args(&values).unwrap();
+        let (path, options, context, _ant) = parse_chat_args(&values).unwrap();
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert!(context.chat_options_specified);
         assert_eq!(
@@ -595,7 +736,7 @@ mod tests {
             "--system",
             "You are a concise assistant.",
         ]);
-        let (_, options, _) = parse_chat_args(&values).unwrap();
+        let (_, options, _, _) = parse_chat_args(&values).unwrap();
         assert_eq!(options.temperature, 0.0);
         assert_eq!(options.top_p, 1.0);
         assert_eq!(options.top_k, 40);
@@ -672,6 +813,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_ant_flags_into_chat_options() {
+        let ant = parse_ant_args(&args(&["--ant", "true", "--ant-vram", "1024", "--ant-ram", "2048"]))
+            .unwrap();
+        assert_eq!(ant.enabled, Some(true));
+        assert_eq!(ant.vram_pool_bytes, Some(1024));
+        assert_eq!(ant.ram_budget_bytes, Some(2048));
+        assert!(ant.disk_dir.is_none());
+        assert!(ant.resident_units.is_empty());
+
+        let ant = parse_ant_args(&args(&[])).unwrap();
+        assert_eq!(ant.enabled, None);
+        assert_eq!(ant.vram_pool_bytes, None);
+        assert_eq!(ant.ram_budget_bytes, None);
+        assert_eq!(ant.disk_dir, None);
+        assert!(ant.resident_units.is_empty());
+    }
+
+    #[test]
+    fn parses_chat_ant_flags() {
+        let values = args(&[
+            "model.safetensors",
+            "--ant",
+            "false",
+            "--ant-vram",
+            "512",
+            "--ant-resident",
+            "model.embed_tokens.weight",
+        ]);
+        let (path, _options, _context, ant) = parse_chat_args(&values).unwrap();
+        assert_eq!(path, PathBuf::from("model.safetensors"));
+        assert_eq!(ant.enabled, Some(false));
+        assert_eq!(ant.vram_pool_bytes, Some(512));
+        assert_eq!(ant.resident_units, vec!["model.embed_tokens.weight".to_string()]);
+    }
+
+    #[test]
+    fn rejects_unknown_ant_flag() {
+        let error = parse_ant_args(&args(&["--ant-vram", "1024", "--bogus"])).unwrap_err();
+        assert!(matches!(error, RunError::Usage(_)));
+    }
+
+    #[test]
     fn reports_usage_errors_with_usage_variant() {
         let error = parse_chat_args(&args(&["--bogus"])).unwrap_err();
         assert!(matches!(error, RunError::Usage(_)));
@@ -679,7 +862,7 @@ mod tests {
 
     #[test]
     fn parses_context_options_and_management_commands() {
-        let (_, _, context) = parse_chat_args(&args(&[
+        let (_, _, context, _) = parse_chat_args(&args(&[
             "model.safetensors",
             "--context",
             "work",
@@ -693,7 +876,7 @@ mod tests {
             Some(PathBuf::from("/tmp/cheetah-contexts"))
         );
         assert!(!context.chat_options_specified);
-        let (_, _, context) =
+        let (_, _, context, _) =
             parse_chat_args(&args(&["model.safetensors", "--max-tokens", "256"])).unwrap();
         assert!(context.chat_options_specified);
 

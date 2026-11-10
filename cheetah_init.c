@@ -1593,6 +1593,56 @@ static int write_manifest(const char *path, const ModelInfo *model) {
     return 0;
 }
 
+static int write_units(const char *path, const ModelInfo *model) {
+    FILE *file = fopen(path, "wb");
+    size_t i;
+    int failed = 0;
+    if (file == NULL) {
+        set_path_error("cannot create units manifest", path);
+        return -1;
+    }
+    failed |= fprintf(file, "[") < 0;
+    for (i = 0; !failed && i < model->tensor_count; ++i) {
+        const TensorRecord *tensor = &model->tensors[i];
+        int layer_id = 0;
+        if (tensor->name != NULL) {
+            const char *lp = strstr(tensor->name, "layers.");
+            if (lp) {
+                long layer_num = strtol(lp + 7, NULL, 10);
+                layer_id = (int)layer_num;
+            }
+        }
+        if (i > 0) { if (fputs(",", file) == EOF) failed = 1; }
+        if (!failed) {
+            failed |= fprintf(file, "\n  {\n    \"unit_id\": ") < 0;
+            if (!failed && append_json_string(file, tensor->name) != 0) failed = 1;
+            failed |= fprintf(file, ",\n    \"name\": ") < 0;
+            if (!failed && append_json_string(file, tensor->name) != 0) failed = 1;
+            failed |= fprintf(file, ",\n    \"dtype\": ") < 0;
+            if (!failed && append_json_string(file, tensor->dtype) != 0) failed = 1;
+            failed |= fprintf(file, ",\n    \"shape\": [") < 0;
+            size_t dimension;
+            for (dimension = 0; !failed && dimension < tensor->dimensions; ++dimension) {
+                if (dimension > 0) { if (fputs(", ", file) == EOF) failed = 1; }
+                if (!failed) {
+                    failed |= fprintf(file, "%llu", (unsigned long long)tensor->shape[dimension]) < 0;
+                }
+            }
+            failed |= fprintf(file, "],\n    \"bytes\": %llu,\n    \"source_file\": ",
+                              (unsigned long long)tensor->payload_size) < 0;
+            if (!failed && append_json_string(file, tensor->shard_name) != 0) failed = 1;
+            failed |= fprintf(file, ",\n    \"source_offset\": %llu,\n    \"shard\": ",
+                              (unsigned long long)tensor->shard_data_offset) < 0;
+            if (!failed && append_json_string(file, tensor->shard_name) != 0) failed = 1;
+            failed |= fprintf(file, ",\n    \"layer_id\": %d\n  }", layer_id) < 0;
+        }
+    }
+    failed |= fprintf(file, "\n]\n") < 0;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) { set_path_error("failed writing units manifest", path); return -1; }
+    return 0;
+}
+
 static int copy_file(const char *source, const char *destination) {
     FILE *input = NULL;
     FILE *output = NULL;
@@ -2042,6 +2092,7 @@ int cheetah_init_model_with_progress(const char *src_dir, const char *dst_dir,
     char *cheetah_dir = NULL;
     char *weights_dir = NULL;
     char *manifest_path = NULL;
+    char *units_path = NULL;
     char *config_path = NULL;
     char *source_config = NULL;
     char *source_tokenizer_config = NULL;
@@ -2107,6 +2158,7 @@ int cheetah_init_model_with_progress(const char *src_dir, const char *dst_dir,
     if (path_join(dst_dir, ".cheetah", &cheetah_dir) != 0 ||
         path_join(cheetah_dir, "weights", &weights_dir) != 0 ||
         path_join(dst_dir, "cheetah_manifest.json", &manifest_path) != 0 ||
+        path_join(dst_dir, "cheetah_units.json", &units_path) != 0 ||
         path_join(dst_dir, "config.json", &config_path) != 0 ||
         path_join(dst_dir, "tokenizer_config.json",
                   &destination_tokenizer_config) != 0 ||
@@ -2145,6 +2197,7 @@ int cheetah_init_model_with_progress(const char *src_dir, const char *dst_dir,
     if (build_and_write_shards(&model, weights_dir,
                                (unsigned char *)aligned_buffer) != 0) goto done;
     if (write_manifest(manifest_path, &model) != 0) goto done;
+    if (write_units(units_path, &model) != 0) goto done;
     if (ensure_config(source_config, config_path, &model) != 0 ||
         ensure_copy(source_tokenizer, destination_tokenizer) != 0 ||
         ensure_copy(source_tokenizer_config,
@@ -2188,6 +2241,7 @@ done:
     free(cheetah_dir);
     free(weights_dir);
     free(manifest_path);
+    free(units_path);
     free(config_path);
     free(destination_tokenizer_config);
     free(destination_tokenizer);
