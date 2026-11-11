@@ -72,6 +72,44 @@ pub(in crate::chat) fn load_model(
     }
 }
 
+pub(in crate::chat) fn backend_device(selected: &str) -> Result<Device, String> {
+    let registration = BACKENDS
+        .iter()
+        .find(|registration| registration.name == selected)
+        .ok_or_else(|| {
+            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, or metal.")
+        })?;
+    match &registration.backend {
+        Backend::Candle(create_device) => create_device(),
+        Backend::Vulkan => Ok(Device::Cpu),
+    }
+}
+
+pub(in crate::chat) fn load_model_for_device(
+    weight_paths: &[PathBuf],
+    config_bytes: &[u8],
+    raw_config: Value,
+    architecture: &str,
+    device: Device,
+) -> Result<(Device, Box<dyn ModelRuntime>), String> {
+    if std::env::var("CHEETAH_DEVICE")
+        .unwrap_or_else(|_| "cpu".into())
+        .eq_ignore_ascii_case("vulkan")
+    {
+        let model_registration = super::registration_for_architecture(architecture)?;
+        return load_vulkan_or_fallback(
+            weight_paths,
+            config_bytes,
+            raw_config,
+            architecture,
+            model_registration,
+        );
+    }
+    let model_registration = super::registration_for_architecture(architecture)?;
+    let model = candle::load_model(weight_paths, config_bytes, raw_config, model_registration, &device)?;
+    Ok((device, model))
+}
+
 fn load_vulkan_or_fallback(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
@@ -186,5 +224,11 @@ mod tests {
     fn registers_candle_and_vulkan_backends() {
         let names: Vec<_> = BACKENDS.iter().map(|backend| backend.name).collect();
         assert_eq!(names, ["cpu", "cuda", "metal", "vulkan"]);
+    }
+
+    #[test]
+    fn backend_device_rejects_unknown_backend() {
+        assert!(backend_device("does_not_exist").is_err());
+        assert!(backend_device("cpu").is_ok());
     }
 }

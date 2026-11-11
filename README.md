@@ -12,6 +12,69 @@ Human-readable CLI output uses semantic colors when writing to a terminal. Color
 
 The directory should contain `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` with its weight shards. You can also launch `cheetah` from inside the model directory.
 
+## Beginner tutorial
+
+This section walks a new user from a clean machine to the first generated response.
+
+### 1. Install prerequisites
+
+You need a Rust toolchain (2024 edition or newer), a C compiler and linker, and Git. On Ubuntu or Debian:
+
+```sh
+sudo apt update
+sudo apt install -y build-essential git
+```
+
+Install Rust via [rustup](https://rustup.rs/) and verify with `rustc --version` and `cargo --version`.
+
+### 2. Build Cheetah
+
+```sh
+git clone https://github.com/DA3M0/cheetah.git
+cd cheetah
+cargo build --release
+```
+
+The first build compiles dependencies and may take a while. When it finishes, the executable is `target/release/cheetah`.
+
+### 3. Get a model
+
+Cheetah runs Safetensors decoder models. Point it at a Hugging Face model directory containing `config.json`, `tokenizer.json`, and `model.safetensors` (optionally with `model.safetensors.index.json` for sharded weights), or a single Safetensors file.
+
+```sh
+cheetah /path/to/model
+```
+
+You can also prepare a model directory for mmap-friendly loading and Ant memory optimization:
+
+```sh
+cheetah init /path/to/hf-model /path/to/prepared-model
+```
+
+GGUF files are not supported; use a Safetensors conversion of the model instead.
+
+### 4. Run a chat
+
+```sh
+cheetah /path/to/model
+```
+
+Then type a message at the `> ` prompt and press Enter. Use `/exit` to quit, `/clear` to reset the conversation, `/save <name>` to save it, and `/help` to list chat commands. Start with a small model and a small context for quick feedback:
+
+```sh
+cheetah /path/to/small-model --ctx-size 1024 --max-tokens 128
+```
+
+### 5. Try the OpenAI-compatible server
+
+```sh
+cheetah serve /path/to/model --port 8080
+```
+
+Then send chat completion requests to the local endpoint.
+
+See the rest of this README for build options, generation parameters, context management, Ant memory optimization, model inspection, and the full API reference.
+
 ## Build
 
 ### Beginner-friendly build guide
@@ -190,16 +253,24 @@ Ant is Cheetah's extremely fine-grained model memory optimization for local infe
 - `cheetah init` prepares a model directory into atomic units and emits the units manifest.
 - Effective Ant settings are resolved from user-managed defaults and CLI overrides, then applied when loading the model.
 - `cheetah chat` warns when the target model has not been prepared for Ant memory optimization; run `cheetah init` first.
-- The Candle backend in V1 performs a full model load and derives the residency plan from the Ant units manifest when Ant is enabled, reporting the resident byte count against the configured VRAM budget.
+- The Candle backend in V1 routes resident atomic units into the inference loader: when Ant is enabled, the inference device is resolved from the residency plan (resident VRAM units load into the accelerator device selected by `CHEETAH_DEVICE`; resident RAM-only units load through the CPU device), and only the source files of resident (VRAM/RAM) units are loaded, with disk-tier or evicted units excluded.
+- Generation-time budget enforcement evicts over-budget resident units and pages evicted resident units back in through the Ant manager before inference.
+- Generation-time prefetch pages evicted resident units back in ahead of inference when `--ant-prefetch-stages <n>` is configured (VRAM-tier units are preferred).
+- Per-request residency overrides accept a `resident_units` list in generation request bodies, forcing the listed atomic units to stay resident for that single request.
 
 Ant CLI overrides for chat include `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, and `--ant-allow-vram-swap <bool>`.
 
+### Interactive Ant preset
+
+`cheetah chat <model-path> --ant-setup true` and `cheetah init <source-dir> <destination-dir> --ant-setup true` run an interactive preset configuration (VRAM pool size, RAM budget, disk residency directory, eviction policy, prefetch stages, VRAM swap) and persist it to the model directory's user-managed Ant settings file.
+
+After the preset is written, starting Ant requires only a bare `--ant` flag: `cheetah chat <model-path> --ant` enables Ant and loads the preset configuration (an explicit `--ant <bool>` still overrides it).
+
 ### V1 not implemented
 
-- Tier-based partial loading in the Candle backend (VRAM → RAM → disk routing into the actual inference loader).
-- Budget enforcement driving eviction, paging, or swap during generation.
+- True per-unit device placement inside the Candle backend (placing each resident unit on its own tier device rather than selecting one device from the resident plan); the Candle loader currently accepts a single device.
 
-The OpenAI-compatible server accepts the same `--ant*` overrides as chat.
+The OpenAI-compatible server accepts the same `--ant*` overrides as chat. Generation requests may additionally pass a `resident_units` override list.
 
 ### Future goals
 

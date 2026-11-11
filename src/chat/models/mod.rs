@@ -85,4 +85,4 @@ pub(super) fn shader_is_registered(name: &str) -> bool {
     shader_path(name).is_some() || SHADERS.iter().any(|shader| shader.name == name)
 }
 
-pub(super) use registry::load_model;
+pub(super) use registry::{backend_device, load_model, load_model_for_device};

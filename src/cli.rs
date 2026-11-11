@@ -155,8 +155,19 @@ pub fn parse_chat_args(
                 }
             }
             "--ant" => {
+                if args
+                    .get(index + 1)
+                    .is_some_and(|value| is_boolean_literal(value.as_str()))
+                {
+                    ant.enabled = Some(parse_bool_option(args, index + 1, "--ant")?);
+                    index += 1;
+                } else {
+                    ant.enabled = Some(true);
+                }
+            }
+            "--ant-setup" => {
                 index += 1;
-                ant.enabled = Some(parse_bool_option(args, index, "--ant")?);
+                ant.interactive = Some(parse_bool_option(args, index, "--ant-setup")?);
             }
             "--ant-vram" => {
                 index += 1;
@@ -531,6 +542,21 @@ fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<Stri
 }
 
 /// 解析布尔开关值,接受 true/false/1/0/yes/no/on/off。
+fn is_boolean_literal(value: &str) -> bool {
+    [
+        "true",
+        "false",
+        "1",
+        "0",
+        "yes",
+        "no",
+        "on",
+        "off",
+    ]
+    .iter()
+    .any(|candidate| candidate.eq_ignore_ascii_case(value))
+}
+
 fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool, RunError> {
     let value = parse_text_option(args, index, option)?;
     match value.trim().to_ascii_lowercase().as_str() {
@@ -553,6 +579,8 @@ pub struct AntCliOptions {
     pub eviction_policy: Option<String>,
     pub prefetch_stages: Option<i64>,
     pub allow_vram_swap: Option<bool>,
+    /// 交互式设置Ant加载策略;`None` 表示未指定。
+    pub interactive: Option<bool>,
 }
 
 impl AntCliOptions {
@@ -595,8 +623,19 @@ pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
         let option = args[index].as_str();
         match option {
             "--ant" => {
+                if args
+                    .get(index + 1)
+                    .is_some_and(|value| is_boolean_literal(value.as_str()))
+                {
+                    options.enabled = Some(parse_bool_option(args, index + 1, option)?);
+                    index += 1;
+                } else {
+                    options.enabled = Some(true);
+                }
+            }
+            "--ant-setup" => {
                 index += 1;
-                options.enabled = Some(parse_bool_option(args, index, option)?);
+                options.interactive = Some(parse_bool_option(args, index, option)?);
             }
             "--ant-vram" => {
                 index += 1;
@@ -852,6 +891,33 @@ mod tests {
     fn rejects_unknown_ant_flag() {
         let error = parse_ant_args(&args(&["--ant-vram", "1024", "--bogus"])).unwrap_err();
         assert!(matches!(error, RunError::Usage(_)));
+    }
+
+    #[test]
+    fn bare_ant_flag_enables_preset_ant() {
+        let ant = parse_ant_args(&args(&["--ant"])).unwrap();
+        assert_eq!(ant.enabled, Some(true));
+        assert_eq!(ant.interactive, None);
+
+        let values = args(&["model.safetensors", "--ant"]);
+        let (path, _options, _context, ant) = parse_chat_args(&values).unwrap();
+        assert_eq!(path, PathBuf::from("model.safetensors"));
+        assert_eq!(ant.enabled, Some(true));
+    }
+
+    #[test]
+    fn ant_flag_with_boolean_value_overrides_preset() {
+        let ant = parse_ant_args(&args(&["--ant", "false"])).unwrap();
+        assert_eq!(ant.enabled, Some(false));
+    }
+
+    #[test]
+    fn parses_ant_setup_interactive_flag() {
+        let ant = parse_ant_args(&args(&["--ant-setup", "true"])).unwrap();
+        assert_eq!(ant.interactive, Some(true));
+
+        let ant = parse_ant_args(&args(&["--ant-setup", "false"])).unwrap();
+        assert_eq!(ant.interactive, Some(false));
     }
 
     #[test]

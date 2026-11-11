@@ -195,6 +195,7 @@ pub struct Engine {
     eos_token_ids: HashSet<u32>,
     stop_markers: Vec<String>,
     ant_plan: std::collections::BTreeMap<String, String>,
+    ant_evicted: Vec<String>,
     ant_resident_bytes: u64,
     ant_budget_bytes: u64,
     ant_settings: Option<AntSettings>,
@@ -223,6 +224,32 @@ fn ant_tier_priority(tier: &str) -> u64 {
         "ram" => 1,
         _ => 2,
     }
+}
+
+fn ant_resident_weight_paths(
+    weight_paths: &[PathBuf],
+    units: &[AntUnit],
+    plan: &std::collections::BTreeMap<String, String>,
+    evicted: &[String],
+) -> Vec<PathBuf> {
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for unit in units {
+        let tier = plan
+            .get(&unit.unit_id)
+            .and_then(|tier| Some(tier.as_str()))
+            .unwrap_or("vram");
+        if tier == "disk" || evicted.iter().any(|e| e == &unit.unit_id) {
+            continue;
+        }
+        keep.insert(unit.source_file.clone());
+    }
+    let mut paths = weight_paths.to_vec();
+    paths.retain(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| keep.contains(name))
+    });
+    paths
 }
 
 fn ant_apply_budget(
@@ -371,25 +398,54 @@ impl Engine {
         }
         if let Some(settings) = ant {
             if settings.enabled && !ant_units.is_empty() {
-                let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+                effective_weight_paths = ant_resident_weight_paths(
+                    &weight_paths,
+                    &ant_units,
+                    &ant_plan,
+                    &ant_evicted,
+                );
+            }
+        }
+        // Ant: resolve the inference device from the residency plan. Resident VRAM
+        // units load into the accelerator device; resident RAM-only units load into
+        // the CPU device; disk units are excluded before the loader runs.
+        let mut ant_resident_device: Option<Device> = None;
+        let mut ant_resident_device_is_accelerator = device_is_accelerator;
+        if let Some(settings) = ant_settings.as_ref() {
+            if settings.enabled && !ant_units.is_empty() {
+                let mut resident_tiers: Vec<&str> = Vec::new();
                 for unit in &ant_units {
                     let tier = ant_plan
                         .get(&unit.unit_id)
                         .and_then(|tier| Some(tier.as_str()))
                         .unwrap_or("vram");
-                    if tier != "disk" && !ant_evicted.iter().any(|e| e == &unit.unit_id) {
-                        keep.insert(unit.source_file.clone());
+                    if tier == "disk" || ant_evicted.iter().any(|e| e == &unit.unit_id) {
+                        continue;
+                    }
+                    resident_tiers.push(tier);
+                }
+                if !resident_tiers.is_empty() {
+                    if resident_tiers.iter().any(|tier| *tier == "vram") && device_is_accelerator {
+                        let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
+                        ant_resident_device = Some(super::models::backend_device(&selected)?);
+                    } else if !resident_tiers.iter().any(|tier| *tier == "vram") {
+                        ant_resident_device = Some(Device::Cpu);
+                        ant_resident_device_is_accelerator = false;
                     }
                 }
-                effective_weight_paths.retain(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| keep.contains(name))
-                });
             }
         }
-        let (device, model) =
-            super::models::load_model(&effective_weight_paths, &config_bytes, raw_config, &architecture)?;
+        let (device, model) = if let Some(resident_device) = ant_resident_device {
+            super::models::load_model_for_device(
+                &effective_weight_paths,
+                &config_bytes,
+                raw_config.clone(),
+                &architecture,
+                resident_device,
+            )?
+        } else {
+            super::models::load_model(&effective_weight_paths, &config_bytes, raw_config, &architecture)?
+        };
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {
             match value {
@@ -440,12 +496,13 @@ impl Engine {
             eos_token_ids,
             stop_markers,
             ant_plan,
+            ant_evicted,
             ant_resident_bytes,
             ant_budget_bytes,
             ant_settings,
             ant_units,
             ant_model_dir: Some(model_dir.to_path_buf()),
-            ant_device_accelerator: device_is_accelerator,
+            ant_device_accelerator: ant_resident_device_is_accelerator,
         })
     }
 
@@ -469,11 +526,81 @@ impl Engine {
         self.ant_resident_bytes <= self.ant_budget_bytes
     }
 
+    fn apply_ant_request_overrides(
+        &self,
+        overrides: &HashSet<String>,
+    ) -> Result<(), String> {
+        let Some(settings) = self.ant_settings.as_ref() else {
+            return Ok(());
+        };
+        if !settings.enabled || overrides.is_empty() || self.ant_units.is_empty() {
+            return Ok(());
+        }
+        let Ok(manager) = Ant::with_settings(settings) else {
+            return Ok(());
+        };
+        for unit in &self.ant_units {
+            if !overrides.contains(&unit.unit_id) {
+                continue;
+            }
+            let tier = self
+                .ant_plan
+                .get(&unit.unit_id)
+                .and_then(|tier| Some(tier.as_str()))
+                .unwrap_or("vram");
+            if tier == "disk" || self.ant_evicted.iter().any(|e| e == &unit.unit_id) {
+                let tier_value = if tier == "vram" { 0 } else { 1 };
+                let _ = manager.page_in(&unit.unit_id, tier_value);
+            }
+        }
+        Ok(())
+    }
+
+    fn prefetch_ant_units(&self) -> Result<(), String> {
+        let Some(settings) = self.ant_settings.as_ref() else {
+            return Ok(());
+        };
+        if !settings.enabled
+            || settings.prefetch_stages <= 0
+            || self.ant_evicted.is_empty()
+            || self.ant_units.is_empty()
+        {
+            return Ok(());
+        }
+        let Ok(manager) = Ant::with_settings(settings) else {
+            return Ok(());
+        };
+        let mut candidates: Vec<(u64, &AntUnit)> = self
+            .ant_units
+            .iter()
+            .filter(|unit| self.ant_evicted.iter().any(|e| e == &unit.unit_id))
+            .map(|unit| {
+                let tier = self
+                    .ant_plan
+                    .get(&unit.unit_id)
+                    .and_then(|tier| Some(tier.as_str()))
+                    .unwrap_or("vram");
+                (ant_tier_priority(tier), unit)
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, unit) in candidates.into_iter().take(settings.prefetch_stages.max(0) as usize) {
+            let tier = self
+                .ant_plan
+                .get(&unit.unit_id)
+                .and_then(|tier| Some(tier.as_str()))
+                .unwrap_or("vram");
+            let tier_value = if tier == "vram" { 0 } else { 1 };
+            let _ = manager.page_in(&unit.unit_id, tier_value);
+        }
+        Ok(())
+    }
+
     fn enforce_ant_budget(&self) {
         let Some(settings) = self.ant_settings.as_ref() else {
             return;
         };
-        if !settings.enabled || !self.ant_within_budget() || settings.vram_pool_bytes == 0 {
+        if !settings.enabled || settings.vram_pool_bytes == 0 {
             return;
         }
         let Ok(manager) = Ant::with_settings(settings) else {
@@ -484,6 +611,25 @@ impl Engine {
         };
         let units = &self.ant_units;
         let plan = &self.ant_plan;
+
+        if self.ant_evicted.is_empty() && self.ant_within_budget() {
+            return;
+        }
+
+        // Ant: page evicted resident-tier units back in before enforcing the
+        // memory budget again.
+        for unit in units {
+            let tier = plan
+                .get(&unit.unit_id)
+                .and_then(|tier| Some(tier.as_str()))
+                .unwrap_or("vram");
+            if tier == "disk" || !self.ant_evicted.iter().any(|e| e == &unit.unit_id) {
+                continue;
+            }
+            let tier_value = if tier == "vram" { 0 } else { 1 };
+            let _ = manager.page_in(&unit.unit_id, tier_value);
+        }
+
         let _resident_bytes = ant_apply_budget(
             &manager,
             model_dir,
@@ -597,8 +743,9 @@ impl Engine {
         options: &ChatOptions,
         extra_stop: &[String],
         sink: &mut dyn TextSink,
+        resident_overrides: &HashSet<String>,
     ) -> Result<Generation, String> {
-        self.generate_inner(prompt, options, extra_stop, sink)
+        self.generate_inner(prompt, options, extra_stop, sink, resident_overrides)
     }
 
     pub fn generate_with_chat_params(
@@ -609,12 +756,13 @@ impl Engine {
         extra_stop: &[String],
         sink: &mut dyn TextSink,
         params: &ChatParams,
+        resident_overrides: &HashSet<String>,
     ) -> Result<Generation, String> {
         let mut stops = extra_stop.to_vec();
         let template_stops: Vec<String> = serde_json::from_str(&params.additional_stops_json)
             .map_err(|error| format!("Failed to parse template stop markers: {error}"))?;
         stops.extend(template_stops);
-        self.generate(context, prompt, options, &stops, sink)
+        self.generate(context, prompt, options, &stops, sink, resident_overrides)
     }
 
     fn generate_inner(
@@ -623,6 +771,7 @@ impl Engine {
         options: &ChatOptions,
         extra_stop: &[String],
         sink: &mut dyn TextSink,
+        resident_overrides: &HashSet<String>,
     ) -> Result<Generation, String> {
         if prompt.is_empty() {
             return Err("Input is empty after tokenization.".into());
@@ -637,7 +786,10 @@ impl Engine {
             ));
         }
 
-        // Ant: enforce the resolved memory budget before generation.
+        // Ant: apply per-request residency overrides, prefetch evicted units,
+        // then enforce the resolved memory budget before generation.
+        self.apply_ant_request_overrides(resident_overrides)?;
+        self.prefetch_ant_units()?;
         self.enforce_ant_budget();
 
         let loaded = self
@@ -1068,7 +1220,7 @@ fn chat_loop(
             engine.prepare(&mut messages, options.system.as_deref(), options.max_tokens)?;
         let mut context = engine.new_context()?;
         let mut sink = StdoutSink;
-        match engine.generate(&mut context, &tokens, &options, &[], &mut sink) {
+        match engine.generate(&mut context, &tokens, &options, &[], &mut sink, &HashSet::new()) {
             Ok(generation) => {
                 println!(
                     "{}",
@@ -1205,6 +1357,98 @@ mod tests {
         );
         assert!(prompt.starts_with("<|begin_of_text|><|start_header_id|>system"));
         assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n"));
+    }
+
+    #[test]
+    fn ant_resident_weight_paths_keep_only_resident_units() {
+        let units = vec![
+            AntUnit {
+                unit_id: "model.embed_tokens.weight".to_string(),
+                name: "embed_tokens".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![1, 4096],
+                bytes: 1024,
+                source_file: "model-00001-of-00002.safetensors".to_string(),
+                source_offset: 0,
+                shard: "model-00001-of-00002.safetensors".to_string(),
+                layer_id: 0,
+            },
+            AntUnit {
+                unit_id: "model.layers.0.weight".to_string(),
+                name: "layers_0".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![1, 4096],
+                bytes: 2048,
+                source_file: "model-00001-of-00002.safetensors".to_string(),
+                source_offset: 0,
+                shard: "model-00001-of-00002.safetensors".to_string(),
+                layer_id: 0,
+            },
+            AntUnit {
+                unit_id: "model.layers.1.weight".to_string(),
+                name: "layers_1".to_string(),
+                dtype: "F32".to_string(),
+                shape: vec![1, 4096],
+                bytes: 4096,
+                source_file: "model-00002-of-00002.safetensors".to_string(),
+                source_offset: 0,
+                shard: "model-00002-of-00002.safetensors".to_string(),
+                layer_id: 1,
+            },
+        ];
+        let mut plan = std::collections::BTreeMap::new();
+        plan.insert("model.embed_tokens.weight".to_string(), "ram".to_string());
+        plan.insert("model.layers.0.weight".to_string(), "vram".to_string());
+        plan.insert("model.layers.1.weight".to_string(), "disk".to_string());
+        let evicted = vec!["model.layers.0.weight".to_string()];
+
+        let paths = ant_resident_weight_paths(
+            &[
+                PathBuf::from("/tmp/model-00001-of-00002.safetensors"),
+                PathBuf::from("/tmp/model-00002-of-00002.safetensors"),
+            ],
+            &units,
+            &plan,
+            &evicted,
+        );
+
+        // The RAM-resident embedding and the evicted VRAM layer share the first
+        // shard; the disk-tier layer is dropped entirely.
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].file_name().and_then(|name| name.to_str()),
+            Some("model-00001-of-00002.safetensors")
+        );
+    }
+
+    #[test]
+    fn ant_resident_weight_paths_keep_everything_when_ant_disabled() {
+        let units = vec![AntUnit {
+            unit_id: "model.layers.0.weight".to_string(),
+            name: "layers_0".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![1, 4096],
+            bytes: 2048,
+            source_file: "model-00001-of-00002.safetensors".to_string(),
+            source_offset: 0,
+            shard: "model-00001-of-00002.safetensors".to_string(),
+            layer_id: 0,
+        }];
+        let plan = std::collections::BTreeMap::from([(
+            "model.layers.0.weight".to_string(),
+            "vram".to_string(),
+        )]);
+        let evicted: Vec<String> = Vec::new();
+
+        let paths = ant_resident_weight_paths(
+            &[PathBuf::from("/tmp/model-00001-of-00002.safetensors")],
+            &units,
+            &plan,
+            &evicted,
+        );
+
+        // Resident-tier units are kept unless they were evicted.
+        assert_eq!(paths.len(), 1);
     }
 
     #[test]

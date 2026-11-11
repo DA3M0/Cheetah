@@ -61,6 +61,8 @@ pub(crate) struct ChatCompletionRequest {
     pub(crate) n: Option<usize>,
     pub(crate) tools: Option<Vec<ToolDefinition>>,
     pub(crate) tool_choice: Option<ToolChoice>,
+    #[serde(default)]
+    pub(crate) resident_units: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -180,6 +182,8 @@ pub(crate) struct CompletionRequest {
     pub(crate) stop: Option<StopValue>,
     pub(crate) seed: Option<u64>,
     pub(crate) echo: bool,
+    #[serde(default)]
+    pub(crate) resident_units: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

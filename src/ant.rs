@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
 use cheetah::native::{self, AntFfiSettings};
 
@@ -190,6 +191,62 @@ impl Ant {
         Ok(settings)
     }
 
+    /// Run an interactive preset configuration for a model directory and persist it.
+    /// Ant: 交互式配置 Ant 加载策略并写入模型目录。
+    pub fn run_interactive_setup(&self, model_dir: &Path) -> Result<AntSettings, String> {
+        let mut settings = AntSettings::default();
+        settings.enabled = true;
+        settings.vram_pool_bytes = interactive_prompt_u64(
+            &format!(
+                "Ant interactive setup: VRAM pool size in bytes [default: {}]:",
+                settings.vram_pool_bytes
+            ),
+            settings.vram_pool_bytes,
+        )?;
+        settings.ram_budget_bytes = interactive_prompt_u64(
+            &format!(
+                "Ant interactive setup: RAM budget in bytes [default: {}]:",
+                settings.ram_budget_bytes
+            ),
+            settings.ram_budget_bytes,
+        )?;
+        let disk_dir = interactive_prompt_str(
+            "Ant interactive setup: disk residency directory (empty for default):",
+            "",
+        )?;
+        if !disk_dir.trim().is_empty() {
+            settings.disk_dir = Some(disk_dir.trim().to_string());
+        }
+        let eviction_policy = interactive_prompt_str(
+            &format!(
+                "Ant interactive setup: eviction policy (lru/clock/clock2; default: {}):",
+                settings.eviction_policy
+            ),
+            &settings.eviction_policy,
+        )?;
+        if !eviction_policy.trim().is_empty() {
+            settings.eviction_policy = eviction_policy.trim().to_string();
+        }
+        let prefetch_stages = interactive_prompt_usize(
+            &format!(
+                "Ant interactive setup: prefetch stages (default: {}):",
+                settings.prefetch_stages
+            ),
+            settings.prefetch_stages.max(0) as usize,
+        )?;
+        settings.prefetch_stages = prefetch_stages as i32;
+        settings.allow_vram_swap = interactive_prompt_bool(
+            &format!(
+                "Ant interactive setup: allow VRAM swap (true/false; default: {}):",
+                settings.allow_vram_swap
+            ),
+            settings.allow_vram_swap,
+        )?;
+        let ant = Ant::with_settings(&settings)?;
+        ant.write_settings_for_model(model_dir, &settings)?;
+        Ok(settings)
+    }
+
     pub fn units_for_model(&self, dst_dir: &Path) -> Result<Vec<AntUnit>, String> {
         let path = dst_dir.join(CHEETAH_UNITS_FILENAME);
         let bytes = std::fs::read(&path)
@@ -305,6 +362,59 @@ impl Ant {
         }
         plan
     }
+}
+
+fn interactive_prompt(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    let mut stdout = std::io::stdout();
+    let _ = stdout.flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| format!("Failed to read interactive setting: {error}"))?;
+    Ok(line.trim().to_string())
+}
+
+fn interactive_prompt_u64(prompt: &str, default: u64) -> Result<u64, String> {
+    let answer = interactive_prompt(prompt)?;
+    if answer.is_empty() {
+        return Ok(default);
+    }
+    answer
+        .parse::<u64>()
+        .map_err(|_| format!("{prompt} expects a non-negative integer; received '{answer}'."))
+}
+
+fn interactive_prompt_usize(prompt: &str, default: usize) -> Result<usize, String> {
+    let answer = interactive_prompt(prompt)?;
+    if answer.is_empty() {
+        return Ok(default);
+    }
+    answer
+        .parse::<usize>()
+        .map_err(|_| format!("{prompt} expects a non-negative integer; received '{answer}'."))
+}
+
+fn interactive_prompt_bool(prompt: &str, default: bool) -> Result<bool, String> {
+    let answer = interactive_prompt(prompt)?;
+    if answer.is_empty() {
+        return Ok(default);
+    }
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{prompt} expects a boolean value (true/false); received '{answer}'."
+        )),
+    }
+}
+
+fn interactive_prompt_str(prompt: &str, default: &str) -> Result<String, String> {
+    let answer = interactive_prompt(prompt)?;
+    if answer.is_empty() {
+        return Ok(default.to_string());
+    }
+    Ok(answer)
 }
 
 impl Drop for Ant {

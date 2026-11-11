@@ -119,7 +119,14 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
     // Ant: after native preparation, route each atomic unit through the
     // built-in residency planner (VRAM -> RAM -> disk).
     let ant_options = cli::parse_ant_args(&flag_args)?;
-    let settings = ant_options.resolve();
+    let mut settings = if ant_options.interactive == Some(true) {
+        let interactive_ant = runtime(ant::Ant::with_settings(&ant::AntSettings::default()))?;
+        let preset = runtime(interactive_ant.run_interactive_setup(&destination))?;
+        preset
+    } else {
+        ant_options.resolve()
+    };
+    apply_ant_overrides(&mut settings, &ant_options);
     let ant = runtime(ant::Ant::with_settings(&settings))?;
     runtime(ant.write_settings_for_model(&destination, &settings))?;
     let units = runtime(ant.units_for_model(&destination))?;
@@ -170,21 +177,7 @@ fn write_report(path: &Path, report: &str) -> Result<(), RunError> {
     })
 }
 
-fn run_chat(
-    path: &Path,
-    requested_options: ChatOptions,
-    context_options: cli::ContextCliOptions,
-    ant_options: cli::AntCliOptions,
-) -> Result<(), RunError> {
-    // Ant: resolve effective memory settings from user-managed defaults, then CLI overrides.
-    // Ant: 先读取用户管理的默认设置，再叠加命令行覆盖项。
-    let mut settings = ant::AntSettings::default();
-    let probe_ant = runtime(ant::Ant::with_settings(&ant::AntSettings::default()))?;
-    if let Ok(user_settings) = probe_ant.settings_for_model(path) {
-        if user_settings.enabled {
-            settings = user_settings;
-        }
-    }
+fn apply_ant_overrides(settings: &mut ant::AntSettings, ant_options: &cli::AntCliOptions) {
     if let Some(enabled) = ant_options.enabled {
         settings.enabled = enabled;
     }
@@ -209,6 +202,29 @@ fn run_chat(
     if let Some(swap) = ant_options.allow_vram_swap {
         settings.allow_vram_swap = swap;
     }
+}
+
+fn run_chat(
+    path: &Path,
+    requested_options: ChatOptions,
+    context_options: cli::ContextCliOptions,
+    ant_options: cli::AntCliOptions,
+) -> Result<(), RunError> {
+    // Ant: resolve effective memory settings from user-managed defaults, then CLI overrides.
+    // Ant: 先读取用户管理的默认设置，再叠加命令行覆盖项。
+    let mut settings = ant::AntSettings::default();
+    let probe_ant = runtime(ant::Ant::with_settings(&ant::AntSettings::default()))?;
+    if ant_options.interactive == Some(true) {
+        // Ant: interactive preset setup writes the preset for this model directory.
+        // Ant: 交互式设置会为模型目录写入预设配置。
+        settings = runtime(probe_ant.run_interactive_setup(path))?;
+    }
+    if let Ok(user_settings) = probe_ant.settings_for_model(path) {
+        if user_settings.enabled {
+            settings = user_settings;
+        }
+    }
+    apply_ant_overrides(&mut settings, &ant_options);
 
     // Ant: warn when the target model has not been prepared for Ant memory management.
     let ant_manager = runtime(ant::Ant::with_settings(&settings))?;
@@ -310,7 +326,8 @@ Chat options:\n\
   --context-dir <path> Context archive directory (also used by /save)\n\
 \n\
 Ant memory options (cheetah init <source-dir> <destination-dir> | cheetah chat <model-path>):\n\
-  --ant <bool>          Enable/disable Ant memory optimization (default: true)\n\
+  --ant-setup <bool>    Interactive Ant preset setup (true runs prompts; default: false)
+  --ant <bool>          Enable/disable Ant memory optimization (default: true; bare --ant enables the preset)\n\
   --ant-vram <bytes>    VRAM pool size override in bytes (default: 8GiB)\n\
   --ant-ram <bytes>     RAM budget override in bytes (default: 16GiB)\n\
   --ant-disk-dir <path> Disk residency directory override\n\

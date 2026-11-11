@@ -8,6 +8,7 @@ use crate::serve::openai::{self, *};
 use crate::serve::queue::{QueueGuard, QueueTicket};
 use bytes::Bytes;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -323,6 +324,11 @@ fn handle_chat_completions(
             return;
         }
     };
+    let resident_overrides: HashSet<String> = api_request
+        .resident_units
+        .as_ref()
+        .map(|units| units.iter().cloned().collect())
+        .unwrap_or_default();
     let system = prepared
         .system
         .clone()
@@ -392,6 +398,7 @@ fn handle_chat_completions(
                         choice: &tool_choice,
                         options: &options,
                         stop: &stop,
+                        resident_overrides: &resident_overrides,
                     },
                 );
                 match result {
@@ -460,6 +467,7 @@ fn handle_chat_completions(
                     choice: &tool_choice,
                     options: &options,
                     stop: &stop,
+                    resident_overrides: &resident_overrides,
                 },
             ) {
                 Ok((generation, result)) => {
@@ -525,7 +533,7 @@ fn handle_chat_completions(
         std::thread::spawn(move || {
             let mut sink =
                 SseSink::new_with_disconnect(tx, completion_id, created, model, disconnected);
-            let result = generate_chat(&gen_state, guard, tokens, &options, &stop, &mut sink);
+            let result = generate_chat(&gen_state, guard, tokens, &options, &stop, &mut sink, &resident_overrides);
             match result {
                 Ok(generation) => {
                     if let Err(err) = sink
@@ -554,7 +562,7 @@ fn handle_chat_completions(
         let _ = request.respond(response);
     } else {
         let mut sink = NullSink;
-        match generate_chat(&state, guard, tokens, &options, &stop, &mut sink) {
+        match generate_chat(&state, guard, tokens, &options, &stop, &mut sink, &resident_overrides) {
             Ok(generation) => {
                 let (content, calls, finish_reason) =
                     chat_completion_parts(&generation.text, generation.finish_reason.as_str());
@@ -639,6 +647,7 @@ struct ToolChatInput<'a> {
     choice: &'a ResolvedToolChoice,
     options: &'a ChatOptions,
     stop: &'a [String],
+    resident_overrides: &'a HashSet<String>,
 }
 
 fn generate_tool_chat(
@@ -660,6 +669,7 @@ fn generate_tool_chat(
         &stop,
         &mut sink,
         &input.chat_params,
+        input.resident_overrides,
     )?;
     let parsed = input
         .chat_params
@@ -722,6 +732,11 @@ fn handle_completions(state: Arc<ServerState>, request: Request, generation_tick
             return;
         }
     };
+    let resident_overrides: HashSet<String> = api_request
+        .resident_units
+        .as_ref()
+        .map(|units| units.iter().cloned().collect())
+        .unwrap_or_default();
     let stop = stop_strings(&api_request.stop);
     let model = if api_request.model.is_empty() {
         state.model_id.clone()
@@ -745,7 +760,7 @@ fn handle_completions(state: Arc<ServerState>, request: Request, generation_tick
     let created = openai::now_unix();
 
     let mut sink = NullSink;
-    match generate_chat(&state, guard, tokens, &options, &stop, &mut sink) {
+    match generate_chat(&state, guard, tokens, &options, &stop, &mut sink, &resident_overrides) {
         Ok(generation) => {
             let body = serde_json::to_string(&TextCompletionResponse {
                 id: completion_id,
@@ -777,11 +792,12 @@ fn generate_chat(
     options: &ChatOptions,
     stop: &[String],
     sink: &mut dyn TextSink,
+    resident_overrides: &HashSet<String>,
 ) -> Result<Generation, String> {
     let mut context = state.engine.new_context()?;
     state
         .engine
-        .generate(&mut context, &tokens, options, stop, sink)
+        .generate(&mut context, &tokens, options, stop, sink, resident_overrides)
 }
 
 fn prompt_error_status(error: &str) -> u16 {
