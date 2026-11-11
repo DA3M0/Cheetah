@@ -74,7 +74,17 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
         }
         "serve" => {
             let (serve_options, chat_options) = cli::parse_serve_args(&args[1..])?;
-            runtime(serve::serve(serve_options, chat_options, None))
+            let ant_args: Vec<String> = args[1..]
+                .iter()
+                .filter(|arg| arg.starts_with("--ant"))
+                .cloned()
+                .collect();
+            let ant_options = if ant_args.is_empty() {
+                cli::AntCliOptions::default()
+            } else {
+                cli::parse_ant_args(&ant_args)?
+            };
+            runtime(serve::serve(serve_options, chat_options, Some(&ant_options.resolve())))
         }
         value if !value.starts_with('-') => {
             let (path, options, context_options, ant_options) = cli::parse_chat_args(&args)?;

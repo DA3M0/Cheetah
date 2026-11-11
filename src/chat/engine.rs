@@ -1,5 +1,5 @@
 use super::models::ModelRuntime;
-use crate::ant::{Ant, AntSettings};
+use crate::ant::{Ant, AntSettings, AntUnit};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
@@ -194,9 +194,13 @@ pub struct Engine {
     max_position_embeddings: usize,
     eos_token_ids: HashSet<u32>,
     stop_markers: Vec<String>,
-    ant_plan: std::collections::HashMap<String, String>,
+    ant_plan: std::collections::BTreeMap<String, String>,
     ant_resident_bytes: u64,
     ant_budget_bytes: u64,
+    ant_settings: Option<AntSettings>,
+    ant_units: Vec<AntUnit>,
+    ant_model_dir: Option<PathBuf>,
+    ant_device_accelerator: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +215,50 @@ struct ModelConfig {
 
 fn default_context_size() -> usize {
     4096
+}
+
+fn ant_tier_priority(tier: &str) -> u64 {
+    match tier {
+        "vram" => 0,
+        "ram" => 1,
+        _ => 2,
+    }
+}
+
+fn ant_apply_budget(
+    manager: &Ant,
+    dst_dir: &Path,
+    units: &[AntUnit],
+    plan: &std::collections::BTreeMap<String, String>,
+    budget_bytes: u64,
+    device_is_accelerator: bool,
+) -> (u64, Vec<String>) {
+    let mut resident_bytes = 0u64;
+    let mut evicted: Vec<String> = Vec::new();
+    let mut resident: Vec<(u64, u64, String)> = Vec::new();
+    for unit in units {
+        let tier = plan
+            .get(&unit.unit_id)
+            .and_then(|tier| Some(tier.as_str()))
+            .unwrap_or("vram");
+        if tier != "disk" {
+            resident_bytes = resident_bytes.saturating_add(unit.byte_size());
+            resident.push((ant_tier_priority(tier), unit.byte_size(), unit.unit_id.clone()));
+        }
+    }
+    if device_is_accelerator && budget_bytes > 0 && resident_bytes > budget_bytes {
+        resident.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, bytes, unit_id) in resident {
+            if resident_bytes <= budget_bytes {
+                break;
+            }
+            if manager.evict_unit(dst_dir, &unit_id).is_ok() {
+                resident_bytes = resident_bytes.saturating_sub(bytes);
+                evicted.push(unit_id);
+            }
+        }
+    }
+    (resident_bytes, evicted)
 }
 
 impl Engine {
@@ -282,8 +330,66 @@ impl Engine {
         } else {
             registration.chat_template.render
         };
+        let device_is_accelerator = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into()) != "cpu";
+        let mut effective_weight_paths = weight_paths.to_vec();
+        let mut ant_plan = std::collections::BTreeMap::new();
+        let mut ant_resident_bytes = 0u64;
+        let mut ant_budget_bytes = AntSettings::default().vram_pool_bytes;
+        let mut ant_settings = ant.cloned();
+        let mut ant_units: Vec<AntUnit> = Vec::new();
+        let mut ant_evicted: Vec<String> = Vec::new();
+        if let Some(settings) = ant {
+            ant_budget_bytes = settings.vram_pool_bytes;
+            if settings.enabled {
+                // Ant: derive the atomic-unit residency plan from the units manifest.
+                //  Ant: 从 units manifest 派生原子单元驻留计划。
+                if let Ok(manager) = Ant::with_settings(settings) {
+                    if let Ok(units) = manager.units_for_model(&model_dir) {
+                        let plan = manager.plan_residency(&units);
+                        for unit in &units {
+                            let tier = plan
+                                .get(&unit.unit_id)
+                                .and_then(|tier| Some(tier.as_str()))
+                                .unwrap_or("vram");
+                            ant_plan.insert(unit.unit_id.clone(), tier.to_string());
+                        }
+                        let (resident_bytes, evicted_units) = ant_apply_budget(
+                            &manager,
+                            &model_dir,
+                            &units,
+                            &plan,
+                            ant_budget_bytes,
+                            device_is_accelerator,
+                        );
+                        ant_resident_bytes = resident_bytes;
+                        ant_units = units;
+                        ant_evicted = evicted_units;
+                    }
+                    ant_settings = Some(settings.clone());
+                }
+            }
+        }
+        if let Some(settings) = ant {
+            if settings.enabled && !ant_units.is_empty() {
+                let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for unit in &ant_units {
+                    let tier = ant_plan
+                        .get(&unit.unit_id)
+                        .and_then(|tier| Some(tier.as_str()))
+                        .unwrap_or("vram");
+                    if tier != "disk" && !ant_evicted.iter().any(|e| e == &unit.unit_id) {
+                        keep.insert(unit.source_file.clone());
+                    }
+                }
+                effective_weight_paths.retain(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| keep.contains(name))
+                });
+            }
+        }
         let (device, model) =
-            super::models::load_model(&weight_paths, &config_bytes, raw_config, &architecture)?;
+            super::models::load_model(&effective_weight_paths, &config_bytes, raw_config, &architecture)?;
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {
             match value {
@@ -314,32 +420,6 @@ impl Engine {
                 eos_token_ids.insert(*id);
             }
         }
-        let mut ant_plan = std::collections::HashMap::new();
-        let mut ant_resident_bytes = 0u64;
-        let mut ant_budget_bytes = AntSettings::default().vram_pool_bytes;
-        if let Some(settings) = ant {
-            ant_budget_bytes = settings.vram_pool_bytes;
-            if settings.enabled {
-                // Ant: derive the atomic-unit residency plan from the units manifest.
-                //  Ant: 从 units manifest 派生原子单元驻留计划。
-                if let Ok(manager) = Ant::with_settings(settings) {
-                    if let Ok(units) = manager.units_for_model(&model_dir) {
-                        let plan = manager.plan_residency(&units);
-                        for unit in &units {
-                            let tier = plan
-                                .get(&unit.unit_id)
-                                .and_then(|tier| Some(tier.as_str()))
-                                .unwrap_or("vram");
-                            ant_plan.insert(unit.unit_id.clone(), tier.to_string());
-                            if tier != "disk" {
-                                ant_resident_bytes =
-                                    ant_resident_bytes.saturating_add(unit.byte_size());
-                            }
-                        }
-                    }
-                }
-            }
-        }
         Ok(Self {
             model: Mutex::new(LoadedModel { model, device }),
             tokenizer,
@@ -362,6 +442,10 @@ impl Engine {
             ant_plan,
             ant_resident_bytes,
             ant_budget_bytes,
+            ant_settings,
+            ant_units,
+            ant_model_dir: Some(model_dir.to_path_buf()),
+            ant_device_accelerator: device_is_accelerator,
         })
     }
 
@@ -379,6 +463,35 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loaded.model.device_name()
+    }
+
+    pub fn ant_within_budget(&self) -> bool {
+        self.ant_resident_bytes <= self.ant_budget_bytes
+    }
+
+    fn enforce_ant_budget(&self) {
+        let Some(settings) = self.ant_settings.as_ref() else {
+            return;
+        };
+        if !settings.enabled || !self.ant_within_budget() || settings.vram_pool_bytes == 0 {
+            return;
+        }
+        let Ok(manager) = Ant::with_settings(settings) else {
+            return;
+        };
+        let Some(model_dir) = self.ant_model_dir.as_deref() else {
+            return;
+        };
+        let units = &self.ant_units;
+        let plan = &self.ant_plan;
+        let _resident_bytes = ant_apply_budget(
+            &manager,
+            model_dir,
+            units,
+            plan,
+            settings.vram_pool_bytes,
+            self.ant_device_accelerator,
+        );
     }
 
     pub fn new_context(&self) -> Result<InferenceContext, String> {
@@ -523,6 +636,9 @@ impl Engine {
                 self.max_position_embeddings
             ));
         }
+
+        // Ant: enforce the resolved memory budget before generation.
+        self.enforce_ant_budget();
 
         let loaded = self
             .model

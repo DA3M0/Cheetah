@@ -198,7 +198,8 @@ Ant CLI overrides for chat include `--ant <bool>`, `--ant-vram <bytes>`, `--ant-
 
 - Tier-based partial loading in the Candle backend (VRAM → RAM → disk routing into the actual inference loader).
 - Budget enforcement driving eviction, paging, or swap during generation.
-- Ant wiring for the OpenAI-compatible server (`serve`).
+
+The OpenAI-compatible server accepts the same `--ant*` overrides as chat.
 
 ### Future goals
 
