@@ -91,7 +91,9 @@ static int unit_index_append(UnitIndex *idx, const CheetahAntUnit *src) {
     dst->shard = src->shard ? xstrdup(src->shard) : NULL;
     dst->ndim = src->ndim;
     dst->bytes = src->bytes;
+    dst->source_offset = src->source_offset;
     dst->layer_id = src->layer_id;
+    dst->tier = src->tier;
     memcpy(dst->shape, src->shape, sizeof(dst->shape));
     return 0;
 }
@@ -213,10 +215,13 @@ static int load_units_from_json(CheetahAnt *ant, const char *dst_dir, UnitIndex 
         if (bytes_str) u.bytes = parse_uint64_token(bytes_str, NULL);
         char *layer_str = json_object_get(obj, "layer_id");
         if (layer_str) u.layer_id = (int)parse_uint64_token(layer_str, NULL);
+        char *offset_str = json_object_get(obj, "source_offset");
+        if (offset_str) u.source_offset = parse_uint64_token(offset_str, NULL);
         free(obj);
         free(shape_str);
         free(bytes_str);
         free(layer_str);
+        free(offset_str);
         if (unit_index_append(idx, &u) != 0) {
             free(text);
             return -1;

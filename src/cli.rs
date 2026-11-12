@@ -165,9 +165,9 @@ pub fn parse_chat_args(
                     ant.enabled = Some(true);
                 }
             }
-            "--ant-setup" => {
-                index += 1;
-                ant.interactive = Some(parse_bool_option(args, index, "--ant-setup")?);
+            "--ant-setup" | "--setup" => {
+                let option = args[index].as_str();
+                ant.interactive = Some(parse_setup_flag(args, &mut index, option)?);
             }
             "--ant-vram" => {
                 index += 1;
@@ -542,7 +542,7 @@ fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<Stri
 }
 
 /// 解析布尔开关值,接受 true/false/1/0/yes/no/on/off。
-fn is_boolean_literal(value: &str) -> bool {
+pub fn is_boolean_literal(value: &str) -> bool {
     [
         "true",
         "false",
@@ -615,6 +615,23 @@ impl AntCliOptions {
     }
 }
 
+/// Parse an interactive-setup flag that accepts either a bare flag or an
+/// explicit boolean value (`--setup`, `--setup true`). `index` points at the
+/// flag itself and is advanced past the flag and any consumed value; the
+/// caller's loop still applies its trailing `index += 1`.
+fn parse_setup_flag(args: &[String], index: &mut usize, option: &str) -> Result<bool, RunError> {
+    if args
+        .get(*index + 1)
+        .is_some_and(|value| is_boolean_literal(value.as_str()))
+    {
+        let value = parse_bool_option(args, *index + 1, option)?;
+        *index += 1;
+        Ok(value)
+    } else {
+        Ok(true)
+    }
+}
+
 /// 解析 Ant 内存优化参数:`--ant <bool>` 以及预算/驻留类覆盖项。
 pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
     let mut options = AntCliOptions::default();
@@ -633,9 +650,9 @@ pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
                     options.enabled = Some(true);
                 }
             }
-            "--ant-setup" => {
-                index += 1;
-                options.interactive = Some(parse_bool_option(args, index, option)?);
+            "--ant-setup" | "--setup" => {
+                let option = args[index].as_str();
+                options.interactive = Some(parse_setup_flag(args, &mut index, option)?);
             }
             "--ant-vram" => {
                 index += 1;
@@ -918,6 +935,25 @@ mod tests {
 
         let ant = parse_ant_args(&args(&["--ant-setup", "false"])).unwrap();
         assert_eq!(ant.interactive, Some(false));
+    }
+
+    #[test]
+    fn parses_setup_alias_and_bare_interactive_flags() {
+        // `--setup` is the alias of `--ant-setup`; both accept a bare flag.
+        let ant = parse_ant_args(&args(&["--setup"])).unwrap();
+        assert_eq!(ant.interactive, Some(true));
+
+        let ant = parse_ant_args(&args(&["--setup", "false"])).unwrap();
+        assert_eq!(ant.interactive, Some(false));
+
+        let ant = parse_ant_args(&args(&["--ant-setup"])).unwrap();
+        assert_eq!(ant.interactive, Some(true));
+
+        // A bare setup flag does not swallow a following model path.
+        let (path, _, _, ant) =
+            parse_chat_args(&args(&["model.safetensors", "--setup", "--max-tokens", "8"])).unwrap();
+        assert_eq!(path, PathBuf::from("model.safetensors"));
+        assert_eq!(ant.interactive, Some(true));
     }
 
     #[test]

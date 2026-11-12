@@ -4,7 +4,7 @@ mod http;
 mod openai;
 mod queue;
 
-use crate::cli::ServeOptions;
+use crate::cli::{AntCliOptions, ServeOptions};
 use crate::color::{self, Color};
 use crate::options::ChatOptions;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub fn serve(
     options: ServeOptions,
     chat_options: ChatOptions,
-    ant: Option<&crate::ant::AntSettings>,
+    ant_options: &AntCliOptions,
 ) -> Result<(), String> {
     // Refuse unauthenticated non-loopback listeners to prevent accidental network exposure.
     // 未启用鉴权时拒绝监听非回环地址，避免服务意外暴露到网络。
@@ -30,6 +30,11 @@ pub fn serve(
     }
 
     let (model_path, model_id) = resolve_model(&options)?;
+    // Ant: resolve the effective settings against the resolved model directory
+    // so the user-managed preset (`--setup`) is honored, with CLI overrides on
+    // top; `--setup` / `--ant-setup` runs the interactive wizard first.
+    let ant_settings = crate::resolve_ant_settings(&model_path, ant_options)
+        .map_err(|error| error.to_string())?;
     eprintln!(
         "{}",
         color::stderr(
@@ -42,7 +47,7 @@ pub fn serve(
         &model_path,
         chat_options.threads,
         chat_options.ctx_size,
-        ant,
+        Some(&ant_settings),
     )?;
     let api_key = resolve_api_key(&options)?;
 

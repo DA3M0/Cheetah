@@ -257,14 +257,16 @@ Ant is Cheetah's extremely fine-grained model memory optimization for local infe
 - Generation-time budget enforcement evicts over-budget resident units and pages evicted resident units back in through the Ant manager before inference.
 - Generation-time prefetch pages evicted resident units back in ahead of inference when `--ant-prefetch-stages <n>` is configured (VRAM-tier units are preferred).
 - Per-request residency overrides accept a `resident_units` list in generation request bodies, forcing the listed atomic units to stay resident for that single request.
+- Layer-ordered residency planning fills the VRAM pool layer by layer, so the boundary layer becomes an explicitly tracked **partial layer**; the startup banner reports `ant layers: <n> full-vram, <n> partial, <n> ram, <n> disk`.
+- Every generation-time swap (override, prefetch, promotion, budget enforcement) re-checks the configured VRAM pool / RAM budget before it executes: VRAM swaps evict residents only when `--ant-allow-vram-swap` permits it, RAM-resident units are queued in layer order for promotion into VRAM as pool headroom appears, and swaps that cannot fit are skipped and counted.
 
 Ant CLI overrides for chat include `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, and `--ant-allow-vram-swap <bool>`.
 
 ### Interactive Ant preset
 
-`cheetah chat <model-path> --ant-setup true` and `cheetah init <source-dir> <destination-dir> --ant-setup true` run an interactive preset configuration (VRAM pool size, RAM budget, disk residency directory, eviction policy, prefetch stages, VRAM swap) and persist it to the model directory's user-managed Ant settings file.
+`cheetah init <source-dir> <destination-dir> --setup`, `cheetah chat <model-path> --setup`, and `cheetah serve <name-or-path> --setup` run an interactive preset configuration: it first shows the model's unit manifest context (unit count, total size, layer count), then prompts for the VRAM pool size, RAM budget, disk residency directory, eviction policy, prefetch stages, VRAM swap, and pinned resident units (comma-separated unit ids, validated against the manifest), and persists the preset to the model directory's user-managed Ant settings file. `--setup` accepts a bare flag or an explicit boolean; `--ant-setup` is an alias.
 
-After the preset is written, starting Ant requires only a bare `--ant` flag: `cheetah chat <model-path> --ant` enables Ant and loads the preset configuration (an explicit `--ant <bool>` still overrides it).
+After the preset is written, all three entry points execute Ant with exactly the configured settings: `cheetah init` replans residency and pages units in with the preset, `cheetah chat <model-path> --ant` loads the preset configuration (an explicit `--ant <bool>` still overrides it), and `cheetah serve <name-or-path>` resolves the preset against the resolved model directory, merging any `--ant*` CLI overrides on top.
 
 ### V1 not implemented
 

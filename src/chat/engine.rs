@@ -1,5 +1,5 @@
 use super::models::ModelRuntime;
-use crate::ant::{Ant, AntSettings, AntUnit};
+use crate::ant::{ant_swap_fit, Ant, AntLayerResidency, AntSettings, AntUnit};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
@@ -101,7 +101,30 @@ fn print_model_info(engine: &Engine) {
             "  ant resident: {} bytes within budget {}",
             engine.ant_resident_bytes, engine.ant_budget_bytes
         );
-        if engine.ant_resident_bytes > engine.ant_budget_bytes {
+        if !engine.ant_layer_summary.is_empty() {
+            let state_of = |wanted: &str| {
+                engine
+                    .ant_layer_summary
+                    .iter()
+                    .filter(|layer| layer.state() == wanted)
+                    .count()
+            };
+            println!(
+                "  ant layers:   {} full-vram, {} partial, {} ram, {} disk",
+                state_of("full_vram"),
+                state_of("partial"),
+                state_of("full_ram"),
+                state_of("full_disk")
+            );
+        }
+        if let Ok(state) = engine.ant_runtime.try_lock() {
+            println!(
+                "  ant swap:     {} queued for VRAM promotion, {} evicted at load",
+                state.promotion_queue.len(),
+                state.evicted.len()
+            );
+        }
+        if !engine.ant_within_budget() {
             println!(
                 "  ant warning:  resident bytes {} exceed vram budget {}",
                 engine.ant_resident_bytes, engine.ant_budget_bytes
@@ -195,13 +218,15 @@ pub struct Engine {
     eos_token_ids: HashSet<u32>,
     stop_markers: Vec<String>,
     ant_plan: std::collections::BTreeMap<String, String>,
-    ant_evicted: Vec<String>,
     ant_resident_bytes: u64,
     ant_budget_bytes: u64,
     ant_settings: Option<AntSettings>,
     ant_units: Vec<AntUnit>,
     ant_model_dir: Option<PathBuf>,
     ant_device_accelerator: bool,
+    ant_layer_summary: Vec<AntLayerResidency>,
+    ant_unit_index: std::collections::BTreeMap<String, AntUnitRuntime>,
+    ant_runtime: Mutex<AntRuntimeState>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +313,35 @@ fn ant_apply_budget(
     (resident_bytes, evicted)
 }
 
+/// Runtime residency facts for one atomic unit, resolved once at load time.
+#[derive(Debug, Clone)]
+struct AntUnitRuntime {
+    bytes: u64,
+    layer_id: i32,
+    tier: String,
+    pinned: bool,
+}
+
+/// Phase 3: cross-generation Ant bookkeeping. Tracks VRAM/RAM occupancy, the
+/// units evicted at runtime, and the in-memory (RAM-tier) units that are next
+/// in line for promotion into VRAM, so every swap re-checks the budget before
+/// it executes and only swaps in as memory becomes available.
+#[derive(Default)]
+struct AntRuntimeState {
+    vram_used_bytes: u64,
+    ram_used_bytes: u64,
+    evicted: HashSet<String>,
+    /// Disk-tier units paged in at runtime; they are resident although the
+    /// plan places them on disk.
+    runtime_resident: HashSet<String>,
+    /// RAM-tier resident units, in layer order: the in-memory portion next in
+    /// line for promotion / swapping into VRAM.
+    promotion_queue: Vec<String>,
+    swaps_in: u64,
+    swaps_out: u64,
+    swap_skips: u64,
+}
+
 impl Engine {
     pub fn load(
         path: &Path,
@@ -365,6 +419,10 @@ impl Engine {
         let mut ant_settings = ant.cloned();
         let mut ant_units: Vec<AntUnit> = Vec::new();
         let mut ant_evicted: Vec<String> = Vec::new();
+        let mut ant_layer_summary: Vec<AntLayerResidency> = Vec::new();
+        let mut ant_unit_index: std::collections::BTreeMap<String, AntUnitRuntime> =
+            std::collections::BTreeMap::new();
+        let mut ant_runtime = AntRuntimeState::default();
         if let Some(settings) = ant {
             ant_budget_bytes = settings.vram_pool_bytes;
             if settings.enabled {
@@ -389,6 +447,50 @@ impl Engine {
                             device_is_accelerator,
                         );
                         ant_resident_bytes = resident_bytes;
+                        // Phase 2: track partial-layer residency for observability.
+                        ant_layer_summary = Ant::layer_residency_summary(&units, &plan);
+                        // Phase 3: seed the runtime bookkeeping from the load plan.
+                        let mut promotion_queue: Vec<(i32, String)> = Vec::new();
+                        for unit in &units {
+                            let tier = plan
+                                .get(&unit.unit_id)
+                                .map(String::as_str)
+                                .unwrap_or("vram");
+                            let evicted = evicted_units.iter().any(|e| e == &unit.unit_id);
+                            ant_unit_index.insert(
+                                unit.unit_id.clone(),
+                                AntUnitRuntime {
+                                    bytes: unit.byte_size(),
+                                    layer_id: unit.layer_id,
+                                    tier: tier.to_string(),
+                                    pinned: settings
+                                        .resident_units
+                                        .iter()
+                                        .any(|pinned| pinned == &unit.unit_id),
+                                },
+                            );
+                            if evicted {
+                                ant_runtime.evicted.insert(unit.unit_id.clone());
+                                continue;
+                            }
+                            match tier {
+                                "vram" => {
+                                    ant_runtime.vram_used_bytes = ant_runtime
+                                        .vram_used_bytes
+                                        .saturating_add(unit.byte_size());
+                                }
+                                "ram" => {
+                                    ant_runtime.ram_used_bytes = ant_runtime
+                                        .ram_used_bytes
+                                        .saturating_add(unit.byte_size());
+                                    promotion_queue.push((unit.layer_id, unit.unit_id.clone()));
+                                }
+                                _ => {}
+                            }
+                        }
+                        promotion_queue.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                        ant_runtime.promotion_queue =
+                            promotion_queue.into_iter().map(|(_, unit_id)| unit_id).collect();
                         ant_units = units;
                         ant_evicted = evicted_units;
                     }
@@ -496,13 +598,15 @@ impl Engine {
             eos_token_ids,
             stop_markers,
             ant_plan,
-            ant_evicted,
             ant_resident_bytes,
             ant_budget_bytes,
             ant_settings,
             ant_units,
             ant_model_dir: Some(model_dir.to_path_buf()),
             ant_device_accelerator: ant_resident_device_is_accelerator,
+            ant_layer_summary,
+            ant_unit_index,
+            ant_runtime: Mutex::new(ant_runtime),
         })
     }
 
@@ -522,8 +626,129 @@ impl Engine {
         loaded.model.device_name()
     }
 
+    /// Ant: whether current runtime residency (VRAM + RAM occupancy tracked by
+    /// the Phase 3 bookkeeping) stays within the configured budget.
     pub fn ant_within_budget(&self) -> bool {
-        self.ant_resident_bytes <= self.ant_budget_bytes
+        let state = self.ant_lock_runtime();
+        state
+            .vram_used_bytes
+            .saturating_add(state.ram_used_bytes)
+            <= self.ant_budget_bytes
+    }
+
+    fn ant_lock_runtime(&self) -> std::sync::MutexGuard<'_, AntRuntimeState> {
+        self.ant_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Phase 3: page one unit in at `tier_value`, re-checking the configured
+    /// budget before the swap executes. VRAM-targeted swaps evict residents to
+    /// make room only when both VRAM swap and `allow_evict` permit it; the
+    /// budget is re-checked before each eviction and once more before the
+    /// swap-in itself, so units only swap in as memory becomes available.
+    /// Returns true when the swap-in executed.
+    fn ant_swap_in_unit(
+        &self,
+        manager: &Ant,
+        unit_id: &str,
+        tier_value: i32,
+        allow_evict: bool,
+    ) -> bool {
+        let Some(settings) = self.ant_settings.as_ref() else {
+            return false;
+        };
+        let Some(runtime) = self.ant_unit_index.get(unit_id) else {
+            return false;
+        };
+        let mut state = self.ant_lock_runtime();
+        if tier_value == 0 {
+            // Eviction candidates run from the highest layer backwards; pinned
+            // units, already-evicted units and the swap-in target never move.
+            let mut evictable: Vec<(u64, i32, String)> = self
+                .ant_unit_index
+                .iter()
+                .filter(|(candidate_id, candidate)| {
+                    candidate_id.as_str() != unit_id
+                        && candidate.tier == "vram"
+                        && !candidate.pinned
+                        && !state.evicted.contains(*candidate_id)
+                })
+                .map(|(candidate_id, candidate)| {
+                    (candidate.bytes, candidate.layer_id, candidate_id.clone())
+                })
+                .collect();
+            evictable.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+            let evictable: Vec<(u64, String)> = evictable
+                .into_iter()
+                .map(|(bytes, _, candidate_id)| (bytes, candidate_id))
+                .collect();
+            let Some(evictions) = ant_swap_fit(
+                state.vram_used_bytes,
+                settings.vram_pool_bytes,
+                runtime.bytes,
+                settings.allow_vram_swap && allow_evict,
+                &evictable,
+            ) else {
+                state.swap_skips = state.swap_skips.saturating_add(1);
+                return false;
+            };
+            if !evictions.is_empty() {
+                let Some(model_dir) = self.ant_model_dir.as_deref() else {
+                    return false;
+                };
+                for eviction in &evictions {
+                    if manager.evict_unit(model_dir, eviction).is_ok() {
+                        if let Some(evicted_runtime) = self.ant_unit_index.get(eviction) {
+                            state.vram_used_bytes = state
+                                .vram_used_bytes
+                                .saturating_sub(evicted_runtime.bytes);
+                        }
+                        state.evicted.insert(eviction.clone());
+                        state.swaps_out = state.swaps_out.saturating_add(1);
+                    }
+                }
+                // Re-check before the swap: only proceed once the pool fits.
+                if state.vram_used_bytes.saturating_add(runtime.bytes)
+                    > settings.vram_pool_bytes
+                {
+                    state.swap_skips = state.swap_skips.saturating_add(1);
+                    return false;
+                }
+            }
+            if manager.page_in(unit_id, 0).is_err() {
+                return false;
+            }
+            state.vram_used_bytes = state.vram_used_bytes.saturating_add(runtime.bytes);
+            state.swaps_in = state.swaps_in.saturating_add(1);
+            state.evicted.remove(unit_id);
+            // A VRAM swap-in leaves the promotion line.
+            state.promotion_queue.retain(|queued| queued != unit_id);
+            true
+        } else {
+            // RAM-targeted swap: enforce the RAM budget and skip when it does
+            // not fit (evicting RAM residents to disk to make room thrashes).
+            if state.ram_used_bytes.saturating_add(runtime.bytes) > settings.ram_budget_bytes {
+                state.swap_skips = state.swap_skips.saturating_add(1);
+                return false;
+            }
+            if manager.page_in(unit_id, 1).is_err() {
+                return false;
+            }
+            state.swaps_in = state.swaps_in.saturating_add(1);
+            if state.evicted.remove(unit_id)
+                || state.runtime_resident.insert(unit_id.to_string())
+            {
+                state.ram_used_bytes = state.ram_used_bytes.saturating_add(runtime.bytes);
+            }
+            // A newly RAM-resident unit joins the promotion line.
+            if runtime.tier == "ram"
+                && !state.promotion_queue.iter().any(|queued| queued == unit_id)
+            {
+                state.promotion_queue.push(unit_id.to_string());
+            }
+            true
+        }
     }
 
     fn apply_ant_request_overrides(
@@ -539,19 +764,34 @@ impl Engine {
         let Ok(manager) = Ant::with_settings(settings) else {
             return Ok(());
         };
-        for unit in &self.ant_units {
-            if !overrides.contains(&unit.unit_id) {
-                continue;
-            }
-            let tier = self
-                .ant_plan
-                .get(&unit.unit_id)
-                .and_then(|tier| Some(tier.as_str()))
-                .unwrap_or("vram");
-            if tier == "disk" || self.ant_evicted.iter().any(|e| e == &unit.unit_id) {
-                let tier_value = if tier == "vram" { 0 } else { 1 };
-                let _ = manager.page_in(&unit.unit_id, tier_value);
-            }
+        let targets: Vec<(String, i32)> = {
+            let state = self.ant_lock_runtime();
+            self.ant_units
+                .iter()
+                .filter(|unit| overrides.contains(&unit.unit_id))
+                .filter(|unit| {
+                    let tier = self
+                        .ant_plan
+                        .get(&unit.unit_id)
+                        .map(String::as_str)
+                        .unwrap_or("vram");
+                    if tier == "disk" {
+                        return true;
+                    }
+                    state.evicted.contains(&unit.unit_id)
+                })
+                .map(|unit| {
+                    let tier = self
+                        .ant_plan
+                        .get(&unit.unit_id)
+                        .map(String::as_str)
+                        .unwrap_or("vram");
+                    (unit.unit_id.clone(), if tier == "vram" { 0 } else { 1 })
+                })
+                .collect()
+        };
+        for (unit_id, tier_value) in targets {
+            let _ = self.ant_swap_in_unit(&manager, &unit_id, tier_value, true);
         }
         Ok(())
     }
@@ -562,7 +802,6 @@ impl Engine {
         };
         if !settings.enabled
             || settings.prefetch_stages <= 0
-            || self.ant_evicted.is_empty()
             || self.ant_units.is_empty()
         {
             return Ok(());
@@ -570,30 +809,72 @@ impl Engine {
         let Ok(manager) = Ant::with_settings(settings) else {
             return Ok(());
         };
-        let mut candidates: Vec<(u64, &AntUnit)> = self
-            .ant_units
-            .iter()
-            .filter(|unit| self.ant_evicted.iter().any(|e| e == &unit.unit_id))
-            .map(|unit| {
-                let tier = self
-                    .ant_plan
-                    .get(&unit.unit_id)
-                    .and_then(|tier| Some(tier.as_str()))
-                    .unwrap_or("vram");
-                (ant_tier_priority(tier), unit)
-            })
-            .collect();
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, unit) in candidates.into_iter().take(settings.prefetch_stages.max(0) as usize) {
-            let tier = self
-                .ant_plan
-                .get(&unit.unit_id)
-                .and_then(|tier| Some(tier.as_str()))
-                .unwrap_or("vram");
-            let tier_value = if tier == "vram" { 0 } else { 1 };
-            let _ = manager.page_in(&unit.unit_id, tier_value);
+        let mut candidates: Vec<(u64, i32, String, i32)> = {
+            let state = self.ant_lock_runtime();
+            if state.evicted.is_empty() {
+                return Ok(());
+            }
+            self.ant_units
+                .iter()
+                .filter(|unit| state.evicted.contains(&unit.unit_id))
+                .filter(|unit| {
+                    self.ant_plan
+                        .get(&unit.unit_id)
+                        .map(String::as_str)
+                        .unwrap_or("vram")
+                        != "disk"
+                })
+                .map(|unit| {
+                    let tier = self
+                        .ant_plan
+                        .get(&unit.unit_id)
+                        .map(String::as_str)
+                        .unwrap_or("vram");
+                    (
+                        ant_tier_priority(tier),
+                        unit.layer_id,
+                        unit.unit_id.clone(),
+                        if tier == "vram" { 0 } else { 1 },
+                    )
+                })
+                .collect()
+        };
+        candidates.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        for (_, _, unit_id, tier_value) in candidates
+            .into_iter()
+            .take(settings.prefetch_stages.max(0) as usize)
+        {
+            // Budget-checked swap-in per prefetch stage.
+            let _ = self.ant_swap_in_unit(&manager, &unit_id, tier_value, true);
         }
         Ok(())
+    }
+
+    /// Phase 3: promote the in-memory (RAM-tier) units that are next in line
+    /// into VRAM. Each swap re-checks the VRAM pool first and only executes
+    /// when the unit fits without evicting anyone; the walk stops at the first
+    /// unit that no longer fits, so later layers are never promoted at the
+    /// expense of earlier ones.
+    fn promote_ant_units(&self) {
+        let Some(settings) = self.ant_settings.as_ref() else {
+            return;
+        };
+        if !settings.enabled || self.ant_units.is_empty() {
+            return;
+        }
+        let Ok(manager) = Ant::with_settings(settings) else {
+            return;
+        };
+        let queue: Vec<String> = self.ant_lock_runtime().promotion_queue.clone();
+        for unit_id in queue {
+            if !self.ant_swap_in_unit(&manager, &unit_id, 0, false) {
+                break;
+            }
+        }
     }
 
     fn enforce_ant_budget(&self) {
@@ -606,38 +887,109 @@ impl Engine {
         let Ok(manager) = Ant::with_settings(settings) else {
             return;
         };
-        let Some(model_dir) = self.ant_model_dir.as_deref() else {
-            return;
-        };
         let units = &self.ant_units;
         let plan = &self.ant_plan;
 
-        if self.ant_evicted.is_empty() && self.ant_within_budget() {
-            return;
-        }
+        let evicted_targets: Vec<(String, i32)> = {
+            let state = self.ant_lock_runtime();
+            if state.evicted.is_empty()
+                && state
+                    .vram_used_bytes
+                    .saturating_add(state.ram_used_bytes)
+                    <= settings.vram_pool_bytes
+            {
+                return;
+            }
+            units
+                .iter()
+                .filter(|unit| state.evicted.contains(&unit.unit_id))
+                .filter(|unit| {
+                    plan.get(&unit.unit_id)
+                        .map(String::as_str)
+                        .unwrap_or("vram")
+                        != "disk"
+                })
+                .map(|unit| {
+                    let tier = plan
+                        .get(&unit.unit_id)
+                        .map(String::as_str)
+                        .unwrap_or("vram");
+                    (unit.unit_id.clone(), if tier == "vram" { 0 } else { 1 })
+                })
+                .collect()
+        };
 
         // Ant: page evicted resident-tier units back in before enforcing the
-        // memory budget again.
-        for unit in units {
-            let tier = plan
-                .get(&unit.unit_id)
-                .and_then(|tier| Some(tier.as_str()))
-                .unwrap_or("vram");
-            if tier == "disk" || !self.ant_evicted.iter().any(|e| e == &unit.unit_id) {
-                continue;
-            }
-            let tier_value = if tier == "vram" { 0 } else { 1 };
-            let _ = manager.page_in(&unit.unit_id, tier_value);
+        // memory budget again — each swap re-checks the budget first.
+        for (unit_id, tier_value) in evicted_targets {
+            self.ant_swap_in_unit(&manager, &unit_id, tier_value, true);
         }
 
-        let _resident_bytes = ant_apply_budget(
-            &manager,
-            model_dir,
-            units,
-            plan,
-            settings.vram_pool_bytes,
-            self.ant_device_accelerator,
-        );
+        let mut state = self.ant_lock_runtime();
+        let mut resident_bytes = state
+            .vram_used_bytes
+            .saturating_add(state.ram_used_bytes);
+        if resident_bytes <= settings.vram_pool_bytes || !self.ant_device_accelerator {
+            return;
+        }
+        let Some(model_dir) = self.ant_model_dir.as_deref() else {
+            return;
+        };
+        // Ant: still over budget — evict lowest-priority residents (RAM tier
+        // first, then the highest VRAM layers; pinned units never move) and
+        // update the runtime bookkeeping with every eviction.
+        let mut evictable: Vec<(u64, i32, String)> = self
+            .ant_unit_index
+            .iter()
+            .filter(|(unit_id, runtime)| {
+                if runtime.pinned || state.evicted.contains(*unit_id) {
+                    return false;
+                }
+                match runtime.tier.as_str() {
+                    "vram" => true,
+                    "ram" => true,
+                    "disk" => state.runtime_resident.contains(*unit_id),
+                    _ => false,
+                }
+            })
+            .map(|(unit_id, runtime)| {
+                (
+                    ant_tier_priority(runtime.tier.as_str()),
+                    runtime.layer_id,
+                    unit_id.clone(),
+                )
+            })
+            .collect();
+        evictable.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+        });
+        for (_, _, unit_id) in evictable {
+            if resident_bytes <= settings.vram_pool_bytes {
+                break;
+            }
+            let Some(runtime) = self.ant_unit_index.get(&unit_id) else {
+                continue;
+            };
+            if manager.evict_unit(model_dir, &unit_id).is_ok() {
+                resident_bytes = resident_bytes.saturating_sub(runtime.bytes);
+                match runtime.tier.as_str() {
+                    "vram" => {
+                        state.vram_used_bytes =
+                            state.vram_used_bytes.saturating_sub(runtime.bytes);
+                    }
+                    _ => {
+                        state.ram_used_bytes =
+                            state.ram_used_bytes.saturating_sub(runtime.bytes);
+                        state.runtime_resident.remove(&unit_id);
+                    }
+                }
+                state.evicted.insert(unit_id.clone());
+                state.promotion_queue.retain(|queued| queued != &unit_id);
+                state.swaps_out = state.swaps_out.saturating_add(1);
+            }
+        }
     }
 
     pub fn new_context(&self) -> Result<InferenceContext, String> {
@@ -787,9 +1139,12 @@ impl Engine {
         }
 
         // Ant: apply per-request residency overrides, prefetch evicted units,
-        // then enforce the resolved memory budget before generation.
+        // promote queued RAM residents into VRAM while the pool has room, then
+        // enforce the resolved memory budget before generation — every swap
+        // re-checks the budget before it executes.
         self.apply_ant_request_overrides(resident_overrides)?;
         self.prefetch_ant_units()?;
+        self.promote_ant_units();
         self.enforce_ant_budget();
 
         let loaded = self
