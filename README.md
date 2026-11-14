@@ -1,20 +1,48 @@
 # Cheetah
 
-Cheetah is a local language-model CLI and OpenAI-compatible API gateway written in Rust and C. It runs Safetensors decoder models using Candle on CPU, CUDA, or Metal; an optional Vulkan backend supports Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral inference. Cheetah can also prepare model weights for mmap-friendly loading and inspect Safetensors files.
+**Cheetah** is a local language-model CLI and OpenAI-compatible API gateway, written in Rust and C. It runs Safetensors decoder models with a self-describing prepared-model format and **Ant tiered memory** — real page-level VRAM/RAM/Disk control — across three independent backends.
 
-The quickest way to start a chat is to pass a Hugging Face model directory:
+| | |
+|---|---|
+| 🧠 **Ant tiered memory** | per-tensor VRAM/RAM/Disk residency acting on real pages — 123 MB steady RSS on a 0.5B model (vs 2.5 GB untiered) |
+| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B |
+| 🧩 **compile-time registry** | declarative registration files; adding a model family = two files, zero central edits |
+| 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
+| 🛠️ **no GGUF** | Safetensors in, self-describing prepared directory out (`cheetah init`) |
 
-```sh
-cheetah /path/to/model
+```
+                 ┌─────────────────────────────────────────────┐
+  CLI / OpenAI ──▶ Engine (chat/serve) ──▶ ModelRuntime boundary ──▶ ┐
+                 └─────────────────────────────────────────────┘      │
+                                                                      ▼
+        ┌──────────────────┬──────────────────────┬──────────────────────────┐
+        │ native (CPU)     │ Vulkan executor      │ Candle (CUDA/Metal only) │
+        │ mmap + Ant tiers │ Candle-free executor │ classic bridge           │
+        └──────────────────┴──────────────────────┴──────────────────────────┘
 ```
 
-Human-readable CLI output uses semantic colors when writing to a terminal. Colors are disabled for redirected output and when `NO_COLOR` is set. Generated model text and machine-readable JSON/API responses are not colored.
+**Newcomer paths**
 
-The directory should contain `config.json`, `tokenizer.json`, and either `model.safetensors` or `model.safetensors.index.json` with its weight shards. You can also launch `cheetah` from inside the model directory.
+- 👤 *I just want to run a model*: follow the [beginner tutorial](#beginner-tutorial) — five steps, ~10 minutes.
+- 🧑‍💻 *I want to contribute*: [CONTRIBUTING.md](CONTRIBUTING.md) → [docs/CODEBASE.md](docs/CODEBASE.md) (repository map) → pick a task in §3.
+- 🔬 *I want to understand the memory system*: [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md).
+
+**Table of contents** — [Beginner tutorial](#beginner-tutorial) · [Build](#build) · [Chat](#chat) · [Model initialization](#model-initialization) · [Ant memory optimization](#ant-memory-optimization) · [Model inspection](#model-inspection) · [API server](#openai-compatible-api-server) · [Supported models](#supported-models-and-limitations) · [Contributing](#contributing)
+
+Human-readable CLI output uses semantic colors on terminals; colors are disabled for redirected output and when `NO_COLOR` is set. Model text and machine-readable JSON/API responses are never colored.
 
 ## Beginner tutorial
 
 This section walks a new user from a clean machine to the first generated response.
+
+**Suggested learning path**
+
+| Time | Goal | Section |
+|------|------|---------|
+| ~10 min | Build and chat with a real model | this tutorial |
+| +15 min | Prepare a model with Ant and watch the tiered-memory banner | [Model initialization](#model-initialization) + [Ant memory optimization](#ant-memory-optimization) |
+| +30 min | Serve an OpenAI-compatible endpoint and hit it with curl or the Python client | [API server](#openai-compatible-api-server) |
+| First PR | Add a native model family or a kernel tweak | [CONTRIBUTING.md](CONTRIBUTING.md) → [docs/CODEBASE.md](docs/CODEBASE.md) |
 
 ### 1. Install prerequisites
 
@@ -39,11 +67,14 @@ The first build compiles dependencies and may take a while. When it finishes, th
 
 ### 3. Get a model
 
-Cheetah runs Safetensors decoder models. Point it at a Hugging Face model directory containing `config.json`, `tokenizer.json`, and `model.safetensors` (optionally with `model.safetensors.index.json` for sharded weights), or a single Safetensors file.
+Cheetah runs Safetensors decoder models. Point it at a Hugging Face model directory containing `config.json`, `tokenizer.json`, and `model.safetensors` (optionally with `model.safetensors.index.json` for sharded weights), or a single Safetensors file. To fetch one, use any HF client — for example a small Qwen2 model (~1 GB):
 
 ```sh
-cheetah /path/to/model
+huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir /tmp/qwen-0.5b
+cheetah /tmp/qwen-0.5b
 ```
+
+(No `huggingface-cli`? Download the files directly from the model page, or point Cheetah at any directory you already have with `config.json`, `tokenizer.json`, and Safetensors weights.)
 
 You can also prepare a model directory for mmap-friendly loading and Ant memory optimization:
 
@@ -171,7 +202,7 @@ On Windows, GPU builds under WSL2 additionally require the relevant GPU and driv
 
 The optional Vulkan feature uses native C compute operators for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral. See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
 
-The Vulkan paths support F32, F16, and BF16 weights. Mixtral uses the sparse-expert architecture and its configured top-k routing. Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and fall back to Candle on CPU. An error during active Vulkan inference is returned rather than silently switching devices.
+The Vulkan paths support F32, F16, and BF16 weights. Mixtral uses the sparse-expert architecture and its configured top-k routing. Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and stop with guidance (there is no silent CPU fallback). An error during active Vulkan inference is returned rather than silently switching devices.
 
 Vulkan operator tests that exercise a real device are ignored by default and require a Vulkan compute device and `glslc`:
 
@@ -242,44 +273,36 @@ The destination is generated model data: initialization replaces unsharded Safet
 
 ## Ant memory optimization
 
-Ant is Cheetah's extremely fine-grained model memory optimization for local inference. After `cheetah init`, Safetensors weights are split into atomic units, and each unit is assigned a residency tier:
+Ant is Cheetah's fine-grained model memory optimization for local inference. After `cheetah init`, Safetensors weights are split into atomic units (one per tensor), and each unit is assigned a residency tier:
 
-- **VRAM (tier 0):** resident in GPU memory; the preferred fast path.
-- **RAM (tier 1):** resident in system memory.
-- **Disk (tier 2):** not resident; paged in on demand.
+- **VRAM (tier 0):** hot resident — pages stay faulted in.
+- **RAM (tier 1):** resident — pages stay faulted in.
+- **Disk (tier 2):** cold — pages dropped with `madvise(DONTNEED)` and streamed back in per step.
 
-### Current V1 implementation
+On the default CPU path (the native backend), tiers act on **real memory pages**: a disk-tier unit contributes ~0 resident bytes, and the OS page cache absorbs re-reads. Measured on qwen-0.5b with a 16 MB/32 MB budget: steady RSS **123 MB** (vs 2,497 MB for the retired Candle CPU path) with identical output.
 
-- `cheetah init` prepares a model directory into atomic units and emits the units manifest.
-- Effective Ant settings are resolved from user-managed defaults and CLI overrides, then applied when loading the model.
-- `cheetah chat` warns when the target model has not been prepared for Ant memory optimization; run `cheetah init` first.
-- The Candle backend in V1 routes resident atomic units into the inference loader: when Ant is enabled, the inference device is resolved from the residency plan (resident VRAM units load into the accelerator device selected by `CHEETAH_DEVICE`; resident RAM-only units load through the CPU device), and only the source files of resident (VRAM/RAM) units are loaded, with disk-tier or evicted units excluded.
-- Generation-time budget enforcement evicts over-budget resident units and pages evicted resident units back in through the Ant manager before inference.
-- Generation-time prefetch pages evicted resident units back in ahead of inference when `--ant-prefetch-stages <n>` is configured (VRAM-tier units are preferred).
-- Per-request residency overrides accept a `resident_units` list in generation request bodies, forcing the listed atomic units to stay resident for that single request.
-- Layer-ordered residency planning fills the VRAM pool layer by layer, so the boundary layer becomes an explicitly tracked **partial layer**; the startup banner reports `ant layers: <n> full-vram, <n> partial, <n> ram, <n> disk`.
-- Every generation-time swap (override, prefetch, promotion, budget enforcement) re-checks the configured VRAM pool / RAM budget before it executes: VRAM swaps evict residents only when `--ant-allow-vram-swap` permits it, RAM-resident units are queued in layer order for promotion into VRAM as pool headroom appears, and swaps that cannot fit are skipped and counted.
-
-Ant CLI overrides for chat include `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, and `--ant-allow-vram-swap <bool>`.
+Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, `--ant-allow-vram-swap <bool>`.
 
 ### Interactive Ant preset
 
-`cheetah init <source-dir> <destination-dir> --setup`, `cheetah chat <model-path> --setup`, and `cheetah serve <name-or-path> --setup` run an interactive preset configuration: it first shows the model's unit manifest context (unit count, total size, layer count), then prompts for the VRAM pool size, RAM budget, disk residency directory, eviction policy, prefetch stages, VRAM swap, and pinned resident units (comma-separated unit ids, validated against the manifest), and persists the preset to the model directory's user-managed Ant settings file. `--setup` accepts a bare flag or an explicit boolean; `--ant-setup` is an alias.
+`cheetah init <source-dir> <destination-dir> --setup`, `cheetah chat <model-path> --setup`, and `cheetah serve <name-or-path> --setup` run an interactive preset configuration: it shows the model's unit context (count, size, layers), prompts for the VRAM pool, RAM budget, disk directory, eviction policy, prefetch stages, VRAM swap, and pinned resident units (validated against the manifest), and persists the preset to the model directory. `--setup` accepts a bare flag or an explicit boolean; `--ant-setup` is an alias. All three entry points then execute Ant with exactly those settings (CLI overrides still win).
 
-After the preset is written, all three entry points execute Ant with exactly the configured settings: `cheetah init` replans residency and pages units in with the preset, `cheetah chat <model-path> --ant` loads the preset configuration (an explicit `--ant <bool>` still overrides it), and `cheetah serve <name-or-path>` resolves the preset against the resolved model directory, merging any `--ant*` CLI overrides on top.
+### Backend landscape
 
-### V1 not implemented
+| Device | Backend | Notes |
+|--------|---------|-------|
+| `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3) | Ant-tiered, SIMD kernels; unregistered families report guidance |
+| `CHEETAH_DEVICE=cuda` / `metal` | Candle | Candle's only remaining role |
+| `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
 
-- True per-unit device placement inside the Candle backend (placing each resident unit on its own tier device rather than selecting one device from the resident plan); the Candle loader currently accepts a single device.
+The startup banner prints the registered backends per architecture (`backends: candle, native`). The OpenAI-compatible server accepts the same device/`--ant*` settings as chat; generation requests may additionally pass a `resident_units` override list.
 
-The OpenAI-compatible server accepts the same `--ant*` overrides as chat. Generation requests may additionally pass a `resident_units` override list.
+### Developer documentation & contributing
 
-### Future goals
-
-- Load only resident units into the selected device and page in on demand for non-resident tiers.
-- Apply the configured eviction policy and prefetch stages automatically.
-- Drive load decisions from the memory budget with per-request residency overrides.
-- Extend residency handling to the Vulkan and quantized backends.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — start here: build/test commands, step-by-step contribution workflows, the debugging toolbox, and the error-message cheat sheet.
+- [docs/CODEBASE.md](docs/CODEBASE.md) — repository map: every file's role, request data flows, module index, environment surface, test matrix, and the invariants that must not break.
+- [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) — Ant memory manager and the native backend: file formats, the parameter-resolution chain, the residency planner, page-level tier control, SIMD kernels, the comparison-test infrastructure, and the add-a-family checklist.
+- [docs/REGISTRY.md](docs/REGISTRY.md) — the model registry: declarative registration files, the generated `REGISTRY`/`ALL_ARCHITECTURES`, backend selection, and how to add an architecture, family, or backend.
 
 ## Model inspection
 
@@ -369,19 +392,39 @@ The server loads one model at a time. Generation requests are queued in arrival 
 
 ## Supported models and limitations
 
-- **Inference:** Safetensors decoder models registered for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral architectures. Candle CPU, CUDA, and Metal support depends on the selected architecture and compiled backend. Vulkan inference supports all six registered architectures with F32, F16, or BF16 weights, subject to model configuration compatibility.
+- **Inference:** Safetensors decoder models registered for Qwen2, Llama, Qwen3 (native CPU backend, Ant-tiered), plus Gemma, Mistral, Mixtral, and Phi (Candle on CUDA/Metal; Vulkan executor for all seven with F32, F16, or BF16 weights, subject to model configuration compatibility).
 - **Inspection and preparation:** Safetensors model directories and weight files.
 - **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
 
 Model inference requires enough system or GPU memory for the weights, context, and generated output. Actual performance depends on model size, backend, and hardware.
 
-## Adding model registrations
+## Contributing
 
-The build scans `src/chat/models/*.rs` (excluding shared registry/support modules) and generates the model registry. Add a Rust module with a `REGISTRATION` for architecture aliases, a prompt renderer/template id, stop markers, and a loader implementing `ModelRuntime`; no central registry edit is needed. The runtime trait supports `clone_box` so generation can keep an independent model instance per request.
+Contributions are welcome — the codebase is structured so the common tasks are mechanical:
 
-An optional same-stem `src/chat/models/<name>.comp` is discovered and compiled when building with `--features vulkan`. Its compiled path is available through `super::shader_path("<name>")`; list shader stems in the registration so Vulkan dispatch can validate them. Cargo rebuilds when model or shader sources change. `cheetah init` uses these registrations to add registered template ids and stop markers to the prepared manifest.
+- **Add a native model family** (highest value): implement the forward deltas in the shared native runner, write a declarative registration file, extend the synthetic-model comparison test. Step-by-step: [docs/REGISTRY.md](docs/REGISTRY.md) §8 and [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11. Reference migrations: llama (optional bias, untied lm_head), qwen3 (per-head q/k RMSNorm).
+- **Kernels / memory control**: the hot path is the fused BF16 gemv in `src/chat/models/native/kernels.rs` (AVX2 intrinsics with a portable fallback); Ant page control lives in `native/store.rs`. Isolation tests and the candle-comparison oracle guard correctness.
+- **Server / CLI work**: `src/serve/` and `src/cli.rs` are self-contained.
 
-See the [model integration guide](MODEL_INTEGRATION.md) for the registration contract, Candle loader example, and optional Vulkan integration details.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) (workflows, debugging toolbox, error-message cheat sheet, review checklist) and the [repository map](docs/CODEBASE.md). Model-specific Vulkan compute shaders (optional `src/chat/models/<name>.comp`) are discovered at build time and validated through the registration's shader list.
+
+## FAQ
+
+**Which backend runs on my machine?**
+`cpu` (default) → the native backend for registered families (Qwen2, Llama, Qwen3); `cuda`/`metal` → Candle; `vulkan` → the independent executor. The startup banner prints `backends: ...` for the loaded architecture.
+
+**Why did I get "no native CPU backend registered"?**
+That family does not have a native implementation yet and the Candle CPU path is retired. Use `CHEETAH_DEVICE=cuda/metal`, or contribute the family — see §3.1 above.
+
+**Why is the model directory missing `config.json` after `cheetah init`?**
+It is not required: init snapshots the model parameters into `cheetah_manifest.json`, and loading falls back to that snapshot (plus registered family defaults) when the file is absent.
+
+**My model loads but outputs look wrong.**
+Run the comparison tests (`cargo test native_`) — if the synthetic comparisons pass but your model misbehaves, the issue is likely a config/manifest mismatch rather than the kernels; check the manifest's `*_source` annotations.
+
+**Do I need a GPU?**
+No — the native CPU path is the primary backend and needs no GPU. Discrete GPUs currently accelerate less than the native CPU path on this codebase (the Vulkan executor keeps weights in host memory; small-VRAM CUDA is impractical for F32 weights).
+
 
 ## License
 
