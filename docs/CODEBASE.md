@@ -177,6 +177,8 @@ run_init_command      src/main.rs:90
 
 ## 4. Environment surface
 
+> **All variables below must be visible to the Cheetah process.** Use `export VAR=value` (persistent for the shell session) or `VAR=value ./target/release/cheetah ...` (inline, one command). A bare `VAR=value` without `export` creates a shell variable that child processes cannot see — Cheetah will silently use the default.
+
 ### 4.1 Device & backend selection
 
 | Variable | Read by | Values | Effect |

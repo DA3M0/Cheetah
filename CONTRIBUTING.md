@@ -107,6 +107,8 @@ cheetah-vulkan: device '...' (API ..., discrete=N)   ← vulkan builds only
 
 ### 4.2 Environment knobs
 
+> **⚠️ These must be `export`ed or set inline** (`VAR=value command`). A bare `VAR=value` on its own line creates a shell variable invisible to Cheetah.
+
 | Variable | Use when |
 |----------|----------|
 | `CHEETAH_DEVICE=cpu\|cuda\|metal\|vulkan` | force a device path |

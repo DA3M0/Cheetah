@@ -84,7 +84,30 @@ cheetah init /path/to/hf-model /path/to/prepared-model
 
 GGUF files are not supported; use a Safetensors conversion of the model instead.
 
-### 4. Run a chat
+### 4. Environment variables
+
+Cheetah reads several environment variables to select the backend and configure memory. These must be **visible to the Cheetah process** — either `export`ed or set inline:
+
+```sh
+# Inline (one command only — the variable is gone after the command exits):
+CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/model
+
+# Export (persists for the entire shell session — all subsequent commands see it):
+export CHEETAH_DEVICE=vulkan
+./target/release/cheetah /path/to/model
+```
+
+> **⚠️ Common pitfall:** writing `CHEETAH_DEVICE=vulkan` on its own line **without `export`** creates a shell variable that child processes cannot see. Cheetah will silently fall back to the default (`cpu`) — no error is printed. Always use `export` or the inline prefix form.
+
+Key variables (full list in [docs/CODEBASE.md](docs/CODEBASE.md) §4):
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `CHEETAH_DEVICE` | `cpu` / `cuda` / `metal` / `vulkan` | `cpu` (native backend) |
+| `CHEETAH_QUANT_Q8` | `1` / `0` | `0` (full precision) |
+| `CHEETAH_VRAM_POOL_SIZE` | bytes | `838860800` (800 MiB) |
+
+### 5. Run a chat
 
 ```sh
 cheetah /path/to/model
@@ -96,7 +119,7 @@ Then type a message at the `> ` prompt and press Enter. Use `/exit` to quit, `/c
 cheetah /path/to/small-model --ctx-size 1024 --max-tokens 128
 ```
 
-### 5. Try the OpenAI-compatible server
+### 6. Try the OpenAI-compatible server
 
 ```sh
 cheetah serve /path/to/model --port 8080
@@ -170,14 +193,14 @@ GPU support must be compiled in and selected at runtime. Build only the backend 
 
 ```sh
 cargo build --release --features cuda
-CHEETAH_DEVICE=cuda ./target/release/cheetah /path/to/model
+CHEETAH_DEVICE=cuda ./target/release/cheetah /path/to/model   # inline = one-shot
 ```
 
 **Apple Metal (macOS):** install Xcode command-line tools, then build and run:
 
 ```sh
 cargo build --release --features metal
-CHEETAH_DEVICE=metal ./target/release/cheetah /path/to/model
+CHEETAH_DEVICE=metal ./target/release/cheetah /path/to/model   # inline = one-shot
 ```
 
 **Vulkan:** install a Vulkan development environment with headers, the loader/runtime, a C compiler, and `glslc`. On Ubuntu or Debian, the development packages are:
@@ -185,7 +208,7 @@ CHEETAH_DEVICE=metal ./target/release/cheetah /path/to/model
 ```sh
 sudo apt install -y build-essential libvulkan-dev glslc
 cargo build --release --features vulkan
-CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/qwen2-model
+CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/qwen2-model   # inline = one-shot
 ```
 
 You also need a Vulkan-capable device and its driver. If `glslc` is not on `PATH`, set `GLSLC` to its executable path before building. Vulkan inference is available for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral when built with `--features vulkan`; support still depends on compatible model configuration and weights. Vulkan builds on platforms other than Linux require a compatible Vulkan SDK and loader and are not covered by the package commands above.
@@ -290,7 +313,7 @@ Ant is Cheetah's fine-grained model memory optimization for local inference. Aft
 - **RAM (tier 1):** resident — pages stay faulted in.
 - **Disk (tier 2):** cold — pages dropped with `madvise(DONTNEED)` and streamed back in per step.
 
-Set `CHEETAH_QUANT_Q8=1` to quantize linear projections to row-wise int8 (halves the weight footprint for the native CPU and Vulkan backends; norms, biases and embeddings stay in original precision).
+Set `export CHEETAH_QUANT_Q8=1` (or inline `CHEETAH_QUANT_Q8=1 cheetah ...`) to quantize linear projections to row-wise int8 (halves the weight footprint for the native CPU and Vulkan backends; norms, biases and embeddings stay in original precision).
 
 On the default CPU path (the native backend), tiers act on **real memory pages**: a disk-tier unit contributes ~0 resident bytes, and the OS page cache absorbs re-reads. Measured on qwen-0.5b with a 16 MB/32 MB budget: steady RSS **123 MB** (vs 2,497 MB for the retired Candle CPU path) with identical output.
 
@@ -308,7 +331,7 @@ Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `-
 | `CHEETAH_DEVICE=cuda` / `metal` | Candle | Candle's only remaining role |
 | `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; Ant bucketed residency (VRAM/streams); Q8 quantization; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
 
-The startup banner prints the registered backends per architecture (`backends: candle, native`). The OpenAI-compatible server accepts the same device/`--ant*` settings as chat; generation requests may additionally pass a `resident_units` override list.
+The startup banner prints the registered backends per architecture (`backends: candle, native`) and the resolved device (`device: native-cpu` / `device: Vulkan`). If the device does not match your expectation, check that `CHEETAH_DEVICE` is exported — an unexported variable silently falls back to the default. The OpenAI-compatible server accepts the same device/`--ant*` settings as chat; generation requests may additionally pass a `resident_units` override list.
 
 ### Developer documentation & contributing
 
