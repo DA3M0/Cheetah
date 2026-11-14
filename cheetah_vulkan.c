@@ -43,6 +43,7 @@ typedef struct VulkanState {
     VkInstance instance;
     VkPhysicalDevice physical_device;
     VkPhysicalDeviceProperties properties;
+    VkPhysicalDeviceMemoryProperties memory_properties;
     VkDevice device;
     VkQueue compute_queue;
     uint32_t queue_family_index;
@@ -245,6 +246,8 @@ static int select_physical_device(VkDeviceSize pool_size) {
                 g_vulkan.queue_family_index = family;
                 vkGetPhysicalDeviceProperties(devices[i],
                                                &g_vulkan.properties);
+                vkGetPhysicalDeviceMemoryProperties(
+                    devices[i], &g_vulkan.memory_properties);
                 fprintf(stderr,
                         "cheetah-vulkan: device '%s' (API %u.%u.%u, "
                         "discrete=%d)\n",
@@ -1713,4 +1716,513 @@ uint32_t vk_get_compute_queue_family_index(void) {
 
 VkCommandPool vk_get_compute_command_pool(void) {
     return g_vulkan.initialized ? g_vulkan.command_pool : VK_NULL_HANDLE;
+}
+
+
+/* ---- Ant resident bucket: persistent weight buffers ----
+ *
+ * Weights uploaded here live in device-local memory (real VRAM) when the
+ * device offers it, and fall back to a persistent host-coherent allocation
+ * otherwise. Uploads are immutable: the executor keeps the authoritative host
+ * copy, so an eviction only releases the device allocation and a page-in
+ * re-uploads from it. Matmul over a resident weight binds its buffer
+ * directly — no per-step weight copy through the pool. */
+
+typedef struct {
+    uint64_t handle;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDeviceSize size;
+    uint32_t weight_format;   /* 0 = f32, 2 = bf16, 3 = f16 (matches matmul) */
+    uint64_t element_count;
+    int device_local;
+} ResidentWeight;
+
+static ResidentWeight *g_resident_weights = NULL;
+static size_t g_resident_weight_count = 0;
+static size_t g_resident_weight_capacity = 0;
+static uint64_t g_resident_weight_next_handle = 1;
+
+static int select_device_local_memory_type(uint32_t type_bits,
+                                           VkDeviceSize required_size,
+                                           uint32_t *index_out) {
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+        if ((type_bits & (1U << bit)) == 0) {
+            continue;
+        }
+        if ((g_vulkan.memory_properties.memoryTypes[bit].propertyFlags &
+             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+            continue;
+        }
+        uint32_t heap_index =
+            g_vulkan.memory_properties.memoryTypes[bit].heapIndex;
+        if (heap_index >= VK_MAX_MEMORY_HEAPS) {
+            continue;
+        }
+        if (g_vulkan.memory_properties.memoryHeaps[heap_index].size >=
+            required_size) {
+            *index_out = bit;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static ResidentWeight *find_resident_weight(uint64_t handle) {
+    for (size_t i = 0; i < g_resident_weight_count; ++i) {
+        if (g_resident_weights[i].handle == handle) {
+            return &g_resident_weights[i];
+        }
+    }
+    return NULL;
+}
+
+/* Upload one BF16 weight tensor. Returns a nonzero handle, or 0 when the
+ * upload cannot be served (callers keep the host-side streaming path). */
+uint64_t cheetah_vulkan_weight_upload_bf16(const uint16_t *weights,
+                                           uint64_t element_count) {
+    VkMemoryRequirements memory_requirements;
+    VkMemoryAllocateInfo memory_info;
+    VkBufferCreateInfo buffer_info;
+    ResidentWeight *record = NULL;
+    ResidentWeight *grown = NULL;
+    void *staging = NULL;
+    VkBuffer staging_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo command_allocate_info;
+    VkCommandBufferBeginInfo command_begin_info;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkBufferCopy copy_region;
+    VkSubmitInfo submit_info;
+    VkFenceCreateInfo fence_info;
+    VkFence fence = VK_NULL_HANDLE;
+    VkBool32 submitted = VK_FALSE;
+    uint64_t handle = 0;
+    VkDeviceSize byte_size;
+    uint32_t memory_type = 0;
+    int device_local = 0;
+    int command_allocated = 0;
+    int registered = 0;
+
+    if (!g_vulkan.initialized) {
+        report_error("weight upload called before Vulkan initialization");
+        return 0;
+    }
+    if (element_count == 0 ||
+        element_count > (uint64_t)g_vulkan.properties.limits.
+                            maxStorageBufferRange / sizeof(uint16_t) ||
+        element_count > (uint64_t)SIZE_MAX / sizeof(uint16_t)) {
+        return 0;
+    }
+    byte_size = element_count * (VkDeviceSize)sizeof(uint16_t);
+    if (byte_size > g_vulkan.properties.limits.maxStorageBufferRange) {
+        return 0; /* larger than a storage binding; keep the streaming path */
+    }
+
+    memset(&buffer_info, 0, sizeof(buffer_info));
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = byte_size;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(g_vulkan.device, &buffer_info, NULL,
+                       &staging_buffer) != VK_SUCCESS) {
+        return 0;
+    }
+    vkGetBufferMemoryRequirements(g_vulkan.device, staging_buffer,
+                                  &memory_requirements);
+    if (memory_requirements.size < byte_size) {
+        memory_requirements.size = byte_size;
+    }
+    /* Prefer real VRAM; fall back to a persistent host-coherent allocation. */
+    if (select_device_local_memory_type(memory_requirements.memoryTypeBits,
+                                        memory_requirements.size,
+                                        &memory_type) == 0) {
+        device_local = 1;
+    } else if (select_pool_memory_type(memory_requirements.memoryTypeBits,
+                                       memory_requirements.size,
+                                       &memory_type) != 0) {
+        vkDestroyBuffer(g_vulkan.device, staging_buffer, NULL);
+        return 0;
+    }
+
+    memset(&memory_info, 0, sizeof(memory_info));
+    memory_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memory_info.allocationSize = memory_requirements.size;
+    memory_info.memoryTypeIndex = memory_type;
+    if (vkAllocateMemory(g_vulkan.device, &memory_info, NULL,
+                         &staging_memory) != VK_SUCCESS) {
+        vkDestroyBuffer(g_vulkan.device, staging_buffer, NULL);
+        return 0;
+    }
+    if (vkBindBufferMemory(g_vulkan.device, staging_buffer, staging_memory,
+                           0) != VK_SUCCESS) {
+        goto cleanup;
+    }
+
+    if (device_local) {
+        /* Stage through the host pool, copy on the transfer queue. */
+        staging = vk_alloc_vram((size_t)byte_size);
+        if (staging == NULL) {
+            goto cleanup;
+        }
+        memcpy(staging, weights, (size_t)byte_size);
+        memset(&command_allocate_info, 0, sizeof(command_allocate_info));
+        command_allocate_info.sType =
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        command_allocate_info.commandPool = g_vulkan.command_pool;
+        command_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command_allocate_info.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(g_vulkan.device, &command_allocate_info,
+                                     &command_buffer) != VK_SUCCESS) {
+            goto cleanup;
+        }
+        command_allocated = 1;
+        memset(&command_begin_info, 0, sizeof(command_begin_info));
+        command_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        command_begin_info.flags =
+            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(command_buffer, &command_begin_info) !=
+            VK_SUCCESS) {
+            goto cleanup;
+        }
+        copy_region.srcOffset = 0;
+        copy_region.dstOffset = 0;
+        copy_region.size = byte_size;
+        vkCmdCopyBuffer(command_buffer, g_vulkan.pool_buffer, staging_buffer,
+                        1, &copy_region);
+        if (vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+            goto cleanup;
+        }
+        memset(&submit_info, 0, sizeof(submit_info));
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &command_buffer;
+        memset(&fence_info, 0, sizeof(fence_info));
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(g_vulkan.device, &fence_info, NULL, &fence) !=
+            VK_SUCCESS) {
+            goto cleanup;
+        }
+        if (vkQueueSubmit(g_vulkan.compute_queue, 1, &submit_info, fence) !=
+            VK_SUCCESS) {
+            goto cleanup;
+        }
+        submitted = VK_TRUE;
+        if (vkWaitForFences(g_vulkan.device, 1, &fence, VK_TRUE,
+                            UINT64_MAX) != VK_SUCCESS) {
+            goto cleanup;
+        }
+        vk_free_vram(staging);
+        staging = NULL;
+    } else {
+        /* Persistent host-coherent allocation: write through the mapping. */
+        void *mapped = NULL;
+        if (vkMapMemory(g_vulkan.device, staging_memory, 0, byte_size, 0,
+                        &mapped) != VK_SUCCESS) {
+            goto cleanup;
+        }
+        memcpy(mapped, weights, (size_t)byte_size);
+        vkUnmapMemory(g_vulkan.device, staging_memory);
+    }
+
+    handle = g_resident_weight_next_handle++;
+    grown = (ResidentWeight *)realloc(
+        g_resident_weights,
+        (g_resident_weight_count + 1) * sizeof(*g_resident_weights));
+    if (grown == NULL) {
+        handle = 0;
+        goto cleanup;
+    }
+    g_resident_weights = grown;
+    g_resident_weight_capacity = g_resident_weight_count + 1;
+    record = &g_resident_weights[g_resident_weight_count];
+    record->handle = handle;
+    record->buffer = staging_buffer;
+    record->memory = staging_memory;
+    record->size = byte_size;
+    record->weight_format = 2; /* bf16 */
+    record->element_count = element_count;
+    record->device_local = device_local;
+    g_resident_weight_count += 1;
+    registered = 1;
+    staging_buffer = VK_NULL_HANDLE;
+    staging_memory = VK_NULL_HANDLE;
+
+cleanup:
+    if (!registered) {
+        if (staging != NULL) {
+            vk_free_vram(staging);
+        }
+        if (staging_buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(g_vulkan.device, staging_buffer, NULL);
+        }
+        if (staging_memory != VK_NULL_HANDLE) {
+            vkFreeMemory(g_vulkan.device, staging_memory, NULL);
+        }
+        handle = 0;
+    }
+    if (command_allocated && command_buffer != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(g_vulkan.device, g_vulkan.command_pool, 1,
+                             &command_buffer);
+    }
+    if (fence != VK_NULL_HANDLE) {
+        vkDestroyFence(g_vulkan.device, fence, NULL);
+    }
+    (void)submitted;
+    return handle;
+}
+
+int cheetah_vulkan_weight_release(uint64_t handle) {
+    ResidentWeight *record = NULL;
+    size_t index = 0;
+
+    for (size_t i = 0; i < g_resident_weight_count; ++i) {
+        if (g_resident_weights[i].handle == handle) {
+            record = &g_resident_weights[i];
+            index = i;
+            break;
+        }
+    }
+    if (record == NULL) {
+        return -1;
+    }
+    if (record->device_local) {
+        vkDestroyBuffer(g_vulkan.device, record->buffer, NULL);
+        vkFreeMemory(g_vulkan.device, record->memory, NULL);
+    } else {
+        vk_free_vram(record->buffer);
+    }
+    memmove(&g_resident_weights[index], &g_resident_weights[index + 1],
+            (g_resident_weight_count - index - 1) * sizeof(*g_resident_weights));
+    g_resident_weight_count -= 1;
+    return 0;
+}
+
+/* C[M,N] = A[M,K] * weight^T over a resident weight buffer. The weight stays
+ * bound in place — only A and C pass through the host pool. */
+int vk_matmul_bf16_transposed_resident_checked(uint64_t weight_handle,
+                                               const float *a, float *c,
+                                               int m, int k, int n) {
+    VkDescriptorPoolSize descriptor_pool_size;
+    VkDescriptorPoolCreateInfo descriptor_pool_info;
+    VkDescriptorSetAllocateInfo descriptor_allocate_info;
+    VkDescriptorBufferInfo buffer_infos[3];
+    VkWriteDescriptorSet descriptor_writes[3];
+    VkCommandBufferAllocateInfo command_allocate_info;
+    VkCommandBufferBeginInfo command_begin_info;
+    VkSubmitInfo submit_info;
+    VkFenceCreateInfo fence_info;
+    uint32_t dimensions[4];
+    VkBuffer pool_buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset_a = 0;
+    VkDeviceSize offset_c = 0;
+    VkDeviceSize size_a = 0;
+    VkDeviceSize size_c = 0;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    void *device_a = NULL;
+    void *device_c = NULL;
+    ResidentWeight *weight = NULL;
+    int status = -1;
+    int command_allocated = 0;
+    int descriptor_allocated = 0;
+    int descriptor_pool_created = 0;
+    int submitted = 0;
+    VkBool32 wait_succeeded = 0;
+    VkDeviceSize bytes_a;
+    VkDeviceSize bytes_c;
+    uint32_t groups_x;
+    uint32_t groups_y;
+
+    if (!g_vulkan.initialized) {
+        report_error("resident matmul called before Vulkan initialization");
+        return -1;
+    }
+    if (m <= 0 || k <= 0 || n <= 0) {
+        report_error("resident matmul dimensions must be positive");
+        return -1;
+    }
+    weight = find_resident_weight(weight_handle);
+    if (weight == NULL) {
+        report_error("resident matmul called with an unknown weight handle");
+        return -1;
+    }
+    bytes_a = (VkDeviceSize)m * (VkDeviceSize)k * sizeof(float);
+    bytes_c = (VkDeviceSize)m * (VkDeviceSize)n * sizeof(float);
+    if (bytes_a > g_vulkan.properties.limits.maxStorageBufferRange ||
+        bytes_c > g_vulkan.properties.limits.maxStorageBufferRange) {
+        report_error("resident matmul allocation exceeds maxStorageBufferRange");
+        return -1;
+    }
+    if ((VkDeviceSize)weight->element_count * sizeof(uint16_t) >
+        g_vulkan.properties.limits.maxStorageBufferRange) {
+        report_error("resident weight exceeds maxStorageBufferRange");
+        return -1;
+    }
+    groups_x = ((uint32_t)n + 15U) / 16U;
+    groups_y = ((uint32_t)m + 15U) / 16U;
+    if (groups_x > g_vulkan.properties.limits.maxComputeWorkGroupCount[0] ||
+        groups_y > g_vulkan.properties.limits.maxComputeWorkGroupCount[1]) {
+        report_error("matrix dimensions exceed device compute dispatch limits");
+        return -1;
+    }
+
+    matmul_lock();
+    if (ensure_matmul_pipeline(1) != 0) {
+        matmul_unlock();
+        return -1;
+    }
+    matmul_unlock();
+
+    device_a = vk_alloc_vram((size_t)bytes_a);
+    device_c = vk_alloc_vram((size_t)bytes_c);
+    if (device_a == NULL || device_c == NULL) {
+        goto cleanup;
+    }
+    memcpy(device_a, a, (size_t)bytes_a);
+    memset(device_c, 0, (size_t)bytes_c);
+    if (vk_get_vram_allocation(device_a, &pool_buffer, &offset_a, &size_a) !=
+            0 ||
+        vk_get_vram_allocation(device_c, &pool_buffer, &offset_c, &size_c) !=
+            0) {
+        goto cleanup;
+    }
+    if (pool_buffer == VK_NULL_HANDLE) {
+        goto cleanup;
+    }
+
+    memset(&descriptor_pool_size, 0, sizeof(descriptor_pool_size));
+    descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptor_pool_size.descriptorCount = 3;
+    memset(&descriptor_pool_info, 0, sizeof(descriptor_pool_info));
+    descriptor_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    descriptor_pool_info.maxSets = 1;
+    descriptor_pool_info.poolSizeCount = 1;
+    descriptor_pool_info.pPoolSizes = &descriptor_pool_size;
+    if (vkCreateDescriptorPool(g_vulkan.device, &descriptor_pool_info, NULL,
+                               &descriptor_pool) != VK_SUCCESS) {
+        goto cleanup;
+    }
+    descriptor_pool_created = 1;
+    memset(&descriptor_allocate_info, 0,
+           sizeof(descriptor_allocate_info));
+    descriptor_allocate_info.sType =
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    descriptor_allocate_info.descriptorPool = descriptor_pool;
+    descriptor_allocate_info.descriptorSetCount = 1;
+    descriptor_allocate_info.pSetLayouts = &g_matmul_descriptor_layout;
+    if (vkAllocateDescriptorSets(g_vulkan.device, &descriptor_allocate_info,
+                                 &descriptor_set) != VK_SUCCESS) {
+        goto cleanup;
+    }
+    descriptor_allocated = 1;
+
+    buffer_infos[0].buffer = pool_buffer;
+    buffer_infos[0].offset = offset_a;
+    buffer_infos[0].range = size_a;
+    buffer_infos[1].buffer = weight->buffer;
+    buffer_infos[1].offset = 0;
+    buffer_infos[1].range = weight->size;
+    buffer_infos[2].buffer = pool_buffer;
+    buffer_infos[2].offset = offset_c;
+    buffer_infos[2].range = size_c;
+    memset(descriptor_writes, 0, sizeof(descriptor_writes));
+    for (uint32_t i = 0; i < 3; ++i) {
+        descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptor_writes[i].dstSet = descriptor_set;
+        descriptor_writes[i].dstBinding = i;
+        descriptor_writes[i].descriptorCount = 1;
+        descriptor_writes[i].descriptorType =
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(g_vulkan.device, 3, descriptor_writes, 0, NULL);
+
+    memset(&command_allocate_info, 0, sizeof(command_allocate_info));
+    command_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_allocate_info.commandPool = g_vulkan.command_pool;
+    command_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_allocate_info.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(g_vulkan.device, &command_allocate_info,
+                                 &command_buffer) != VK_SUCCESS) {
+        goto cleanup;
+    }
+    command_allocated = 1;
+    memset(&command_begin_info, 0, sizeof(command_begin_info));
+    command_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    command_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(command_buffer, &command_begin_info) !=
+        VK_SUCCESS) {
+        goto cleanup;
+    }
+    dimensions[0] = (uint32_t)m;
+    dimensions[1] = (uint32_t)k;
+    dimensions[2] = (uint32_t)n;
+    dimensions[3] = 1U; /* transpose_b */
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      g_matmul_bf16_pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            g_matmul_pipeline_layout, 0, 1, &descriptor_set,
+                            0, NULL);
+    vkCmdPushConstants(command_buffer, g_matmul_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dimensions),
+                       dimensions);
+    vkCmdDispatch(command_buffer, groups_x, groups_y, 1);
+    if (vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+        goto cleanup;
+    }
+    memset(&fence_info, 0, sizeof(fence_info));
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(g_vulkan.device, &fence_info, NULL, &fence) !=
+        VK_SUCCESS) {
+        goto cleanup;
+    }
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+    if (vkQueueSubmit(g_vulkan.compute_queue, 1, &submit_info, fence) !=
+        VK_SUCCESS) {
+        goto cleanup;
+    }
+    submitted = 1;
+    if (vkWaitForFences(g_vulkan.device, 1, &fence, VK_TRUE, UINT64_MAX) !=
+        VK_SUCCESS) {
+        goto cleanup;
+    }
+    wait_succeeded = 1;
+    memcpy(c, device_c, (size_t)bytes_c);
+    status = 0;
+
+cleanup:
+    if (wait_succeeded && device_c != NULL) {
+        /* result already copied back */
+    }
+    if (device_a != NULL) {
+        vk_free_vram(device_a);
+    }
+    if (device_c != NULL) {
+        vk_free_vram(device_c);
+    }
+    if (fence != VK_NULL_HANDLE) {
+        vkDestroyFence(g_vulkan.device, fence, NULL);
+    }
+    if (command_allocated && command_buffer != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(g_vulkan.device, g_vulkan.command_pool, 1,
+                             &command_buffer);
+    }
+    if (descriptor_allocated && descriptor_set != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(g_vulkan.device, descriptor_pool, 1,
+                             &descriptor_set);
+    }
+    if (descriptor_pool_created && descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(g_vulkan.device, descriptor_pool, NULL);
+    }
+    if (status != 0 && submitted != 0 && !wait_succeeded) {
+        report_error("resident matmul submission failed");
+    }
+    return status;
 }

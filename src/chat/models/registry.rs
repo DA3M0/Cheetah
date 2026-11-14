@@ -40,6 +40,7 @@ pub(in crate::chat) fn load_model(
     config_bytes: &[u8],
     raw_config: Value,
     architecture: &str,
+    plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
     let model_registration = super::registration_for_architecture(architecture)?;
     let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
@@ -71,6 +72,7 @@ pub(in crate::chat) fn load_model(
             raw_config,
             architecture,
             model_registration,
+            plan,
         ),
     }
 }
@@ -102,6 +104,7 @@ pub(in crate::chat) fn load_model_for_device(
     raw_config: Value,
     architecture: &str,
     device: Device,
+    plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
     if std::env::var("CHEETAH_DEVICE")
         .unwrap_or_else(|_| "cpu".into())
@@ -114,6 +117,7 @@ pub(in crate::chat) fn load_model_for_device(
             raw_config,
             architecture,
             model_registration,
+            plan,
         );
     }
     let model_registration = super::registration_for_architecture(architecture)?;
@@ -134,6 +138,7 @@ fn load_vulkan_or_fallback(
     raw_config: Value,
     _architecture: &str,
     model_registration: &'static ModelRegistration,
+    plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
     #[cfg(feature = "vulkan")]
     match model_registration.loader_for("vulkan") {
@@ -154,7 +159,8 @@ fn load_vulkan_or_fallback(
                     )
                 );
             } else {
-                let vulkan_model = (|| loader(weight_paths, config_bytes, raw_config.clone()))();
+                let vulkan_model =
+                    (|| loader(weight_paths, config_bytes, raw_config.clone(), plan))();
                 match vulkan_model {
                     Ok(executor) => return Ok((Device::Cpu, executor)),
                     Err(error) => {

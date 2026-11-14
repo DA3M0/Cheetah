@@ -1,5 +1,6 @@
 use crate::color::{self, Color};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+use std::collections::BTreeMap;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -523,6 +524,16 @@ struct NamedWeight {
     data: WeightData,
 }
 
+/// Ant residency slot for one weight tensor: Some = resident in the GPU
+/// bucket (device-local when available, persistent host-coherent otherwise);
+/// None = streaming path (weights re-staged per matmul from host memory).
+#[derive(Clone)]
+struct VulkanWeightSlot {
+    handle: u64,
+    element_count: usize,
+    device_local: bool,
+}
+
 #[derive(Clone)]
 struct Linear {
     name: String,
@@ -530,6 +541,7 @@ struct Linear {
     output_size: usize,
     weight: WeightData,
     bias: Option<WeightData>,
+    slot: Option<VulkanWeightSlot>,
 }
 
 impl Linear {
@@ -722,17 +734,139 @@ impl super::models::ModelRuntime for VulkanTransformerExecutor {
     fn device_name(&self) -> &'static str {
         "Vulkan"
     }
+
+    fn as_ant_tier_control(&mut self) -> Option<&mut dyn super::models::AntTierControl> {
+        Some(self)
+    }
+}
+
+impl VulkanTransformerExecutor {
+    /// Ant bucketing: page one weight tensor between the GPU bucket
+    /// (persistent upload) and the host-streaming bucket. The host copy in
+    /// `WeightData` is always authoritative, so eviction only releases the
+    /// device allocation and a page-in re-uploads from it.
+    fn page_weight(&mut self, unit_id: &str, resident: bool) -> bool {
+        let mut handled = false;
+        for layer in &mut self.layers {
+            for linear in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+            ] {
+                if linear.name != unit_id {
+                    continue;
+                }
+                handled = true;
+                match (resident, &mut linear.slot) {
+                    (true, slot @ None) => {
+                        *slot = upload_slot(&linear.name, &linear.weight);
+                    }
+                    (false, slot @ Some(_)) => {
+                        if let Some(slot) = slot.take() {
+                            cheetah::native::vulkan::weight_release(slot.handle);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match &mut layer.feed_forward {
+                FeedForward::Dense { gate, up, down, .. } => {
+                    for linear in [gate, up, down] {
+                        if linear.name != unit_id {
+                            continue;
+                        }
+                        handled = true;
+                        match (resident, &mut linear.slot) {
+                            (true, slot @ None) => {
+                                *slot = upload_slot(&linear.name, &linear.weight);
+                            }
+                            (false, slot @ Some(_)) => {
+                                if let Some(slot) = slot.take() {
+                                    cheetah::native::vulkan::weight_release(slot.handle);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                FeedForward::MixtureOfExperts {
+                    router,
+                    experts,
+                    ..
+                } => {
+                    for linear in
+                        std::iter::once(&mut *router).chain(experts.iter_mut().flat_map(
+                            |expert| [&mut expert.gate, &mut expert.up, &mut expert.down],
+                        ))
+                    {
+                        if linear.name != unit_id {
+                            continue;
+                        }
+                        handled = true;
+                        match (resident, &mut linear.slot) {
+                            (true, slot @ None) => {
+                                *slot = upload_slot(&linear.name, &linear.weight);
+                            }
+                            (false, slot @ Some(_)) => {
+                                if let Some(slot) = slot.take() {
+                                    cheetah::native::vulkan::weight_release(slot.handle);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        handled
+    }
+}
+
+impl super::models::AntTierControl for VulkanTransformerExecutor {
+    fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
+        self.page_weight(unit_id, true)
+    }
+
+    fn evict_unit(&mut self, unit_id: &str) -> bool {
+        self.page_weight(unit_id, false)
+    }
+}
+
+/// Upload one linear weight into the resident bucket; returns None when the
+/// backend cannot serve it (then the streaming path stays active).
+fn upload_slot(name: &str, weight: &WeightData) -> Option<VulkanWeightSlot> {
+    match weight {
+        WeightData::BF16(values) => {
+            cheetah::native::vulkan::weight_upload_bf16(values).map(|handle| {
+                eprintln!(
+                    "{}",
+                    color::stderr(
+                        &format!("cheetah: Ant page-in '{name}' -> GPU bucket."),
+                        Color::Green
+                    )
+                );
+                VulkanWeightSlot {
+                    handle,
+                    element_count: values.len(),
+                    device_local: true,
+                }
+            })
+        }
+        _ => None,
+    }
 }
 
 impl VulkanTransformerExecutor {
     pub(crate) fn load(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
+        plan: &BTreeMap<String, String>,
     ) -> Result<Self, String> {
         let result = (|| {
             cheetah::native::vulkan::initialize()?;
             cheetah::native::vulkan::prepare()?;
-            Self::load_initialized(paths, config)
+            Self::load_initialized(paths, config, plan)
         })();
         if result.is_err()
             && let Err(shutdown_error) = cheetah::native::vulkan::shutdown()
@@ -753,6 +887,7 @@ impl VulkanTransformerExecutor {
     fn load_initialized(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
+        plan: &BTreeMap<String, String>,
     ) -> Result<Self, String> {
         let head_dim = config.head_dim;
         let kv_size = config.num_key_value_heads * head_dim;
@@ -841,6 +976,7 @@ impl VulkanTransformerExecutor {
                 TransformerFeedForwardFeatures::Dense => FeedForward::Dense {
                     gate: take_linear(
                         &mut weights,
+                        plan,
                         &format!("{prefix}.{}", layout.dense_gate),
                         config.hidden_size,
                         config.intermediate_size,
@@ -848,6 +984,7 @@ impl VulkanTransformerExecutor {
                     )?,
                     up: take_linear(
                         &mut weights,
+                        plan,
                         &format!("{prefix}.{}", layout.dense_up),
                         config.hidden_size,
                         config.intermediate_size,
@@ -855,6 +992,7 @@ impl VulkanTransformerExecutor {
                     )?,
                     down: take_linear(
                         &mut weights,
+                        plan,
                         &format!("{prefix}.{}", layout.dense_down),
                         config.intermediate_size,
                         config.hidden_size,
@@ -873,6 +1011,7 @@ impl VulkanTransformerExecutor {
                     down,
                 } => load_moe_feed_forward(
                     &mut weights,
+                    plan,
                     &prefix,
                     config,
                     *num_experts,
@@ -892,6 +1031,7 @@ impl VulkanTransformerExecutor {
                 k_norm,
                 q_proj: take_linear(
                     &mut weights,
+                    plan,
                     &format!("{attention}.{}", layout.q_proj),
                     config.hidden_size,
                     config.num_attention_heads * head_dim,
@@ -899,6 +1039,7 @@ impl VulkanTransformerExecutor {
                 )?,
                 k_proj: take_linear(
                     &mut weights,
+                    plan,
                     &format!("{attention}.{}", layout.k_proj),
                     config.hidden_size,
                     kv_size,
@@ -906,6 +1047,7 @@ impl VulkanTransformerExecutor {
                 )?,
                 v_proj: take_linear(
                     &mut weights,
+                    plan,
                     &format!("{attention}.{}", layout.v_proj),
                     config.hidden_size,
                     kv_size,
@@ -913,6 +1055,7 @@ impl VulkanTransformerExecutor {
                 )?,
                 o_proj: take_linear(
                     &mut weights,
+                    plan,
                     &format!("{attention}.{}", layout.o_proj),
                     config.num_attention_heads * head_dim,
                     config.hidden_size,
@@ -1063,6 +1206,7 @@ impl VulkanTransformerExecutor {
 
 fn load_moe_feed_forward(
     weights: &mut HashMap<String, NamedWeight>,
+    plan: &BTreeMap<String, String>,
     prefix: &str,
     config: &VulkanTransformerConfig,
     num_experts: usize,
@@ -1076,6 +1220,7 @@ fn load_moe_feed_forward(
 ) -> Result<FeedForward, String> {
     let router = take_linear(
         weights,
+        plan,
         &format!("{prefix}.{router_layout}"),
         config.hidden_size,
         num_experts,
@@ -1087,6 +1232,7 @@ fn load_moe_feed_forward(
         experts.push(Expert {
             gate: take_linear(
                 weights,
+                plan,
                 &format!("{expert_prefix}.{gate_layout}"),
                 config.hidden_size,
                 config.intermediate_size,
@@ -1094,6 +1240,7 @@ fn load_moe_feed_forward(
             )?,
             up: take_linear(
                 weights,
+                plan,
                 &format!("{expert_prefix}.{up_layout}"),
                 config.hidden_size,
                 config.intermediate_size,
@@ -1101,6 +1248,7 @@ fn load_moe_feed_forward(
             )?,
             down: take_linear(
                 weights,
+                plan,
                 &format!("{expert_prefix}.{down_layout}"),
                 config.intermediate_size,
                 config.hidden_size,
@@ -1185,12 +1333,14 @@ fn validate_shape(name: &str, actual: &[usize], expected: &[usize]) -> Result<()
 
 fn take_linear(
     weights: &mut HashMap<String, NamedWeight>,
+    plan: &BTreeMap<String, String>,
     prefix: &str,
     input_size: usize,
     output_size: usize,
     with_bias: bool,
 ) -> Result<Linear, String> {
     let weight_name = format!("{prefix}.weight");
+    let resident = plan.get(&weight_name).map(String::as_str) == Some("vram");
     let weight = take_weight(weights, &weight_name, &[output_size, input_size])?;
     let bias_name = format!("{prefix}.bias");
     let bias = match weights.remove(&bias_name) {
@@ -1210,12 +1360,44 @@ fn take_linear(
         }
         None => None,
     };
+    // Ant bucketing: units planned into the VRAM tier are uploaded once into
+    // the resident bucket (device-local when available); the host copy stays
+    // authoritative for page-ins after an eviction. Upload failures fall back
+    // to the per-step streaming path.
+    let slot = if resident {
+        match &weight.data {
+            WeightData::BF16(values) => {
+                cheetah::native::vulkan::weight_upload_bf16(values).map(|handle| {
+                    VulkanWeightSlot {
+                        handle,
+                        element_count: values.len(),
+                        device_local: true,
+                    }
+                })
+            }
+            _ => None, // F32/F16 resident upload lands with the bf16 path
+        }
+    } else {
+        None
+    };
+    if resident && slot.is_none() {
+        eprintln!(
+            "{}",
+            color::stderr(
+                &format!(
+                    "cheetah: resident upload for '{prefix}' unavailable; keeping the streaming path."
+                ),
+                Color::Yellow
+            )
+        );
+    }
     Ok(Linear {
         name: prefix.to_owned(),
         input_size,
         output_size,
         weight: weight.data,
         bias,
+        slot,
     })
 }
 
@@ -1327,6 +1509,7 @@ impl VulkanPhiExecutor {
         let lm_head = if weights.contains_key("lm_head.weight") {
             take_linear(
                 &mut weights,
+                &BTreeMap::new(),
                 "lm_head",
                 config.hidden_size,
                 config.vocab_size,
@@ -1338,6 +1521,7 @@ impl VulkanPhiExecutor {
                 input_size: config.hidden_size,
                 output_size: config.vocab_size,
                 weight: embedding.clone(),
+                slot: None,
                 bias: None,
             }
         } else {
@@ -1375,6 +1559,7 @@ impl VulkanPhiExecutor {
                 k_norm,
                 q_proj: take_linear(
                     &mut weights,
+                    &BTreeMap::new(),
                     &format!("{attention}.q_proj"),
                     config.hidden_size,
                     config.num_attention_heads * config.head_dim,
@@ -1382,6 +1567,7 @@ impl VulkanPhiExecutor {
                 )?,
                 k_proj: take_linear(
                     &mut weights,
+                    &BTreeMap::new(),
                     &format!("{attention}.k_proj"),
                     config.hidden_size,
                     config.num_key_value_heads * config.head_dim,
@@ -1389,6 +1575,7 @@ impl VulkanPhiExecutor {
                 )?,
                 v_proj: take_linear(
                     &mut weights,
+                    &BTreeMap::new(),
                     &format!("{attention}.v_proj"),
                     config.hidden_size,
                     config.num_key_value_heads * config.head_dim,
@@ -1396,6 +1583,7 @@ impl VulkanPhiExecutor {
                 )?,
                 dense: take_linear(
                     &mut weights,
+                    &BTreeMap::new(),
                     &format!("{attention}.dense"),
                     config.num_attention_heads * config.head_dim,
                     config.hidden_size,
@@ -1403,6 +1591,7 @@ impl VulkanPhiExecutor {
                 )?,
                 fc1: take_linear(
                     &mut weights,
+                    &BTreeMap::new(),
                     &format!("{prefix}.mlp.fc1"),
                     config.hidden_size,
                     config.intermediate_size,
@@ -1410,6 +1599,7 @@ impl VulkanPhiExecutor {
                 )?,
                 fc2: take_linear(
                     &mut weights,
+                    &BTreeMap::new(),
                     &format!("{prefix}.mlp.fc2"),
                     config.intermediate_size,
                     config.hidden_size,
@@ -1552,6 +1742,7 @@ mod tests {
             output_size: size,
             weight: WeightData::F32(matrix.into()),
             bias: None,
+            slot: None,
         }
     }
 
@@ -1594,6 +1785,7 @@ mod tests {
                     output_size: *num_experts,
                     weight: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
                     bias: None,
+                    slot: None,
                 },
                 experts: (0..*num_experts)
                     .map(|index| Expert {
@@ -1780,6 +1972,7 @@ mod tests {
         };
         let feed_forward = load_moe_feed_forward(
             &mut weights,
+            &BTreeMap::new(),
             "layers.0",
             &config,
             *num_experts,

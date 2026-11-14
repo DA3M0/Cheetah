@@ -77,7 +77,12 @@ pub(super) enum BackendLoader {
     ),
     /// Vulkan compute path: receives the aligned shard paths.
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
-    Vulkan(fn(&[PathBuf], &[u8], Value) -> Result<Box<dyn ModelRuntime>, String>),
+    Vulkan(fn(
+        &[PathBuf],
+        &[u8],
+        Value,
+        &std::collections::BTreeMap<String, String>,
+    ) -> Result<Box<dyn ModelRuntime>, String>),
     /// Native mmap + Ant tiering: receives the prepared model directory, the
     /// resolved residency plan, and the family constants for parameter
     /// fallbacks.

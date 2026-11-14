@@ -481,6 +481,16 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        fn cheetah_vulkan_weight_upload_bf16(weights: *const u16, element_count: u64) -> u64;
+        fn cheetah_vulkan_weight_release(handle: u64) -> c_int;
+        fn vk_matmul_bf16_transposed_resident_checked(
+            handle: u64,
+            a: *const f32,
+            c: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+        ) -> c_int;
         fn vk_matmul_fp16_transposed_checked(
             a: *const f32,
             b: *const u16,
@@ -641,6 +651,49 @@ pub mod vulkan {
     ) -> Result<Vec<f32>, String> {
         matmul_with(m, k, n, a.len(), b.len(), |dims, output| unsafe {
             vk_matmul_transposed_checked(a.as_ptr(), b.as_ptr(), output, dims[0], dims[1], dims[2])
+        })
+    }
+
+    /// Upload one BF16 weight tensor into the resident bucket (device-local
+    /// memory when available, a persistent host-coherent allocation otherwise).
+    /// Returns the resident-weight handle, or None when the upload cannot be
+    /// served and the caller should keep the per-step streaming path.
+    pub fn weight_upload_bf16(weights: &[u16]) -> Option<u64> {
+        let guard = VULKAN_LOCK.lock();
+        let _guard = guard.unwrap_or_else(|poisoned| poisoned.into_inner());
+        let handle = unsafe {
+            cheetah_vulkan_weight_upload_bf16(weights.as_ptr(), weights.len() as u64)
+        };
+        if handle == 0 { None } else { Some(handle) }
+    }
+
+    /// Release a resident weight bucket (device-local allocation or the
+    /// persistent host-coherent one, depending on where it was uploaded).
+    pub fn weight_release(handle: u64) {
+        let guard = VULKAN_LOCK.lock();
+        let _guard = guard.unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe { cheetah_vulkan_weight_release(handle) };
+    }
+
+    /// C[M,N] = A[M,K] * weight^T over a resident weight buffer: the weight
+    /// stays bound in device/host persistent memory and only A/C pass through
+    /// the pool. Caller must hold a valid upload handle (weight_upload_bf16).
+    pub fn matmul_bf16_transposed_resident(
+        handle: u64,
+        a: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        matmul_with(m, k, n, a.len(), n, |dims, output| unsafe {
+            vk_matmul_bf16_transposed_resident_checked(
+                handle,
+                a.as_ptr(),
+                output,
+                dims[0],
+                dims[1],
+                dims[2],
+            )
         })
     }
 

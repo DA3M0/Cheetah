@@ -583,9 +583,10 @@ impl Engine {
                 raw_config.clone(),
                 &architecture,
                 resident_device,
+                &ant_plan,
             )?
         } else {
-            super::models::load_model(&effective_weight_paths, &config_bytes, raw_config, &architecture)?
+            super::models::load_model(&effective_weight_paths, &config_bytes, raw_config, &architecture, &ant_plan)?
         };
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {

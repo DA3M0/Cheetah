@@ -491,10 +491,11 @@ pub(super) fn load_vulkan(
     weight_paths: &[PathBuf],
     _config_bytes: &[u8],
     raw_config: Value,
+    plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<Box<dyn ModelRuntime>, String> {
     let config = vulkan_config(&raw_config)?;
     Ok(Box::new(
-        super::super::vulkan_transformer::VulkanTransformerExecutor::load(weight_paths, &config)?,
+        super::super::vulkan_transformer::VulkanTransformerExecutor::load(weight_paths, &config, plan)?,
     ))
 }
 
