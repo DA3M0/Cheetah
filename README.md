@@ -200,9 +200,22 @@ On Windows, GPU builds under WSL2 additionally require the relevant GPU and driv
 
 ### Vulkan
 
-The optional Vulkan feature uses native C compute operators for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral. See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
+The optional Vulkan feature uses native C compute operators for all registered architectures (Qwen2, Llama, Qwen3, Gemma, Mistral, Mixtral, Phi). See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
 
-The Vulkan paths support F32, F16, and BF16 weights. Mixtral uses the sparse-expert architecture and its configured top-k routing. Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and stop with guidance (there is no silent CPU fallback). An error during active Vulkan inference is returned rather than silently switching devices.
+**Supported weight precisions:** F32, F16, BF16, and **Q8** (row-wise int8 with per-row f32 scales, enabled by `CHEETAH_QUANT_Q8=1`). Q8 roughly halves the weight footprint compared to BF16. Mixtral uses the sparse-expert architecture with top-k routing. Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and stop with guidance (there is no silent CPU fallback). An error during active Vulkan inference is returned rather than silently switching devices.
+
+**Ant bucketed residency:** VRAM-tier weights are uploaded once into DEVICE_LOCAL memory (real VRAM); disk-tier weights stream through a HOST_COHERENT pool each step. Ant page-in/evict moves weights between the two buckets. On GPUs with small VRAM, oversized uploads automatically fall back to the streaming path per weight.
+
+**Operator library** (`shared_ops.comp`, 10 ops): rms_norm, elementwise add, silu_mul, rotary, attention, gelu_mul (exact + tanh), layer_norm, embedding_gather, bias_add. Dedicated matmul pipelines for f32, bf16, f16, and q8.
+
+Compiled shader paths can be overridden per operator:
+
+| Shader | Override variable | Default |
+|--------|-------------------|---------|
+| f32 matmul | `CHEETAH_MATMUL_SPV` | embedded at build time |
+| bf16 matmul | `CHEETAH_MATMUL_BF16_SPV` | embedded at build time |
+| q8 matmul | `CHEETAH_MATMUL_Q8_SPV` | embedded at build time |
+| shared ops (10 ops) | `CHEETAH_QWEN_OPS_SPV` | embedded at build time |
 
 Vulkan operator tests that exercise a real device are ignored by default and require a Vulkan compute device and `glslc`:
 
@@ -210,8 +223,6 @@ Vulkan operator tests that exercise a real device are ignored by default and req
 cargo test --features vulkan
 cargo test --features vulkan qwen_operators_match_cpu_reference -- --ignored --nocapture
 ```
-
-`CHEETAH_MATMUL_SPV` and `CHEETAH_QWEN_OPS_SPV` can override the corresponding compiled shader paths.
 
 ## Chat
 
@@ -295,7 +306,7 @@ Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `-
 |--------|---------|-------|
 | `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3) | Ant-tiered, SIMD kernels; unregistered families report guidance |
 | `CHEETAH_DEVICE=cuda` / `metal` | Candle | Candle's only remaining role |
-| `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
+| `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; Ant bucketed residency (VRAM/streams); Q8 quantization; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
 
 The startup banner prints the registered backends per architecture (`backends: candle, native`). The OpenAI-compatible server accepts the same device/`--ant*` settings as chat; generation requests may additionally pass a `resident_units` override list.
 
@@ -394,7 +405,7 @@ The server loads one model at a time. Generation requests are queued in arrival 
 
 ## Supported models and limitations
 
-- **Inference:** Safetensors decoder models registered for Qwen2, Llama, Qwen3 (native CPU backend, Ant-tiered), plus Gemma, Mistral, Mixtral, and Phi (Candle on CUDA/Metal; Vulkan executor for all seven with F32, F16, or BF16 weights, subject to model configuration compatibility).
+- **Inference:** Safetensors decoder models registered for Qwen2, Llama, Qwen3 (native CPU backend, Ant-tiered), plus Gemma, Mistral, Mixtral, and Phi (Candle on CUDA/Metal; Vulkan executor for all seven with F32, F16, BF16, or Q8 (row-wise int8) weights, subject to model configuration compatibility).
 - **Inspection and preparation:** Safetensors model directories and weight files.
 - **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
 
@@ -426,6 +437,12 @@ Run the comparison tests (`cargo test native_`) — if the synthetic comparisons
 
 **Do I need a GPU?**
 No — the native CPU path is the primary backend and needs no GPU. Discrete GPUs currently accelerate less than the native CPU path on this codebase (the Vulkan executor keeps weights in host memory; small-VRAM CUDA is impractical for F32 weights).
+
+**How do I enable Q8 quantization?**
+Set `CHEETAH_QUANT_Q8=1` before starting. Linear projections are quantized to row-wise int8 (roughly half the weight footprint). Norms, biases and embeddings stay in full precision. Vulkan only for now.
+
+**Why does CHEETAH_DEVICE=VULKAN (uppercase) fail?**
+Older builds used case-sensitive device lookup. This was fixed — all casing now works (`vulkan`, `VULKAN`, `Vulkan`). If you still see `Unsupported CHEETAH_DEVICE`, rebuild from the latest code.
 
 
 ## License
