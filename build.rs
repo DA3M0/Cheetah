@@ -83,6 +83,12 @@ fn discover_shaders(directory: &Path) -> Vec<ShaderSource> {
             c_define: Some("CHEETAH_DEFAULT_MATMUL_SPV"),
         },
         ShaderSource {
+            name: "matmul_q8".into(),
+            source: PathBuf::from("matmul_q8.comp"),
+            output: "matmul_q8.spv".into(),
+            c_define: Some("CHEETAH_DEFAULT_MATMUL_Q8_SPV"),
+        },
+        ShaderSource {
             name: "matmul_bf16".into(),
             source: PathBuf::from("matmul_bf16.comp"),
             output: "matmul_bf16.spv".into(),

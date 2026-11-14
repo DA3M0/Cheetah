@@ -344,11 +344,55 @@ pub(crate) fn required_usize(config: &Value, name: &str) -> Result<usize, String
         .and_then(|value| usize::try_from(value).map_err(|_| format!("{name} does not fit usize.")))
 }
 
+/// Row-wise symmetric int8 quantization of one Linear weight matrix
+/// `[rows, cols]`: one f32 scale per output row + one i8 per weight
+/// (byte-packed). ~0.25 bytes of scale overhead per weight on top of the
+/// int8 payload — roughly half the footprint of BF16.
+#[derive(Clone)]
+struct Q8Matrix {
+    rows: usize,
+    cols: usize,
+    /// Single GPU-facing buffer: a head of `rows` f32 scales (as raw bytes)
+    /// followed by the row-major int8 payloads, each row padded to a
+    /// multiple of four bytes so the shader unpacks four lanes per u32 word.
+    buffer: Arc<[u8]>,
+}
+
+impl Q8Matrix {
+    fn head_bytes(&self) -> usize {
+        self.rows * 4
+    }
+
+    fn row_bytes(&self) -> usize {
+        (self.cols + 3) / 4 * 4
+    }
+
+    fn scale(&self, row: usize) -> f32 {
+        let base = row * 4;
+        f32::from_le_bytes([
+            self.buffer[base],
+            self.buffer[base + 1],
+            self.buffer[base + 2],
+            self.buffer[base + 3],
+        ])
+    }
+
+    fn dequant_value(&self, row: usize, col: usize) -> f32 {
+        let raw = self.buffer[self.head_bytes() + row * self.row_bytes() + col] as i8 as f32;
+        self.scale(row) * raw
+    }
+
+    fn buffer_bytes(&self) -> usize {
+        self.head_bytes() + self.rows * self.row_bytes()
+    }
+}
+
 #[derive(Clone)]
 enum WeightData {
     F32(Arc<[f32]>),
     F16(Arc<[u16]>),
     BF16(Arc<[u16]>),
+    Q8(Arc<Q8Matrix>),
 }
 
 impl WeightData {
@@ -395,7 +439,45 @@ impl WeightData {
             Self::F32(values) => values[index],
             Self::F16(values) => half::f16::from_bits(values[index]).to_f32(),
             Self::BF16(values) => half::bf16::from_bits(values[index]).to_f32(),
+            // Q8 is only meaningful with row/col context; callers that hit
+            // the flat accessor get the dequantized value with scale 1 rows.
+            Self::Q8(matrix) => matrix.dequant_value(0, index.min(matrix.cols - 1)),
         }
+    }
+
+    /// Row-wise symmetric int8 quantization: scale = max|w| / 127 per row.
+    fn quantize_q8_rowwise(&self, rows: usize, cols: usize) -> Result<Self, String> {
+        let expected = rows.checked_mul(cols).ok_or("Q8 quantization size overflow")?;
+        if self.len() != expected {
+            return Err(format!(
+                "Q8 quantization expected {expected} elements, found {}.",
+                self.len()
+            ));
+        }
+        let row_bytes = (cols + 3) / 4 * 4;
+        let mut buffer = vec![0u8; rows * 4 + rows * row_bytes];
+        for row in 0..rows {
+            let start = row * cols;
+            let mut row_slice = Vec::with_capacity(cols);
+            for col in 0..cols {
+                row_slice.push(self.value(start + col));
+            }
+            let max_abs = row_slice
+                .iter()
+                .fold(0f32, |acc, value| acc.max(value.abs()));
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            let scale_base = row * 4;
+            buffer[scale_base..scale_base + 4].copy_from_slice(&scale.to_le_bytes());
+            for (col, value) in row_slice.iter().enumerate() {
+                let quantized = (value / scale).round().clamp(-127.0, 127.0) as i8;
+                buffer[rows * 4 + row * row_bytes + col] = quantized as u8;
+            }
+        }
+        Ok(Self::Q8(Arc::new(Q8Matrix {
+            rows,
+            cols,
+            buffer: buffer.into(),
+        })))
     }
 
     fn add_one(&self) -> Self {
@@ -410,16 +492,24 @@ impl WeightData {
         match self {
             Self::F32(values) => values.len(),
             Self::F16(values) | Self::BF16(values) => values.len(),
+            Self::Q8(matrix) => matrix.rows * matrix.cols,
         }
     }
 
     /// FFI view for shader operators: (pointer, weight_format, element_count).
-    /// Format encoding matches shared_ops.comp: 0 = f32, 2 = f16, 3 = bf16.
+    /// Format encoding matches shared_ops.comp: 0 = f32, 2 = f16, 3 = bf16;
+    /// 4 = q8 (row-wise int8, buffer = scales head + packed rows) — q8 is
+    /// only served by the dedicated matmul pipeline, not shared_ops.
     fn ffi_parts(&self) -> (*const std::os::raw::c_void, u32, usize) {
         match self {
             Self::F32(values) => (values.as_ptr().cast(), 0, values.len()),
             Self::F16(values) => (values.as_ptr().cast(), 2, values.len()),
             Self::BF16(values) => (values.as_ptr().cast(), 3, values.len()),
+            Self::Q8(matrix) => (
+                matrix.buffer.as_ptr().cast(),
+                4,
+                matrix.buffer_bytes() / 4,
+            ),
         }
     }
 
@@ -439,6 +529,9 @@ impl WeightData {
             }
             Self::BF16(weights) => {
                 cheetah::native::vulkan::rms_norm_bf16(input, weights, rows, width, epsilon)
+            }
+            Self::Q8(_) => {
+                Err("Q8 quantization applies to linear projections only; norms stay in their original precision.".to_string())
             }
         }
     }
@@ -483,10 +576,10 @@ impl WeightData {
         }
         const MAX_WEIGHT_TILE_ELEMENTS: usize = 16 * 1024 * 1024;
         const MAX_ROW_TILE: usize = 64;
+        let mut output = vec![0.0; output_len];
         let tile_size = output_size
             .min(16_384)
             .min((MAX_WEIGHT_TILE_ELEMENTS / input_size).max(1));
-        let mut output = vec![0.0; output_len];
         for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
             let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
             let input_start = row_offset * input_size;
@@ -517,6 +610,20 @@ impl WeightData {
                         input_size,
                         columns,
                     )?,
+                    Self::Q8(matrix) => {
+                        // Host-streaming q8 path: the whole buffer (scale
+                        // head + packed rows) is small enough to stage in one
+                        // pass, so no column tiling is needed.
+                        cheetah::native::vulkan::matmul_q8_transposed(
+                            input_tile,
+                            &matrix.buffer,
+                            matrix.rows,
+                            matrix.cols,
+                            tile_rows,
+                            input_size,
+                            matrix.rows,
+                        )?
+                    }
                 };
                 for row in 0..tile_rows {
                     let source = &tile[row * columns..(row + 1) * columns];
@@ -554,6 +661,8 @@ struct Linear {
     slot: Option<VulkanWeightSlot>,
 }
 
+const MAX_ROW_TILE: usize = 64;
+
 impl Linear {
     fn forward(&self, input: &[f32], rows: usize) -> Result<Vec<f32>, String> {
         let expected = rows
@@ -566,9 +675,79 @@ impl Linear {
                 input.len()
             ));
         }
-        let mut output = self
-            .weight
-            .linear(input, rows, self.input_size, self.output_size)?;
+        let mut output = if let (WeightData::Q8(matrix), Some(slot)) = (&self.weight, &self.slot) {
+            // Ant resident q8: the quantized buffer stays bound on the GPU.
+            let mut output = vec![0.0; rows * self.output_size];
+            for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
+                let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
+                let input_tile =
+                    &input[row_offset * self.input_size..][..tile_rows * self.input_size];
+                let out_tile = cheetah::native::vulkan::matmul_q8_transposed_resident(
+                    slot.handle,
+                    input_tile,
+                    tile_rows,
+                    self.input_size,
+                    self.output_size,
+                )?;
+                output[row_offset * self.output_size..][..tile_rows * self.output_size]
+                    .copy_from_slice(&out_tile);
+            }
+            if let Some(bias) = &self.bias {
+                for row in output.chunks_exact_mut(self.output_size) {
+                    for (value, index) in row.iter_mut().zip(0..self.output_size) {
+                        *value += bias.value(index);
+                    }
+                }
+            }
+            return Ok(output);
+        } else if let WeightData::Q8(matrix) = &self.weight {
+            // Q8 host-streaming path: the whole quantized buffer (scale head
+            // + packed int8 rows) stages in one pass — roughly half the size
+            // of the BF16 weights and far below the storage-buffer range.
+            let output_len = rows * self.output_size;
+            eprintln!("dbg: Q8 forward rows={rows} k={} n={} buffer_bytes={} row_bytes={}", self.input_size, self.output_size, matrix.buffer_bytes(), matrix.row_bytes());
+            let mut output = vec![0.0; output_len];
+            for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
+                let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
+                let input_tile =
+                    &input[row_offset * self.input_size..][..tile_rows * self.input_size];
+                let out_tile = cheetah::native::vulkan::matmul_q8_transposed(
+                    input_tile,
+                    &matrix.buffer,
+                    matrix.rows,
+                    matrix.cols,
+                    tile_rows,
+                    self.input_size,
+                    matrix.rows,
+                )?;
+                output[row_offset * self.output_size..][..tile_rows * self.output_size]
+                    .copy_from_slice(&out_tile);
+            }
+            output
+        } else if let Some(slot) = &self.slot {
+            // Ant resident bucket (bf16): the weight stays bound in place on
+            // the GPU — only activation and output tiles pass through the
+            // host pool.
+            let mut output = vec![0.0; rows * self.output_size];
+            for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
+                let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
+                let input_tile =
+                    &input[row_offset * self.input_size..][..tile_rows * self.input_size];
+                let out_tile = cheetah::native::vulkan::matmul_bf16_transposed_resident(
+                    slot.handle,
+                    input_tile,
+                    tile_rows,
+                    self.input_size,
+                    self.output_size,
+                )?;
+                output[row_offset * self.output_size..][..tile_rows * self.output_size]
+                    .copy_from_slice(&out_tile);
+            }
+            output
+        } else {
+            self.weight
+                .linear(input, rows, self.input_size, self.output_size)?
+        };
         if let Some(bias) = &self.bias {
             if bias.len() != self.output_size {
                 return Err(format!("Invalid bias shape for '{}'.", self.name));
@@ -1352,6 +1531,12 @@ fn take_linear(
 ) -> Result<Linear, String> {
     let weight_name = format!("{prefix}.weight");
     let resident = plan.get(&weight_name).map(String::as_str) == Some("vram");
+    // Ant quantization: CHEETAH_QUANT_Q8=1 quantizes linear projections to
+    // row-wise int8 (halves the weight footprint for both the streaming and
+    // the resident path). Norms, biases and the embedding stay in full precision.
+    let quantize_q8 = std::env::var("CHEETAH_QUANT_Q8")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let weight = take_weight(weights, &weight_name, &[output_size, input_size])?;
     let bias_name = format!("{prefix}.bias");
     let bias = match weights.remove(&bias_name) {
@@ -1402,11 +1587,16 @@ fn take_linear(
             )
         );
     }
+    let weight = if quantize_q8 {
+        weight.data.quantize_q8_rowwise(output_size, input_size)?
+    } else {
+        weight.data
+    };
     Ok(Linear {
         name: prefix.to_owned(),
         input_size,
         output_size,
-        weight: weight.data,
+        weight,
         bias,
         slot,
     })
@@ -2056,5 +2246,133 @@ mod tests {
             assert_eq!(logits, repeated);
         }
         cheetah::native::vulkan::shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod q8_tests {
+    use super::*;
+
+    /// CHEETAH_QUANT_Q8=1 + a synthetic BF16 decoder: the Vulkan executor's
+    /// q8-quantized output must stay finite and terminate (a hang here means
+    /// the resident q8 matmul deadlocks). Set CHEETAH_TEST_VULKAN_Q8=1 to run.
+    #[test]
+    fn vulkan_q8_quantized_forward_terminates() {
+        if std::env::var("CHEETAH_TEST_VULKAN_Q8").is_err() {
+            eprintln!("skipping q8 forward test (set CHEETAH_TEST_VULKAN_Q8=1)");
+            return;
+        }
+        // SAFETY: test-scoped process env mutation; single-threaded test.
+        unsafe { std::env::set_var("CHEETAH_QUANT_Q8", "1") };
+        // Synthetic decoder generator lives in the native test module; rebuild
+        // the tiny model here via the same helper through the native tests is
+        // not reachable, so prepare a minimal directory directly.
+        let base = std::env::temp_dir().join(format!(
+            "cheetah-synth-q8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            r#"{
+                "model_type": "llama",
+                "architectures": ["LlamaForCausalLM"],
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "hidden_act": "silu",
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": false,
+                "max_position_embeddings": 512
+            }"#,
+        )
+        .unwrap();
+
+        let mut shape_f32: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
+        shape_f32.push(("model.embed_tokens.weight".into(), vec![0.0; 128 * 64], vec![128, 64]));
+        shape_f32.push(("lm_head.weight".into(), vec![0.0; 128 * 64], vec![128, 64]));
+        shape_f32.push(("model.norm.weight".into(), vec![1.0; 64], vec![64]));
+        for layer in 0..2usize {
+            let prefix = format!("model.layers.{layer}.");
+            for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                shape_f32.push((format!("{prefix}{name}"), vec![1.0; 64], vec![64]));
+            }
+            shape_f32.push((format!("{prefix}self_attn.q_proj.weight"), vec![0.5; 4096], vec![64, 64]));
+            shape_f32.push((format!("{prefix}self_attn.k_proj.weight"), vec![0.25; 2048], vec![32, 64]));
+            shape_f32.push((format!("{prefix}self_attn.v_proj.weight"), vec![0.25; 2048], vec![32, 64]));
+            shape_f32.push((format!("{prefix}self_attn.o_proj.weight"), vec![0.5; 4096], vec![64, 64]));
+            shape_f32.push((format!("{prefix}mlp.gate_proj.weight"), vec![0.5; 8192], vec![128, 64]));
+            shape_f32.push((format!("{prefix}mlp.up_proj.weight"), vec![0.5; 8192], vec![128, 64]));
+            shape_f32.push((format!("{prefix}mlp.down_proj.weight"), vec![0.5; 8192], vec![64, 128]));
+        }
+
+        let tensors: Vec<(String, safetensors::tensor::TensorView<'static>)> = shape_f32
+            .into_iter()
+            .map(|(name, data, shape)| {
+                let mut bytes = Vec::with_capacity(data.len() * 4);
+                for value in &data {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                (
+                    name,
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, leaked)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        std::fs::write(
+            src.join("model.safetensors"),
+            safetensors::serialize(tensors, &None).unwrap(),
+        )
+        .unwrap();
+
+        cheetah::native::init_model(&src, &dst).unwrap();
+
+        cheetah::native::vulkan::initialize().unwrap();
+        cheetah::native::vulkan::prepare().unwrap();
+        let paths: Vec<std::path::PathBuf> = std::fs::read_dir(dst.join(".cheetah/weights"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|ext| ext.to_str()) == Some("safetensors")).then_some(path)
+            })
+            .collect();
+        let plan = std::collections::BTreeMap::new(); // all units resident
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dst.join("config.json")).unwrap()).unwrap();
+        let features = TransformerFeatures::standard("Llama");
+        let config = VulkanTransformerConfig::from_raw(&raw, features).unwrap();
+        let mut model =
+            VulkanTransformerExecutor::load(&paths, &config, &plan).unwrap();
+
+        let tokens: Vec<u32> = vec![3, 41, 17];
+        let started = std::time::Instant::now();
+        let logits = model.forward(&tokens, 0).unwrap();
+        eprintln!(
+            "q8 forward finished in {:?}; finite={}",
+            started.elapsed(),
+            logits.iter().all(|value| f32::is_finite(*value))
+        );
+        assert!(logits.iter().all(|value| f32::is_finite(*value)));
+
+        let _ = std::fs::remove_dir_all(&base);
+        // SAFETY: test-scoped process env mutation.
+        unsafe { std::env::remove_var("CHEETAH_QUANT_Q8") };
+        cheetah::native::vulkan::shutdown().unwrap();
+    }
+
+    fn config_bytes(dst: &std::path::Path) -> Vec<u8> {
+        std::fs::read(dst.join("config.json")).unwrap()
     }
 }

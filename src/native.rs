@@ -491,6 +491,22 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        fn vk_matmul_q8_transposed_checked(
+            a: *const f32,
+            q8: *const u8,
+            c: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+        ) -> c_int;
+        fn vk_matmul_q8_transposed_resident_checked(
+            handle: u64,
+            a: *const f32,
+            c: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+        ) -> c_int;
         fn vk_matmul_fp16_transposed_checked(
             a: *const f32,
             b: *const u16,
@@ -505,16 +521,16 @@ pub mod vulkan {
             weight_format: u32,
             table_element_count: u64,
             output: *mut f32,
-            token_count: u32,
-            hidden_size: u32,
+            token_count: usize,
+            hidden_size: usize,
             scale: u32,
         ) -> c_int;
         fn vk_qwen_bias_add(
             values: *const f32,
             bias: *const c_void,
             bias_format: u32,
-            total_count: u32,
-            period: u32,
+            total_count: usize,
+            period: usize,
             output: *mut f32,
         ) -> c_int;
         fn vk_qwen_rms_norm(
@@ -719,8 +735,8 @@ pub mod vulkan {
                 table_format,
                 table_element_count as u64,
                 output.as_mut_ptr(),
-                token_ids.len() as u32,
-                hidden_size as u32,
+                token_ids.len(),
+                hidden_size,
                 if scale { 1u32 } else { 0u32 },
             )
         };
@@ -748,13 +764,88 @@ pub mod vulkan {
                 values.as_ptr(),
                 bias,
                 bias_format,
-                values.len() as u32,
-                period as u32,
+                values.len(),
+                period,
                 values.as_mut_ptr(),
             )
         };
         check_native_result(result, "Vulkan bias add")?;
         Ok(())
+    }
+
+    /// Host-streaming q8 matmul: C[M,N] = A[M,K] * W^T where W is the
+    /// quantized buffer (f32 scale head + packed int8 rows). Roughly half
+    /// the PCIe traffic of the BF16 streaming path.
+    pub fn matmul_q8_transposed(
+        a: &[f32],
+        q8: &[u8],
+        weight_rows: usize,
+        weight_cols: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        if m == 0 || k == 0 || n == 0 {
+            return Err("Vulkan matrix dimensions must be positive.".to_string());
+        }
+        let expected_a = m
+            .checked_mul(k)
+            .ok_or_else(|| "A matrix element count overflows usize.".to_string())?;
+        let row_bytes = (k + 3) / 4 * 4;
+        let expected_q8 = n * 4 + n * row_bytes;
+        if q8.len() != expected_q8 {
+            return Err(format!(
+                "Vulkan q8 matmul expected {expected_q8} bytes, received {}.",
+                q8.len()
+            ));
+        }
+        let output_len = m
+            .checked_mul(n)
+            .ok_or_else(|| "C matrix element count overflows usize.".to_string())?;
+        if a.len() != expected_a {
+            return Err(format!(
+                "Vulkan q8 matmul expected A length {expected_a}, received {}.",
+                a.len()
+            ));
+        }
+        let mut output = vec![0.0; output_len];
+        let _guard = VULKAN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = unsafe {
+            vk_matmul_q8_transposed_checked(
+                a.as_ptr(),
+                q8.as_ptr(),
+                output.as_mut_ptr(),
+                m as c_int,
+                k as c_int,
+                n as c_int,
+            )
+        };
+        check_native_result(result, "Vulkan q8 matmul")?;
+        Ok(output)
+    }
+
+    /// Ant resident q8 matmul: the quantized weight buffer stays bound on
+    /// the GPU; only activations and outputs pass through the pool.
+    /// Caller must hold a valid q8 upload handle (weight_upload_q8).
+    pub fn matmul_q8_transposed_resident(
+        handle: u64,
+        a: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        matmul_with(m, k, n, a.len(), n, |dims, output| unsafe {
+            vk_matmul_q8_transposed_resident_checked(
+                handle,
+                a.as_ptr(),
+                output,
+                dims[0],
+                dims[1],
+                dims[2],
+            )
+        })
     }
 
     /// C[M,N] = A[M,K] * weight^T over a resident weight buffer: the weight
