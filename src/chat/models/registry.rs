@@ -44,11 +44,12 @@ pub(in crate::chat) fn load_model(
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
     let model_registration = super::registration_for_architecture(architecture)?;
     let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
+    let selected_lower = selected.to_lowercase();
     let registration = BACKENDS
         .iter()
-        .find(|registration| registration.name == selected)
+        .find(|registration| registration.name == selected_lower)
         .ok_or_else(|| {
-            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, or metal.")
+            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, metal, or vulkan.")
         })?;
 
     match registration.backend {
@@ -88,9 +89,9 @@ fn retired_cpu_candle_message(architecture: &str) -> String {
 pub(in crate::chat) fn backend_device(selected: &str) -> Result<Device, String> {
     let registration = BACKENDS
         .iter()
-        .find(|registration| registration.name == selected)
+        .find(|registration| registration.name == selected.to_lowercase().as_str())
         .ok_or_else(|| {
-            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, or metal.")
+            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, metal, or vulkan.")
         })?;
     match &registration.backend {
         Backend::Candle(create_device) => create_device(),
