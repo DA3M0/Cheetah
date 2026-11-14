@@ -2226,3 +2226,77 @@ cleanup:
     }
     return status;
 }
+
+/* Ant op 8: embedding gather. b0 = token ids (u32 words), b1 = embedding
+ * table in `weight_format`, b2 = gathered rows. p3 = scale flag. */
+int vk_qwen_gather(const uint32_t *token_ids, const void *table,
+                   uint32_t weight_format, uint64_t table_element_count,
+                   float *output, size_t token_count, size_t hidden_size,
+                   uint32_t scale) {
+    const void *sources[5] = {token_ids, table, NULL, NULL, NULL};
+    void *destinations[5] = {NULL, NULL, output, NULL, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    size_t total;
+    if (token_ids == NULL || table == NULL || output == NULL ||
+        token_count == 0 || hidden_size == 0 ||
+        token_count > SIZE_MAX / hidden_size ||
+        table_element_count < (uint64_t)hidden_size) {
+        report_error("invalid arguments to vk_qwen_gather");
+        return -1;
+    }
+    if (weight_format != 0 && weight_format != 2 && weight_format != 3) {
+        report_error("vk_qwen_gather weight format must be f32, bf16, or f16");
+        return -1;
+    }
+    total = token_count * hidden_size;
+    if (total > UINT32_MAX) {
+        report_error("Qwen gather count exceeds 32-bit shader indexing");
+        return -1;
+    }
+    sizes[0] = token_count * sizeof(uint32_t);
+    sizes[1] = (size_t)table_element_count * (weight_format == 0   ? sizeof(float)
+                                              : weight_format == 3 ? 2
+                                                                   : 2);
+    sizes[2] = total * sizeof(float);
+    sizes[3] = 0;
+    sizes[4] = 0;
+    parameters[0] = 8;
+    parameters[1] = (uint32_t)hidden_size;
+    parameters[2] = (uint32_t)token_count;
+    parameters[3] = weight_format;
+    parameters[4] = scale;
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32((uint32_t)total, 64));
+}
+
+/* Ant op 9: broadcast bias add over a matmul output. b0 = values (read),
+ * b1 = bias vector in `bias_format` with `period` elements, b2 = result. */
+int vk_qwen_bias_add(const float *values, const void *bias,
+                     uint32_t bias_format, size_t total_count,
+                     uint32_t period, float *output) {
+    const void *sources[5] = {values, bias, NULL, NULL, NULL};
+    void *destinations[5] = {NULL, NULL, output, NULL, NULL};
+    size_t sizes[5];
+    uint32_t parameters[8] = {0};
+    if (values == NULL || bias == NULL || output == NULL || total_count == 0 ||
+        period == 0 || total_count > SIZE_MAX / sizeof(float)) {
+        report_error("invalid arguments to vk_qwen_bias_add");
+        return -1;
+    }
+    if (bias_format != 0 && bias_format != 2 && bias_format != 3) {
+        report_error("vk_qwen_bias_add bias format must be f32, bf16, or f16");
+        return -1;
+    }
+    sizes[0] = total_count * sizeof(float);
+    sizes[1] = (size_t)period * (bias_format == 0 ? sizeof(float) : sizeof(uint16_t));
+    sizes[2] = total_count * sizeof(float);
+    sizes[3] = 0;
+    sizes[4] = 0;
+    parameters[0] = 9;
+    parameters[1] = (uint32_t)total_count;
+    parameters[2] = period;
+    parameters[3] = bias_format;
+    return run_qwen_compute(sources, destinations, sizes, parameters,
+                            ceil_div_u32((uint32_t)total_count, 64));
+}

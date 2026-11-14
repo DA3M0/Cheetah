@@ -246,6 +246,40 @@ void run_attention(uint query_head_index) {
     }
 }
 
+// Ant op 8: embedding gather. b0 carries the token ids (as raw u32 words),
+// b1 is the embedding table in `params.p2` format, b2 receives the gathered
+// rows — one thread per output element. p3 enables the gemma-style
+// sqrt(hidden) embedding scale.
+void run_embedding_gather(uint index) {
+    uint hidden = params.p1;
+    uint token_count = params.p2;
+    uint row = index / hidden;
+    uint col = index % hidden;
+    if (row >= token_count) {
+        return;
+    }
+    uint token = b0.data[row];
+    float value = load_weight(token * hidden + col, params.p3);
+    if (params.p4 == 1u) {
+        value *= sqrt(float(hidden));
+    }
+    b2.data[index] = floatBitsToUint(value);
+}
+
+// Ant op 9: broadcast bias add over a matmul output. b0 carries the output of
+// the projection (total = rows * out_size elements), b1 the bias vector of
+// `params.p2` elements in `params.p3` format. Result lands in b2.
+void run_bias_add(uint index) {
+    uint total = params.p1;
+    uint period = params.p2;
+    if (index >= total) {
+        return;
+    }
+    float value = uintBitsToFloat(b0.data[index]);
+    value += load_weight(index % period, params.p3);
+    b2.data[index] = floatBitsToUint(value);
+}
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (params.op == 0u) {
@@ -264,5 +298,9 @@ void main() {
         run_elementwise(index, 3u);
     } else if (params.op == 6u) {
         run_elementwise(index, 4u);
+    } else if (params.op == 8u) {
+        run_embedding_gather(index);
+    } else if (params.op == 9u) {
+        run_bias_add(index);
     }
 }

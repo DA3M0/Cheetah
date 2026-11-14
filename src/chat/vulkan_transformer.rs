@@ -413,6 +413,16 @@ impl WeightData {
         }
     }
 
+    /// FFI view for shader operators: (pointer, weight_format, element_count).
+    /// Format encoding matches shared_ops.comp: 0 = f32, 2 = f16, 3 = bf16.
+    fn ffi_parts(&self) -> (*const std::os::raw::c_void, u32, usize) {
+        match self {
+            Self::F32(values) => (values.as_ptr().cast(), 0, values.len()),
+            Self::F16(values) => (values.as_ptr().cast(), 2, values.len()),
+            Self::BF16(values) => (values.as_ptr().cast(), 3, values.len()),
+        }
+    }
+
     fn rms_norm(
         &self,
         input: &[f32],
@@ -1110,22 +1120,23 @@ impl VulkanTransformerExecutor {
             );
         }
         let hidden = self.config.hidden_size;
-        let mut activations = Vec::with_capacity(sequence * hidden);
         for token_id in tokens {
             let token = *token_id as usize;
             if token >= self.config.vocab_size {
                 return Err(format!("Token ID {token} exceeds the model vocabulary."));
             }
-            let start = token * hidden;
-            for index in 0..hidden {
-                let value = self.embedding.value(start + index);
-                activations.push(if self.config.features.embedding_scale {
-                    value * (hidden as f32).sqrt()
-                } else {
-                    value
-                });
-            }
         }
+        // Ant op 8: embedding gather runs as a Vulkan shader — the host loop
+        // only validates token ids against the vocabulary.
+        let (table_ptr, table_format, table_elements) = self.embedding.ffi_parts();
+        let mut activations = cheetah::native::vulkan::embedding_gather(
+            tokens,
+            table_ptr,
+            table_format,
+            table_elements,
+            hidden,
+            self.config.features.embedding_scale,
+        )?;
 
         for layer in &mut self.layers {
             let residual = activations.clone();

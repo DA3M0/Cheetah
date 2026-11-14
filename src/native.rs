@@ -499,6 +499,24 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        fn vk_qwen_gather(
+            token_ids: *const u32,
+            table: *const c_void,
+            weight_format: u32,
+            table_element_count: u64,
+            output: *mut f32,
+            token_count: u32,
+            hidden_size: u32,
+            scale: u32,
+        ) -> c_int;
+        fn vk_qwen_bias_add(
+            values: *const f32,
+            bias: *const c_void,
+            bias_format: u32,
+            total_count: u32,
+            period: u32,
+            output: *mut f32,
+        ) -> c_int;
         fn vk_qwen_rms_norm(
             input: *const f32,
             weight: *const c_void,
@@ -673,6 +691,70 @@ pub mod vulkan {
         let guard = VULKAN_LOCK.lock();
         let _guard = guard.unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe { cheetah_vulkan_weight_release(handle) };
+    }
+
+    /// Ant op 8: gather embedding rows on the GPU. `table` is the embedding
+    /// tensor in `table_format` (0 = f32, 2 = bf16, 3 = f16); the result holds
+    /// one row per token, optionally scaled by sqrt(hidden) (gemma-style).
+    pub fn embedding_gather(
+        token_ids: &[u32],
+        table: *const std::os::raw::c_void,
+        table_format: u32,
+        table_element_count: usize,
+        hidden_size: usize,
+        scale: bool,
+    ) -> Result<Vec<f32>, String> {
+        if token_ids.is_empty() || hidden_size == 0 {
+            return Err("Vulkan embedding gather requires tokens and a hidden size.".to_string());
+        }
+        let output_len = token_ids.len() * hidden_size;
+        let mut output = vec![0.0; output_len];
+        let _guard = VULKAN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = unsafe {
+            vk_qwen_gather(
+                token_ids.as_ptr(),
+                table,
+                table_format,
+                table_element_count as u64,
+                output.as_mut_ptr(),
+                token_ids.len() as u32,
+                hidden_size as u32,
+                if scale { 1u32 } else { 0u32 },
+            )
+        };
+        check_native_result(result, "Vulkan embedding gather")?;
+        Ok(output)
+    }
+
+    /// Ant op 9: broadcast bias add on the GPU over a matmul output
+    /// (`values` has `rows * period` elements; the bias cycles per row).
+    /// In-place on `values`.
+    pub fn bias_add(
+        values: &mut [f32],
+        bias: *const std::os::raw::c_void,
+        bias_format: u32,
+        period: usize,
+    ) -> Result<(), String> {
+        if values.is_empty() || period == 0 {
+            return Err("Vulkan bias add requires values and a bias period.".to_string());
+        }
+        let _guard = VULKAN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = unsafe {
+            vk_qwen_bias_add(
+                values.as_ptr(),
+                bias,
+                bias_format,
+                values.len() as u32,
+                period as u32,
+                values.as_mut_ptr(),
+            )
+        };
+        check_native_result(result, "Vulkan bias add")?;
+        Ok(())
     }
 
     /// C[M,N] = A[M,K] * weight^T over a resident weight buffer: the weight
