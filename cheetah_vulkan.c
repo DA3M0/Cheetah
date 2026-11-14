@@ -245,6 +245,17 @@ static int select_physical_device(VkDeviceSize pool_size) {
                 g_vulkan.queue_family_index = family;
                 vkGetPhysicalDeviceProperties(devices[i],
                                                &g_vulkan.properties);
+                fprintf(stderr,
+                        "cheetah-vulkan: device '%s' (API %u.%u.%u, "
+                        "discrete=%d)\n",
+                        g_vulkan.properties.deviceName,
+                        VK_API_VERSION_MAJOR(g_vulkan.properties.apiVersion),
+                        VK_API_VERSION_MINOR(g_vulkan.properties.apiVersion),
+                        VK_API_VERSION_PATCH(g_vulkan.properties.apiVersion),
+                        g_vulkan.properties.deviceType ==
+                                VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+                            ? 1
+                            : 0);
                 free(families);
                 free(devices);
                 return 0;
