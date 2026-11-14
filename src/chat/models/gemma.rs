@@ -1,4 +1,4 @@
-use super::{ChatTemplate, ModelRegistration, ModelRuntime};
+use super::{ModelRuntime};
 use candle_core::Device;
 use candle_nn::VarBuilder;
 use candle_transformers::models::gemma;
@@ -6,18 +6,6 @@ use serde_json::Value;
 #[cfg(feature = "vulkan")]
 use std::path::PathBuf;
 
-pub(super) const REGISTRATION: ModelRegistration = ModelRegistration {
-    architectures: &["GemmaForCausalLM", "gemma"],
-    chat_template: ChatTemplate {
-        id: "gemma",
-        render: super::templates::gemma,
-        header_renderer: None,
-    },
-    stop_markers: &["<end_of_turn>"],
-    loader: load,
-    vulkan_loader: vulkan_loader(),
-    shaders: &["shared_ops"],
-};
 
 #[derive(Clone)]
 struct Runtime {
@@ -25,19 +13,9 @@ struct Runtime {
     device: Device,
 }
 
-const fn vulkan_loader() -> Option<super::VulkanModelLoader> {
-    #[cfg(feature = "vulkan")]
-    {
-        Some(load_vulkan)
-    }
-    #[cfg(not(feature = "vulkan"))]
-    {
-        None
-    }
-}
 
 #[cfg(feature = "vulkan")]
-fn load_vulkan(
+pub(super) fn load_vulkan(
     weight_paths: &[PathBuf],
     _config_bytes: &[u8],
     raw_config: Value,
@@ -109,13 +87,22 @@ mod vulkan_tests {
 }
 
 impl ModelRuntime for Runtime {
-    fn forward(
-        &mut self,
-        input: &candle_core::Tensor,
-        offset: usize,
-    ) -> Result<candle_core::Tensor, String> {
-        self.model
-            .forward(input, offset)
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        // Bridge the backend-agnostic runtime boundary to the Candle model:
+        // tokens in, final-position logits out.
+        let input = candle_core::Tensor::from_vec(
+            tokens.to_vec(),
+            (1, tokens.len()),
+            &self.device,
+        )
+        .map_err(|error| error.to_string())?;
+        let logits = self
+            .model
+            .forward(&input, offset)
+            .map_err(|error| error.to_string())?;
+        logits
+            .reshape((logits.elem_count(),))
+            .and_then(|logits| logits.to_vec1::<f32>())
             .map_err(|error| error.to_string())
     }
 
@@ -132,7 +119,7 @@ impl ModelRuntime for Runtime {
     }
 }
 
-fn load(
+pub(super) fn load(
     config_bytes: &[u8],
     _raw_config: Value,
     builder: VarBuilder<'_>,

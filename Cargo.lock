@@ -333,6 +333,7 @@ dependencies = [
  "ctrlc",
  "half",
  "indicatif 0.17.11",
+ "libc",
  "memmap2",
  "num_cpus",
  "pnet",

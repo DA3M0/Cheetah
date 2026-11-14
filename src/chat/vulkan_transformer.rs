@@ -1,5 +1,4 @@
 use crate::color::{self, Color};
-use candle_core::{Device, Tensor};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -712,8 +711,8 @@ pub(crate) struct VulkanTransformerExecutor {
 }
 
 impl super::models::ModelRuntime for VulkanTransformerExecutor {
-    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
-        VulkanTransformerExecutor::forward(self, input, offset)
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        VulkanTransformerExecutor::forward(self, tokens, offset)
     }
 
     fn clear_cache(&mut self) {
@@ -940,13 +939,11 @@ impl VulkanTransformerExecutor {
         }
     }
 
-    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
-        let (batch, sequence) = input
-            .dims2()
-            .map_err(|error| format!("Invalid Vulkan transformer input: {error}"))?;
-        if batch != 1 || sequence == 0 {
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        let sequence = tokens.len();
+        if sequence == 0 {
             return Err(format!(
-                "Vulkan {} requires a non-empty batch of size one.",
+                "Vulkan {} requires a non-empty token sequence.",
                 self.config.features.model_name
             ));
         }
@@ -969,12 +966,9 @@ impl VulkanTransformerExecutor {
                 "Vulkan transformer KV cache position does not match the input offset.".into(),
             );
         }
-        let token_ids = input
-            .to_vec2::<u32>()
-            .map_err(|error| format!("Cannot read Vulkan transformer token IDs: {error}"))?;
         let hidden = self.config.hidden_size;
         let mut activations = Vec::with_capacity(sequence * hidden);
-        for token_id in &token_ids[0] {
+        for token_id in tokens {
             let token = *token_id as usize;
             if token >= self.config.vocab_size {
                 return Err(format!("Token ID {token} exceeds the model vocabulary."));
@@ -1063,8 +1057,7 @@ impl VulkanTransformerExecutor {
         let logits = self
             .lm_head
             .linear(&normalized, 1, hidden, self.config.vocab_size)?;
-        Tensor::from_vec(logits, (1, 1, self.config.vocab_size), &Device::Cpu)
-            .map_err(|error| format!("Cannot create Vulkan transformer logits: {error}"))
+        Ok(logits)
     }
 }
 
@@ -1283,8 +1276,8 @@ pub(crate) struct VulkanPhiExecutor {
 }
 
 impl super::models::ModelRuntime for VulkanPhiExecutor {
-    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
-        VulkanPhiExecutor::forward(self, input, offset)
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        VulkanPhiExecutor::forward(self, tokens, offset)
     }
 
     fn clear_cache(&mut self) {
@@ -1435,11 +1428,9 @@ impl VulkanPhiExecutor {
         })
     }
 
-    fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor, String> {
-        let (batch, sequence) = input
-            .dims2()
-            .map_err(|error| format!("Invalid Vulkan Phi input: {error}"))?;
-        if batch != 1 || sequence == 0 {
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        let sequence = tokens.len();
+        if sequence == 0 {
             return Err("Vulkan Phi currently requires a non-empty batch of size one.".into());
         }
         let last_position = offset
@@ -1459,12 +1450,9 @@ impl VulkanPhiExecutor {
         {
             return Err("Vulkan Phi KV cache position does not match the input offset.".into());
         }
-        let token_ids = input
-            .to_vec2::<u32>()
-            .map_err(|error| format!("Cannot read Vulkan Phi token IDs: {error}"))?;
         let hidden = self.config.hidden_size;
         let mut activations = Vec::with_capacity(sequence * hidden);
-        for token_id in &token_ids[0] {
+        for token_id in tokens {
             let token = *token_id as usize;
             if token >= self.config.vocab_size {
                 return Err(format!("Token ID {token} exceeds the Phi vocabulary."));
@@ -1545,8 +1533,7 @@ impl VulkanPhiExecutor {
             .final_norm
             .forward(last, 1, hidden, self.config.layer_norm_eps)?;
         let logits = self.lm_head.forward(&normalized, 1)?;
-        Tensor::from_vec(logits, (1, 1, self.config.vocab_size), &Device::Cpu)
-            .map_err(|error| format!("Cannot create Vulkan Phi logits: {error}"))
+        Ok(logits)
     }
 }
 
@@ -1839,7 +1826,6 @@ mod tests {
     fn tiny_dense_and_moe_models_forward_and_reset_cache() {
         cheetah::native::vulkan::initialize().unwrap();
         cheetah::native::vulkan::prepare().unwrap();
-        let device = Device::Cpu;
         let feed_forward_features = [
             TransformerFeedForwardFeatures::Dense,
             TransformerFeedForwardFeatures::MixtureOfExperts {
@@ -1855,26 +1841,15 @@ mod tests {
         ];
         for features in feed_forward_features {
             let mut model = tiny_executor(features);
-            let first = Tensor::new(&[[0u32]], &device).unwrap();
+            let first = [0u32];
             let logits = model.forward(&first, 0).unwrap();
-            assert_eq!(logits.dims(), [1, 1, 2]);
-            assert!(
-                logits
-                    .to_vec3::<f32>()
-                    .unwrap()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .all(f32::is_finite)
-            );
-            let next = Tensor::new(&[[1u32]], &device).unwrap();
+            assert_eq!(logits.len(), 2);
+            assert!(logits.iter().all(|value| f32::is_finite(*value)));
+            let next = [1u32];
             model.forward(&next, 1).unwrap();
             model.clear_cache();
             let repeated = model.forward(&first, 0).unwrap();
-            assert_eq!(
-                logits.to_vec3::<f32>().unwrap(),
-                repeated.to_vec3::<f32>().unwrap()
-            );
+            assert_eq!(logits, repeated);
         }
         cheetah::native::vulkan::shutdown().unwrap();
     }

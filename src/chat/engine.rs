@@ -3,7 +3,7 @@ use crate::ant::{ant_swap_fit, Ant, AntLayerResidency, AntSettings, AntUnit};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use candle_transformers::models::llama;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rand::SeedableRng;
@@ -93,6 +93,10 @@ fn print_model_info(engine: &Engine) {
     );
     if let Some(architecture) = engine.model_architecture() {
         println!("  architecture: {architecture}");
+        println!(
+            "  backends:     {}",
+            super::models::registered_backend_names(architecture).join(", ")
+        );
     }
     println!("  device:       {}", engine.device_name());
     if !engine.ant_plan.is_empty() {
@@ -356,18 +360,26 @@ impl Engine {
         if threads == 0 {
             return Err("--threads must be greater than 0.".into());
         }
-        rayon::ThreadPoolBuilder::new()
+        // Reuse the existing global pool when one is already initialized
+        // (e.g. in-process callers such as the test harness).
+        let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .build_global()
-            .map_err(|error| format!("Failed to initialize CPU thread pool: {error}"))?;
+            .build_global();
         let model_dir = if path.is_dir() {
             path
         } else {
             path.parent().unwrap_or_else(|| Path::new("."))
         };
         let config_path = model_dir.join("config.json");
-        let config_bytes = fs::read(&config_path)
-            .map_err(|error| format!("Failed to read {}: {error}", config_path.display()))?;
+        let config_bytes = match fs::read(&config_path) {
+            Ok(bytes) => bytes,
+            Err(read_error) => {
+                // Ant: a prepared directory is self-describing — rebuild a
+                // minimal config from the manifest snapshot so a missing
+                // config.json does not gate loading.
+                synth_config_from_manifest(model_dir, &read_error)?
+            }
+        };
         let raw_config: serde_json::Value = serde_json::from_slice(&config_bytes)
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
         let config: ModelConfig = serde_json::from_value(raw_config.clone())
@@ -537,7 +549,34 @@ impl Engine {
                 }
             }
         }
-        let (device, model) = if let Some(resident_device) = ant_resident_device {
+        // Ant: prefer the native mmap-backed CPU backend for architectures that
+        // register a native loader — its tiers act on real pages.
+        // Set CHEETAH_NATIVE=0 to fall back to the Candle CPU path.
+        let native_enabled = std::env::var("CHEETAH_NATIVE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let native_model = if device_is_accelerator || !native_enabled {
+            None
+        } else {
+            match super::models::backend_loader_for_architecture(&architecture, "native") {
+                Some(super::models::BackendLoader::Native(loader)) => {
+                    let family = super::models::family_for_architecture(&architecture)
+                        .ok_or_else(|| {
+                            format!(
+                                "Architecture '{architecture}' registers a native backend without family parameters."
+                            )
+                        })?;
+                    Some(
+                        loader(model_dir, &config_bytes, &raw_config, &ant_plan, family)
+                            .map(|runtime| (Device::Cpu, runtime))?,
+                    )
+                }
+                _ => None,
+            }
+        };
+        let (device, model) = if let Some((device, model)) = native_model {
+            (device, model)
+        } else if let Some(resident_device) = ant_resident_device {
             super::models::load_model_for_device(
                 &effective_weight_paths,
                 &config_bytes,
@@ -636,6 +675,27 @@ impl Engine {
             <= self.ant_budget_bytes
     }
 
+    /// Ant: push tier transitions into the model's real memory pages when the
+    /// backend owns mmap-backed weights (native CPU backend); candle-backed
+    /// models report no tier control and only keep the C-side bookkeeping.
+    fn ant_apply_real_tier(&self, page_ins: &[(String, i32)], evictions: &[String]) {
+        if page_ins.is_empty() && evictions.is_empty() {
+            return;
+        }
+        let Ok(mut loaded) = self.model.lock() else {
+            return;
+        };
+        let Some(control) = loaded.model.as_ant_tier_control() else {
+            return;
+        };
+        for (unit_id, tier) in page_ins {
+            control.page_in_unit(unit_id, *tier);
+        }
+        for unit_id in evictions {
+            control.evict_unit(unit_id);
+        }
+    }
+
     fn ant_lock_runtime(&self) -> std::sync::MutexGuard<'_, AntRuntimeState> {
         self.ant_runtime
             .lock()
@@ -706,6 +766,8 @@ impl Engine {
                         }
                         state.evicted.insert(eviction.clone());
                         state.swaps_out = state.swaps_out.saturating_add(1);
+                        // Ant: drop the unit's real pages on mmap backends.
+                        self.ant_apply_real_tier(&[], std::slice::from_ref(eviction));
                     }
                 }
                 // Re-check before the swap: only proceed once the pool fits.
@@ -719,6 +781,8 @@ impl Engine {
             if manager.page_in(unit_id, 0).is_err() {
                 return false;
             }
+            // Ant: fault the unit's real pages in on mmap backends.
+            self.ant_apply_real_tier(&[(unit_id.to_string(), 0)], &[]);
             state.vram_used_bytes = state.vram_used_bytes.saturating_add(runtime.bytes);
             state.swaps_in = state.swaps_in.saturating_add(1);
             state.evicted.remove(unit_id);
@@ -735,6 +799,8 @@ impl Engine {
             if manager.page_in(unit_id, 1).is_err() {
                 return false;
             }
+            // Ant: fault the unit's real pages in on mmap backends.
+            self.ant_apply_real_tier(&[(unit_id.to_string(), 1)], &[]);
             state.swaps_in = state.swaps_in.saturating_add(1);
             if state.evicted.remove(unit_id)
                 || state.runtime_resident.insert(unit_id.to_string())
@@ -988,6 +1054,8 @@ impl Engine {
                 state.evicted.insert(unit_id.clone());
                 state.promotion_queue.retain(|queued| queued != &unit_id);
                 state.swaps_out = state.swaps_out.saturating_add(1);
+                // Ant: drop the unit's real pages on mmap backends.
+                self.ant_apply_real_tier(&[], std::slice::from_ref(&unit_id));
             }
         }
     }
@@ -1152,14 +1220,11 @@ impl Engine {
             .lock()
             .map_err(|_| "Model mutex was poisoned.".to_string())?;
         let mut model = loaded.model.clone();
-        let device = loaded.device.clone();
         drop(loaded);
         model.clear_cache();
-        let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), &device)
-            .map_err(|error| format!("Failed to prepare model input: {error}"))?;
         let started = Instant::now();
-        let mut logits = model
-            .forward(&input, 0)
+        let mut logits_values = model
+            .forward(prompt, 0)
             .map_err(|error| format!("Model inference failed: {error}"))?;
         let mut rng = StdRng::seed_from_u64(options.seed.unwrap_or_else(random_seed));
         let mut history = prompt.to_vec();
@@ -1182,10 +1247,6 @@ impl Engine {
                 finish_reason = FinishReason::Stop;
                 break;
             }
-            let logits_values = logits
-                .reshape((logits.elem_count(),))
-                .and_then(|logits| logits.to_vec1::<f32>())
-                .map_err(|error| format!("Failed to read model logits: {error}"))?;
             let token = sample_token(&logits_values, &history, options, &mut rng)?;
             if self.eos_token_ids.contains(&token) {
                 finish_reason = FinishReason::Stop;
@@ -1219,10 +1280,8 @@ impl Engine {
                 finish_reason = FinishReason::Stop;
                 break;
             }
-            let input = Tensor::from_vec(vec![token], (1, 1), &device)
-                .map_err(|error| format!("Failed to prepare generated token: {error}"))?;
-            logits = model
-                .forward(&input, history.len() - 1)
+            logits_values = model
+                .forward(&[token], history.len() - 1)
                 .map_err(|error| format!("Model inference failed: {error}"))?;
         }
         let decode_duration = decoding_started.elapsed();
@@ -1257,6 +1316,88 @@ fn resolve_model_files(path: &Path) -> Result<(Vec<PathBuf>, Option<Vec<String>>
         .transpose()?;
     let weight_paths = resolve_weight_files(path, manifest.as_ref())?;
     Ok((weight_paths, stop_markers))
+}
+
+/// Ant: rebuild a minimal config from the manifest's model-parameter snapshot
+/// when the copied config.json is missing, so a prepared model directory
+/// stays loadable on its own (parameters were snapshotted at `cheetah init`).
+/// Family-specific extra fields (hidden_act / sliding_window / ...) required
+/// by the Candle transformers structs are merged from the registration.
+fn synth_config_from_manifest(
+    model_dir: &Path,
+    read_error: &std::io::Error,
+) -> Result<Vec<u8>, String> {
+    let manifest = read_model_manifest(model_dir)?;
+    let model = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.get("model"))
+        .and_then(|model| model.as_object())
+        .ok_or_else(|| {
+            format!(
+                "Failed to read {}: {read_error}. The directory also has no manifest model-parameter snapshot; run `cheetah init` first.",
+                model_dir.join("config.json").display()
+            )
+        })?;
+    let required = [
+        "model_type",
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "vocab_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ];
+    for name in required {
+        if !model.contains_key(name) {
+            return Err(format!(
+                "Failed to read {}: {read_error}. The manifest snapshot is missing '{name}'; re-run `cheetah init`.",
+                model_dir.join("config.json").display()
+            ));
+        }
+    }
+    let model_type = model
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mut synthesized = model.clone();
+    synthesized.insert(
+        "architectures".into(),
+        serde_json::Value::Array(vec![serde_json::Value::String(model_type.clone())]),
+    );
+    if !synthesized.contains_key("max_position_embeddings") {
+        synthesized.insert("max_position_embeddings".into(), serde_json::json!(4096));
+    }
+    // Merge the family's fallback parameters and extra config fields, when
+    // registered: family values fill any gap the manifest snapshot does not
+    // cover (e.g. manifests written before the snapshot was extended).
+    if let Some(family) = super::models::family_for_architecture(&model_type) {
+        if !synthesized.contains_key("rope_theta") {
+            synthesized.insert("rope_theta".into(), serde_json::json!(family.rope_theta));
+        }
+        if !synthesized.contains_key("rms_norm_eps") {
+            synthesized.insert("rms_norm_eps".into(), serde_json::json!(family.rms_norm_eps));
+        }
+        if !synthesized.contains_key("tie_word_embeddings") {
+            synthesized.insert(
+                "tie_word_embeddings".into(),
+                serde_json::json!(family.tie_word_embeddings),
+            );
+        }
+        if !family.extra_config_json.trim().is_empty() {
+            let extra: serde_json::Value = serde_json::from_str(family.extra_config_json)
+                .map_err(|error| {
+                    format!("Invalid family extra_config_json for '{model_type}': {error}")
+                })?;
+            if let Some(source) = extra.as_object() {
+                for (key, value) in source {
+                    synthesized.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    serde_json::to_vec(&synthesized)
+        .map_err(|error| format!("Failed to synthesize config.json from the manifest: {error}"))
 }
 
 fn read_model_manifest(model_dir: &Path) -> Result<Option<serde_json::Value>, String> {

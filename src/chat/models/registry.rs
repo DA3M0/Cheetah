@@ -53,6 +53,9 @@ pub(in crate::chat) fn load_model(
     match registration.backend {
         Backend::Candle(create_device) => {
             let device = create_device()?;
+            if matches!(device, Device::Cpu) {
+                return Err(retired_cpu_candle_message(architecture));
+            }
             let model = candle::load_model(
                 weight_paths,
                 config_bytes,
@@ -70,6 +73,14 @@ pub(in crate::chat) fn load_model(
             model_registration,
         ),
     }
+}
+
+/// The Candle CPU path is retired: CPU inference runs on the native mmap
+/// backend; Candle remains the CUDA/Metal device option.
+fn retired_cpu_candle_message(architecture: &str) -> String {
+    format!(
+        "Architecture '{architecture}' has no native CPU backend registered, and the Candle CPU path is retired. Use CHEETAH_DEVICE=cuda or metal for Candle inference, or run a model family with a registered native backend."
+    )
 }
 
 pub(in crate::chat) fn backend_device(selected: &str) -> Result<Device, String> {
@@ -106,10 +117,17 @@ pub(in crate::chat) fn load_model_for_device(
         );
     }
     let model_registration = super::registration_for_architecture(architecture)?;
+    if matches!(device, Device::Cpu) {
+        return Err(retired_cpu_candle_message(architecture));
+    }
     let model = candle::load_model(weight_paths, config_bytes, raw_config, model_registration, &device)?;
     Ok((device, model))
 }
 
+#[cfg_attr(
+    not(feature = "vulkan"),
+    allow(unused_variables, unused_mut)
+)]
 fn load_vulkan_or_fallback(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
@@ -118,76 +136,66 @@ fn load_vulkan_or_fallback(
     model_registration: &'static ModelRegistration,
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
     #[cfg(feature = "vulkan")]
-    if let Some(loader) = model_registration.vulkan_loader {
-        if model_registration
-            .shaders
-            .iter()
-            .any(|shader| !super::shader_is_registered(shader))
-        {
+    match model_registration.loader_for("vulkan") {
+        Some(super::BackendLoader::Vulkan(loader)) => {
+            if model_registration
+                .shaders
+                .iter()
+                .any(|shader| !super::shader_is_registered(shader))
+            {
+                eprintln!(
+                    "{}",
+                    color::stderr(
+                        &format!(
+                            "cheetah: Vulkan model '{}' references an unregistered shader.",
+                            model_registration.chat_template.id
+                        ),
+                        Color::Yellow
+                    )
+                );
+            } else {
+                let vulkan_model = (|| loader(weight_paths, config_bytes, raw_config.clone()))();
+                match vulkan_model {
+                    Ok(executor) => return Ok((Device::Cpu, executor)),
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            color::stderr(
+                                &format!(
+                                    "cheetah: Vulkan model '{}' unavailable ({error}).",
+                                    model_registration.chat_template.id
+                                ),
+                                Color::Yellow
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        _ => {
             eprintln!(
                 "{}",
                 color::stderr(
                     &format!(
-                        "cheetah: Vulkan model '{}' references an unregistered shader; falling back to CPU.",
-                        model_registration.chat_template.id
+                        "cheetah: Vulkan inference is not registered for architecture '{_architecture}'; falling back to CPU."
                     ),
                     Color::Yellow
                 )
             );
-        } else {
-            let vulkan_model = (|| loader(weight_paths, config_bytes, raw_config.clone()))();
-            match vulkan_model {
-                Ok(executor) => return Ok((Device::Cpu, executor)),
-                Err(error) => {
-                    eprintln!(
-                        "{}",
-                        color::stderr(
-                            &format!(
-                                "cheetah: Vulkan model '{}' unavailable ({error}); falling back to CPU.",
-                                model_registration.chat_template.id
-                            ),
-                            Color::Yellow
-                        )
-                    );
-                }
-            }
         }
-    } else {
-        eprintln!(
-            "{}",
-            color::stderr(
-                &format!(
-                    "cheetah: Vulkan inference is not registered for architecture '{_architecture}'; falling back to CPU."
-                ),
-                Color::Yellow
-            )
-        );
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _has_vulkan_registration = model_registration.vulkan_loader.is_some()
-            && model_registration
-                .shaders
-                .iter()
-                .all(|shader| super::shader_is_registered(shader));
         eprintln!(
             "{}",
             color::stderr(
-                "cheetah: Vulkan support was not compiled; falling back to CPU. Rebuild with --features vulkan.",
+                "cheetah: Vulkan support was not compiled. Rebuild with --features vulkan, or use CHEETAH_DEVICE=cuda/metal.",
                 Color::Yellow
             )
         );
     }
 
-    let device = Device::Cpu;
-    let model = candle::load_model(
-        weight_paths,
-        config_bytes,
-        raw_config,
-        model_registration,
-        &device,
-    )?;
-    Ok((device, model))
+    Err(retired_cpu_candle_message(_architecture))
 }
 
 fn cpu_device() -> Result<Device, String> {
