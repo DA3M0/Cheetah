@@ -89,6 +89,17 @@ typedef struct ModelInfo {
     int found_key;
     uint64_t key_output_size;
     int model_type_from_config;
+    int has_rope_theta;
+    double rope_theta;
+    int has_rms_norm_eps;
+    double rms_norm_eps;
+    int has_tie_word_embeddings;
+    int tie_word_embeddings;
+    int has_config_attention_heads;
+    uint64_t config_attention_heads;
+    int has_config_kv_heads;
+    uint64_t config_kv_heads;
+    int max_context_from_config;
     int has_im_start;
     int has_im_end;
     int has_header_tokens;
@@ -221,6 +232,36 @@ static int parse_hex4(JsonParser *parser, uint32_t *value) {
     }
     parser->cursor += 4;
     *value = result;
+    return 0;
+}
+
+static int parse_json_number(JsonParser *parser, double *value) {
+    char *end = NULL;
+    double parsed;
+
+    skip_space(parser);
+    if (parser->cursor >= parser->end) return 0;
+    parsed = strtod(parser->cursor, &end);
+    if (end == parser->cursor) return 0;
+    parser->cursor = end;
+    *value = parsed;
+    return 1;
+}
+
+static int parse_json_boolean(JsonParser *parser, int *value) {
+    skip_space(parser);
+    if ((size_t)(parser->end - parser->cursor) < 4) return 0;
+    if (strncmp(parser->cursor, "true", 4) == 0) {
+        parser->cursor += 4;
+        *value = 1;
+        return 1;
+    }
+    if ((size_t)(parser->end - parser->cursor) >= 5 &&
+        strncmp(parser->cursor, "false", 5) == 0) {
+        parser->cursor += 5;
+        *value = 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -1013,6 +1054,14 @@ static void finalize_inference(ModelInfo *model) {
     if (model->model_type[0] == '\0') {
         (void)snprintf(model->model_type, sizeof(model->model_type), "llama");
     }
+    /* Source config.json values are authoritative; the tensor-shape
+     * heuristics above only filled in what the config did not provide. */
+    if (model->has_config_attention_heads) {
+        model->num_attention_heads = model->config_attention_heads;
+    }
+    if (model->has_config_kv_heads) {
+        model->num_key_value_heads = model->config_kv_heads;
+    }
 }
 
 static int add_source_mapping(ModelInfo *model, const char *path,
@@ -1530,14 +1579,37 @@ static int write_manifest(const char *path, const ModelInfo *model) {
     failed |= fprintf(file,
                       ",\n    \"model_type_source\": \"%s\""
                       ",\n    \"num_attention_heads_source\": \"%s\""
-                      ",\n    \"max_position_embeddings_source\": \"default (4096)\""
-                      "\n  },\n  \"chat_template\": ",
+                      ",\n    \"max_position_embeddings_source\": \"%s\"",
                       model->model_type_from_config
                           ? "source config.json"
                           : "tensor-name heuristic",
-                      model->has_q_norm
-                          ? "inferred from q_norm and q_proj tensor shapes"
-                          : "estimated from hidden_size; verify") < 0;
+                      model->has_config_attention_heads
+                          ? "source config.json"
+                          : (model->has_q_norm
+                                 ? "inferred from q_norm and q_proj tensor shapes"
+                                 : "estimated from hidden_size; verify"),
+                      model->max_context_from_config
+                          ? "source config.json"
+                          : "default (4096)") < 0;
+    if (!failed && model->has_rope_theta) {
+        failed |= fprintf(file,
+                          ",\n    \"rope_theta\": %.6f"
+                          ",\n    \"rope_theta_source\": \"source config.json\"",
+                          model->rope_theta) < 0;
+    }
+    if (!failed && model->has_rms_norm_eps) {
+        failed |= fprintf(file,
+                          ",\n    \"rms_norm_eps\": %.8f"
+                          ",\n    \"rms_norm_eps_source\": \"source config.json\"",
+                          model->rms_norm_eps) < 0;
+    }
+    if (!failed && model->has_tie_word_embeddings) {
+        failed |= fprintf(file,
+                          ",\n    \"tie_word_embeddings\": %s"
+                          ",\n    \"tie_word_embeddings_source\": \"source config.json\"",
+                          model->tie_word_embeddings ? "true" : "false") < 0;
+    }
+    failed |= fprintf(file, "\n  },\n  \"chat_template\": ") < 0;
     if (!failed && append_json_string(file, model->chat_template) != 0) failed = 1;
     failed |= fprintf(file, ",\n  \"stop_markers\": [") < 0;
     for (i = 0; !failed && i < model->stop_marker_count; ++i) {
@@ -1795,6 +1867,102 @@ static char *json_string_field_from_file(const char *path, const char *field) {
     }
     free(contents);
     return value;
+}
+
+/* Parse ": <value>" for a numeric or boolean field directly from file
+ * contents; used to snapshot authoritative model parameters from the source
+ * config.json into the manifest. */
+static int json_scalar_field_from_contents(const char *contents, size_t length,
+                                           const char *field, double *number_out,
+                                           int *bool_out) {
+    char needle[128];
+    const char *cursor;
+    JsonParser parser;
+    int parsed = 0;
+
+    if (snprintf(needle, sizeof(needle), "\"%s\"", field) < 0 ||
+        strlen(needle) >= sizeof(needle)) {
+        return 0;
+    }
+    cursor = strstr(contents, needle);
+    if (cursor == NULL) return 0;
+    cursor += strlen(needle);
+    parser.cursor = cursor;
+    parser.end = contents + length;
+    skip_space(&parser);
+    if (parser.cursor >= parser.end || *parser.cursor++ != ':') return 0;
+    if (number_out != NULL && parse_json_number(&parser, number_out)) {
+        parsed = 1;
+    } else if (bool_out != NULL && parse_json_boolean(&parser, bool_out)) {
+        parsed = 1;
+    }
+    return parsed;
+}
+
+static int json_number_field_from_file(const char *path, const char *field,
+                                       double *value) {
+    FILE *file;
+    long file_size;
+    char *contents;
+    int parsed = 0;
+
+    file = fopen(path, "rb");
+    if (file == NULL) return 0;
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) < 0 ||
+        (uintmax_t)file_size > SIZE_MAX - 1 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+    contents = (char *)malloc((size_t)file_size + 1);
+    if (contents == NULL) {
+        fclose(file);
+        return 0;
+    }
+    if (fread(contents, 1, (size_t)file_size, file) != (size_t)file_size) {
+        free(contents);
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    contents[file_size] = '\0';
+    parsed = json_scalar_field_from_contents(contents, (size_t)file_size,
+                                             field, value, NULL);
+    free(contents);
+    return parsed;
+}
+
+static int json_bool_field_from_file(const char *path, const char *field,
+                                     int *value) {
+    FILE *file;
+    long file_size;
+    char *contents;
+    int parsed = 0;
+
+    file = fopen(path, "rb");
+    if (file == NULL) return 0;
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) < 0 ||
+        (uintmax_t)file_size > SIZE_MAX - 1 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+    contents = (char *)malloc((size_t)file_size + 1);
+    if (contents == NULL) {
+        fclose(file);
+        return 0;
+    }
+    if (fread(contents, 1, (size_t)file_size, file) != (size_t)file_size) {
+        free(contents);
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    contents[file_size] = '\0';
+    parsed = json_scalar_field_from_contents(contents, (size_t)file_size,
+                                             field, NULL, value);
+    free(contents);
+    return parsed;
 }
 
 static const char *find_bytes(const char *begin, const char *end,
@@ -2135,6 +2303,46 @@ int cheetah_init_model_with_progress(const char *src_dir, const char *dst_dir,
                 (void)snprintf(model.model_type, sizeof(model.model_type), "%s",
                                configured_model_type);
                 model.model_type_from_config = 1;
+            }
+            /* Snapshot authoritative inference parameters from the source
+             * config.json into the manifest so a prepared model directory is
+             * self-describing even if the copied config.json is removed. */
+            {
+                double number = 0.0;
+                int flag = 0;
+                if (json_number_field_from_file(source_config, "rope_theta",
+                                                &number)) {
+                    model.rope_theta = number;
+                    model.has_rope_theta = 1;
+                }
+                if (json_number_field_from_file(source_config, "rms_norm_eps",
+                                                &number)) {
+                    model.rms_norm_eps = number;
+                    model.has_rms_norm_eps = 1;
+                }
+                if (json_bool_field_from_file(source_config,
+                                              "tie_word_embeddings", &flag)) {
+                    model.tie_word_embeddings = flag;
+                    model.has_tie_word_embeddings = 1;
+                }
+                if (json_number_field_from_file(
+                        source_config, "num_attention_heads", &number) &&
+                    number > 0.0) {
+                    model.config_attention_heads = (uint64_t)number;
+                    model.has_config_attention_heads = 1;
+                }
+                if (json_number_field_from_file(
+                        source_config, "num_key_value_heads", &number) &&
+                    number > 0.0) {
+                    model.config_kv_heads = (uint64_t)number;
+                    model.has_config_kv_heads = 1;
+                }
+                if (json_number_field_from_file(
+                        source_config, "max_position_embeddings", &number) &&
+                    number > 0.0) {
+                    model.max_context = (uint64_t)number;
+                    model.max_context_from_config = 1;
+                }
             }
         }
         if (source_tokenizer_config != NULL) {
