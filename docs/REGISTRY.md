@@ -266,8 +266,14 @@ Selection details worth knowing:
 | Backend | Implementation | Weight data path |
 |---------|----------------|------------------|
 | Candle | `candle.rs` (`VarBuilder::from_mmaped_safetensors`, F32) + per-architecture wrappers around `candle_transformers` | owned tensors, materialized at build (CUDA/Metal devices only) |
-| Native | `native/` (mmap store, Ant tiers, SIMD kernels) | zero-copy mmap views in stored dtype; tiers = real pages |
-| Vulkan | `vulkan_transformer.rs` executors (transformer + Phi) + `cheetah_vulkan.c` substrate | weights staged into a VRAM-allocator pool; HOST_VISIBLE|HOST_COHERENT heap required |
+| Native | `native/` (mmap store, Ant tiers, SIMD kernels) | zero-copy mmap views in stored dtype (BF16/F16/F32); tiers = real pages via madvise |
+| Vulkan | `vulkan_transformer.rs` executors (transformer + Phi) + `cheetah_vulkan.c` substrate | Ant-bucketed: VRAM-tier weights in DEVICE_LOCAL buffers, disk-tier in HOST_COHERENT streaming pool; supports BF16/F16/F32 and Q8 (row-wise int8) precisions |
+
+Vulkan operator library (`shared_ops.comp`, 10 ops): rms_norm, elementwise
+add, silu_mul, rotary, attention, gelu_mul (exact + tanh approx), layer_norm,
+embedding_gather, bias_add — all dispatched through a single compute shader
+with a push-constant `op` selector. Dedicated matmul pipelines for f32, bf16,
+f16, and q8 precisions.
 
 The runtime boundary is backend-agnostic: `ModelRuntime::forward(&[u32],
 usize) -> Result<Vec<f32>, String>` — tokens in, final-position logits out.

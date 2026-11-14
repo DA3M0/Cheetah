@@ -177,12 +177,35 @@ run_init_command      src/main.rs:90
 
 ## 4. Environment surface
 
+### 4.1 Device & backend selection
+
+| Variable | Read by | Values | Effect |
+|----------|---------|--------|--------|
+| `CHEETAH_DEVICE` | registry.rs, engine.rs | `cpu` / `cuda` / `metal` / `vulkan` | backend selection. `cpu` (default) → native mmap backend for registered families (Qwen2, Llama, Qwen3); `cuda`/`metal` → Candle; `vulkan` → independent executor. |
+| `CHEETAH_NATIVE` | engine.rs | `0` / `1` | `0` skips native selection (surfaces the guidance error for unregistered families on CPU). Kept for policy testing. |
+| `CHEETAH_QUANT_Q8` | vulkan_transformer.rs (take_linear) | `1` / `true` | Quantizes all Linear projections to row-wise int8 (Q8) at load time. Halves weight footprint; norms/biases/embeddings stay in original precision. Vulkan only. |
+
+### 4.2 Vulkan substrate
+
+| Variable | Read by | Values | Effect |
+|----------|---------|--------|--------|
+| `CHEETAH_VRAM_POOL_SIZE` | cheetah_vulkan.c | bytes (default 800 MiB) | HOST_COHERENT allocator pool size; also filters devices (heap must ≥ pool) |
+| `CHEETAH_MATMUL_SPV` | cheetah_vulkan.c | .spv path | overrides the f32 matmul shader |
+| `CHEETAH_MATMUL_BF16_SPV` | cheetah_vulkan.c | .spv path | overrides the bf16 matmul shader |
+| `CHEETAH_MATMUL_Q8_SPV` | cheetah_vulkan.c | .spv path | overrides the q8 matmul shader |
+| `CHEETAH_QWEN_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the shared_ops shader (rmsnorm/rope/attention/silu/gelu/elementwise) |
+
+### 4.3 Build-time
+
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `CHEETAH_DEVICE` | registry.rs, engine.rs | `cpu` (default, native) / `cuda` / `metal` / `vulkan` |
-| `CHEETAH_NATIVE` | engine.rs | `0` disables native selection (Candle CPU is retired — this surfaces the guidance error; kept for policy testing) |
-| `CHEETAH_VRAM_POOL_SIZE` | cheetah_vulkan.c | Vulkan allocator pool bytes (default 800 MiB) |
-| `GLSLC` | build.rs | shader compiler override |
+| `GLSLC` | build.rs | shader compiler path (default: `glslc` on PATH) |
+
+### 4.4 Testing
+
+| Variable | Read by | Effect |
+|----------|---------|--------|
+| `CHEETAH_TEST_VULKAN_Q8` | vulkan_transformer.rs (tests) | set `1` to run the q8 resident-matmul forward test (needs a Vulkan device) |
 | `NO_COLOR` | color.rs | disable ANSI coloring |
 
 Constant filenames (not env): `cheetah_units.json`, `cheetah_manifest.json`,

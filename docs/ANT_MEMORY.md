@@ -242,7 +242,7 @@ The full sequence, in order:
 4. Resolve Ant settings (§3.3).
 5. Open the units manifest and plan residency (`plan_residency`).
 6. Apply the budget (`ant_apply_budget`) → `ant_evicted` list.
-7. Derive the layer summary (§5) and seed the runtime bookkeeping (§7.4).
+7. Derive the layer summary (§5) and seed the runtime bookkeeping (§7.8).
 8. **Native selection**: on CPU devices, look up
    `backend_loader_for_architecture(architecture, "native")` (see
    [REGISTRY.md](REGISTRY.md) §7). When registered, the native loader
@@ -251,7 +251,7 @@ The full sequence, in order:
 9. Otherwise fall through to the device backends: CUDA/Metal → Candle;
    Vulkan → the independent executor. The Candle CPU path is retired
    (an explicit guidance error, not a silent fallback).
-10. Seed `AntRuntimeState` from the plan (§7.4) and print the startup banner
+10. Seed `AntRuntimeState` from the plan (§7.8) and print the startup banner
     (`ant plan`, `ant layers`, `ant swap`, `backends`).
 
 ---
@@ -345,7 +345,109 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
   `(sin, cos)` — historically swapped, guarded by a comment and tests**),
   `silu_multiply`, `softmax` (stable, in place).
 
-### 7.4 Engine-side runtime accounting (`AntRuntimeState`)
+### 7.4 SIMD kernels — AVX2+FMA detail
+
+`dot_row_bf16_fused` is the hottest per-token path. Two implementations
+behind one call site, dispatched by `is_x86_feature_detected!("avx2") &&
+is_x86_feature_detected!("fma")`:
+
+- **AVX2+FMA intrinsics** (`#[target_feature(enable = "avx2,fma")]`):
+  one 256-bit load = 16 bf16 lanes; each 128-bit half is zero-extended
+  (`_mm256_cvtepu16_epi32`) and shifted left 16 (`_mm256_slli_epi32`) — the
+  u32 lane becomes `bf16 << 16`, which bit-casts to the f32 value with lanes
+  preserved — then two `_mm256_fmadd_ps` per 16-element chunk. Horizontal
+  reduction once per row (store + sum).
+- **Portable fused loop** (`as_chunks::<8>` row × `as_chunks::<4>` x, four
+  accumulators, pure bit arithmetic): on AVX2 hardware LLVM compiles this to
+  equivalent vector code (measured parity), so the portable path is the
+  correctness reference and the non-AVX2 fallback in one.
+
+Other kernels (`rmsnorm`, `rope_in_place`, `silu_multiply`, `softmax`) are
+scalar loops in f32 — they are not bandwidth-bound and do not benefit from
+explicit SIMD at current model sizes.
+
+### 7.5 Q8 quantization (Vulkan + all paths)
+
+`CHEETAH_QUANT_Q8=1` quantizes every Linear projection to row-wise
+symmetric int8 at load time. The quantized buffer layout:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ f32 scale[0] │ f32 scale[1] │ ... │ f32 scale[n-1]      │  ← head (n×4 B)
+├─────────────────────────────────────────────────────────┤
+│ i8 row 0, col 0..(cols+3)/4*4  (padded to 4-byte)       │  ← packed
+│ i8 row 1, ...                                           │
+│ ...                                                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+The shader (`matmul_q8.comp`) unpacks four int8 lanes per u32 word with a
+sign-extending shift and multiplies by the row scale loaded from the head.
+Dedicated pipeline (`ensure_matmul_q8_pipeline`) with its own descriptor
+layout and push-constant layout to avoid NULL-layout crashes on first use.
+
+Coverage: Linear projections only (norms, biases and the embedding stay in
+their original precision). Both the host-streaming and the resident path
+consume the same quantized buffer layout.
+
+Memory: ~0.25 bytes of scale overhead per weight on top of the int8 payload —
+roughly half the footprint of BF16. The per-row symmetric quantization bounds
+the dequantization error to ±scale/2 (±max|w|/254).
+
+### 7.6 Vulkan bucketed residency
+
+The Vulkan executor's weights live in two memory pools, mapped to Ant tiers:
+
+| Ant tier | Vulkan memory | Shader access |
+|----------|--------------|---------------|
+| VRAM/RAM (resident) | DEVICE_LOCAL (real VRAM) | fast GPU-local reads |
+| Disk (streaming) | HOST_COHERENT (host RAM) | GPU reads via PCIe each step |
+
+- **Load**: VRAM-tier weights are uploaded once via
+  `cheetah_vulkan_weight_upload_bf16` / `_q8` into persistent device-local
+  buffers; disk-tier weights stay in the host-coherent streaming path.
+- **Per step**: disk-tier weights are staged through the HOST_COHERENT pool
+  (a copy into a pool buffer + one dispatch), then the pool space is released.
+  Resident weights stay bound in place — no per-step copy.
+- **Ant page-in / evict** (`AntTierControl`): moves a unit's buffer between
+  the two buckets (upload = allocate device-local + copy; evict = free the
+  device allocation; the host copy in `WeightData` is always authoritative).
+
+Measured on GT 730M (983 MB VRAM): tiered plans show real VRAM residency
+(7 → 25 MiB), full-resident plans degrade gracefully bucket-by-bucket when
+VRAM is insufficient, output unchanged.
+
+The executor requires a HOST_VISIBLE|HOST_COHERENT heap for the streaming
+bucket — discrete GPUs whose DEVICE_LOCAL memory is not host-coherent
+(most discrete GPUs) keep weights in host RAM, so the GPU runs compute
+shaders with PCIe data reads. True VRAM residency requires the device-local
+bucket to fit the resident tier's bytes.
+
+### 7.7 Vulkan operator library (shared_ops.comp)
+
+Ten ops dispatched through a single compute shader (`shared_ops.comp`) with
+a push-constant `op` selector:
+
+| op | Function | Notes |
+|----|----------|-------|
+| 0 | rms_norm | weight_format supports f32/f16/bf16 |
+| 1 | elementwise add | |
+| 2 | silu_mul | silu(gate) ⊙ up |
+| 3 | rotary | rotate-half GQA-aware |
+| 4 | attention | causal, softmax fused |
+| 5 | gelu_mul (exact) | gelu_erf(gate) ⊙ up |
+| 6 | gelu_mul (tanh approx) | |
+| 7 | layer_norm | mean-subtract variant |
+| **8** | **embedding_gather** | token ids + table → rows, with scale |
+| **9** | **bias_add** | broadcast bias over matmul output |
+
+The format encoding for `load_weight` / `load_bias` in shared_ops.comp is
+**0 = f32, 2 = f16, 3 = bf16** (the f16 branch uses `unpackHalf2x16`; the
+bf16 branch uses bit-shift widening). This encoding differs from the C-side
+matmul pipeline's `weight_format` (which uses bit 1 for f16/bf16 selection) —
+`WeightData::ffi_parts` normalizes to the shared_ops encoding.
+
+### 7.8 Engine-side runtime accounting (`AntRuntimeState`)
 
 Phase-3 bookkeeping that the generation hooks keep up to date (in `Engine`,
 behind a `Mutex`):
@@ -435,6 +537,9 @@ Lessons worth keeping:
 | + fused bf16 (bit widening in accumulator) | 3.7 | parity with retired Candle path |
 | + AVX2 explicit intrinsics | 3.0–3.7 | parity (LLVM already auto-vectorized the portable path) |
 | Machine idle, latest build | **7.9–8.4** | same binary, unloaded host |
+| Vulkan GT 730M, BF16 streaming | 0.3 | old per-step weight copy design |
+| Vulkan GT 730M, BF16 bucketed residency | 0.47 | resident matmul skips weight copy |
+| Vulkan GT 730M, Q8 bucketed residency | ~0.5 (est.) | halved weight footprint; Kepler shader-limited |
 
 Memory (16M/32M tiered): steady RSS **123 MB**, inference peak **152 MB**
 (lm_head chunked with per-chunk page release), vs Candle 2,497/3,704 MB.
@@ -478,6 +583,11 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   the original full-offload design.
 - The C-side `eviction_policy` (`lru|clock|clock2`) is metadata only; the
   native backend's effective policy is tier-driven.
+- Q8 quantization changes the numerics (per-row int8 bounds the error to
+  ±max|w|/254 per weight). Outputs differ from BF16/F32 runs.
+- Vulkan resident bucket (DEVICE_LOCAL) requires the VRAM-tier bytes to fit
+  in the device's memory heap. Oversized uploads fall back to the
+  host-coherent streaming path per weight.
 
 ---
 

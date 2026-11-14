@@ -279,6 +279,8 @@ Ant is Cheetah's fine-grained model memory optimization for local inference. Aft
 - **RAM (tier 1):** resident — pages stay faulted in.
 - **Disk (tier 2):** cold — pages dropped with `madvise(DONTNEED)` and streamed back in per step.
 
+Set `CHEETAH_QUANT_Q8=1` to quantize linear projections to row-wise int8 (halves the weight footprint for the native CPU and Vulkan backends; norms, biases and embeddings stay in original precision).
+
 On the default CPU path (the native backend), tiers act on **real memory pages**: a disk-tier unit contributes ~0 resident bytes, and the OS page cache absorbs re-reads. Measured on qwen-0.5b with a 16 MB/32 MB budget: steady RSS **123 MB** (vs 2,497 MB for the retired Candle CPU path) with identical output.
 
 Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, `--ant-allow-vram-swap <bool>`.
