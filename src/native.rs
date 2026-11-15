@@ -285,11 +285,10 @@ pub fn init_model_with_metadata(
 
         if result.is_ok() {
             for bar in [&mut progress.parse_bar, &mut progress.write_bar] {
-                if let Some(b) = bar {
-                    if !b.is_finished() {
+                if let Some(b) = bar
+                    && !b.is_finished() {
                         b.finish_with_message("Initialization complete");
                     }
-                }
             }
         } else {
             abandon_bars(&mut progress);
@@ -303,10 +302,8 @@ pub fn init_model_with_metadata(
 }
 
 fn abandon_bars(progress: &mut InitProgress) {
-    for bar in [&mut progress.parse_bar, &mut progress.write_bar] {
-        if let Some(b) = bar {
-            b.abandon_with_message("Initialization failed");
-        }
+    for b in [&mut progress.parse_bar, &mut progress.write_bar].into_iter().flatten() {
+        b.abandon_with_message("Initialization failed");
     }
 }
 

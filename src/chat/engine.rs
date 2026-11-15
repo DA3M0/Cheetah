@@ -264,8 +264,7 @@ fn ant_resident_weight_paths(
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     for unit in units {
         let tier = plan
-            .get(&unit.unit_id)
-            .and_then(|tier| Some(tier.as_str()))
+            .get(&unit.unit_id).map(|tier| tier.as_str())
             .unwrap_or("vram");
         if tier == "disk" || evicted.iter().any(|e| e == &unit.unit_id) {
             continue;
@@ -294,8 +293,7 @@ fn ant_apply_budget(
     let mut resident: Vec<(u64, u64, String)> = Vec::new();
     for unit in units {
         let tier = plan
-            .get(&unit.unit_id)
-            .and_then(|tier| Some(tier.as_str()))
+            .get(&unit.unit_id).map(|tier| tier.as_str())
             .unwrap_or("vram");
         if tier != "disk" {
             resident_bytes = resident_bytes.saturating_add(unit.byte_size());
@@ -441,18 +439,17 @@ impl Engine {
                 // Ant: derive the atomic-unit residency plan from the units manifest.
                 //  Ant: 从 units manifest 派生原子单元驻留计划。
                 if let Ok(manager) = Ant::with_settings(settings) {
-                    if let Ok(units) = manager.units_for_model(&model_dir) {
+                    if let Ok(units) = manager.units_for_model(model_dir) {
                         let plan = manager.plan_residency(&units);
                         for unit in &units {
                             let tier = plan
-                                .get(&unit.unit_id)
-                                .and_then(|tier| Some(tier.as_str()))
+                                .get(&unit.unit_id).map(|tier| tier.as_str())
                                 .unwrap_or("vram");
                             ant_plan.insert(unit.unit_id.clone(), tier.to_string());
                         }
                         let (resident_bytes, evicted_units) = ant_apply_budget(
                             &manager,
-                            &model_dir,
+                            model_dir,
                             &units,
                             &plan,
                             ant_budget_bytes,
@@ -510,8 +507,8 @@ impl Engine {
                 }
             }
         }
-        if let Some(settings) = ant {
-            if settings.enabled && !ant_units.is_empty() {
+        if let Some(settings) = ant
+            && settings.enabled && !ant_units.is_empty() {
                 effective_weight_paths = ant_resident_weight_paths(
                     &weight_paths,
                     &ant_units,
@@ -519,19 +516,17 @@ impl Engine {
                     &ant_evicted,
                 );
             }
-        }
         // Ant: resolve the inference device from the residency plan. Resident VRAM
         // units load into the accelerator device; resident RAM-only units load into
         // the CPU device; disk units are excluded before the loader runs.
         let mut ant_resident_device: Option<Device> = None;
         let mut ant_resident_device_is_accelerator = device_is_accelerator;
-        if let Some(settings) = ant_settings.as_ref() {
-            if settings.enabled && !ant_units.is_empty() {
+        if let Some(settings) = ant_settings.as_ref()
+            && settings.enabled && !ant_units.is_empty() {
                 let mut resident_tiers: Vec<&str> = Vec::new();
                 for unit in &ant_units {
                     let tier = ant_plan
-                        .get(&unit.unit_id)
-                        .and_then(|tier| Some(tier.as_str()))
+                        .get(&unit.unit_id).map(|tier| tier.as_str())
                         .unwrap_or("vram");
                     if tier == "disk" || ant_evicted.iter().any(|e| e == &unit.unit_id) {
                         continue;
@@ -539,16 +534,15 @@ impl Engine {
                     resident_tiers.push(tier);
                 }
                 if !resident_tiers.is_empty() {
-                    if resident_tiers.iter().any(|tier| *tier == "vram") && device_is_accelerator {
+                    if resident_tiers.contains(&"vram") && device_is_accelerator {
                         let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
                         ant_resident_device = Some(super::models::backend_device(&selected)?);
-                    } else if !resident_tiers.iter().any(|tier| *tier == "vram") {
+                    } else if !resident_tiers.contains(&"vram") {
                         ant_resident_device = Some(Device::Cpu);
                         ant_resident_device_is_accelerator = false;
                     }
                 }
             }
-        }
         // Ant: prefer the native mmap-backed CPU backend for architectures that
         // register a native loader — its tiers act on real pages.
         // Set CHEETAH_NATIVE=0 to fall back to the Candle CPU path.
@@ -1695,7 +1689,7 @@ fn chat_loop(
                 }
                 archive.name = name.to_owned();
                 archive.turns = messages
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|pair| ConversationTurn {
                         user: pair[0].content.clone(),
                         assistant: pair[1].content.clone(),

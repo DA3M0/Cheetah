@@ -1079,10 +1079,7 @@ impl Read for ChannelReader {
                         Err(RecvTimeoutError::Disconnected) => return Ok(0),
                     }
                 } else {
-                    match self.receiver.try_recv() {
-                        Ok(chunk) => Some(chunk),
-                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => None,
-                    }
+                    self.receiver.try_recv().ok()
                 };
                 let Some(next) = next else {
                     break;

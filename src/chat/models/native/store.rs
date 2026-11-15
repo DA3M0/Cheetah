@@ -228,7 +228,7 @@ impl MmapWeightStore {
             // SAFETY: offset < slice.len(), reading a single byte from the map.
             let _ = unsafe { std::ptr::read_volatile(ptr.add(offset)) };
         }
-        if slice.len() > 0 {
+        if !slice.is_empty() {
             let _ = unsafe { std::ptr::read_volatile(ptr.add(slice.len() - 1)) };
         }
     }

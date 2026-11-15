@@ -51,7 +51,7 @@ fn dequant_bf16_row(row_bytes: &[u8], out: &mut [f32]) {
         out[2 * index + 1] = f32::from_bits(word & 0xFFFF_0000);
     }
     let tail_u16: &[u8] = tail;
-    for (index, chunk) in tail_u16.chunks_exact(2).enumerate() {
+    for (index, chunk) in tail_u16.as_chunks::<2>().0.iter().enumerate() {
         out[2 * pairs.len() + index] = bf16_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
 }
@@ -63,12 +63,12 @@ fn dequant_row(row_bytes: &[u8], dtype: super::store::WeightDType, out: &mut [f3
     match dtype {
         WeightDType::Bf16 => dequant_bf16_row(row_bytes, out),
         WeightDType::F16 => {
-            for (chunk, value) in row_bytes.chunks_exact(2).zip(out.iter_mut()) {
+            for (chunk, value) in row_bytes.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
                 *value = f16_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
             }
         }
         WeightDType::F32 => {
-            for (chunk, value) in row_bytes.chunks_exact(4).zip(out.iter_mut()) {
+            for (chunk, value) in row_bytes.as_chunks::<4>().0.iter().zip(out.iter_mut()) {
                 *value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             }
         }
@@ -147,7 +147,7 @@ fn dot_row_bf16_fused_portable(row: &[u8], x: &[f32]) -> f32 {
 /// Callers must guarantee AVX2 + FMA support (runtime detection).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 {
+unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 { unsafe {
     use std::arch::x86_64::*;
 
     let (full, tail) = row.as_chunks::<32>(); // 32 bytes = 16 bf16 per chunk
@@ -181,12 +181,12 @@ unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 {
     _mm256_storeu_ps(lanes1.as_mut_ptr(), acc1);
     let total: f32 = lanes.iter().sum::<f32>() + lanes1.iter().sum::<f32>();
     let mut tail_total = 0f32;
-    for (index, byte_pair) in tail.chunks_exact(2).enumerate() {
+    for (index, byte_pair) in tail.as_chunks::<2>().0.iter().enumerate() {
         let x_index = full.len() * 16 + index;
         tail_total += widen_bf16(byte_pair[0], byte_pair[1]) * x[x_index];
     }
     total + tail_total
-}
+}}
 
 pub fn gemv(
     weight: &[u8],

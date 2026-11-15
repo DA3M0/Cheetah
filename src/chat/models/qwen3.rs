@@ -96,9 +96,9 @@ impl Config {
             || self.num_hidden_layers == 0
             || self.num_attention_heads == 0
             || self.num_key_value_heads == 0
-            || self.num_attention_heads % self.num_key_value_heads.max(1) != 0
+            || !self.num_attention_heads.is_multiple_of(self.num_key_value_heads.max(1))
             || head_dim == 0
-            || head_dim % 2 != 0
+            || !head_dim.is_multiple_of(2)
             || self.max_position_embeddings == 0
             || !self.rope_theta.is_finite()
             || self.rope_theta <= 0.0
