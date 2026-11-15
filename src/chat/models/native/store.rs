@@ -89,20 +89,23 @@ impl MmapWeightStore {
                     // header, then the payload. Unit offsets are relative to the
                     // payload start.
                     if mmap.len() < 8 {
-                        return Err(format!("Shard {} is too small for a header.", path.display()));
+                        return Err(format!(
+                            "Shard {} is too small for a header.",
+                            path.display()
+                        ));
                     }
                     let header_len = u64::from_le_bytes([
                         mmap[0], mmap[1], mmap[2], mmap[3], mmap[4], mmap[5], mmap[6], mmap[7],
                     ]) as usize;
                     let data_start = 8 + header_len;
                     if data_start > mmap.len() {
-                        return Err(format!("Shard {} header exceeds the file size.", path.display()));
+                        return Err(format!(
+                            "Shard {} header exceeds the file size.",
+                            path.display()
+                        ));
                     }
                     let idx = shards.len();
-                    shards.push(ShardMapping {
-                        mmap,
-                        data_start,
-                    });
+                    shards.push(ShardMapping { mmap, data_start });
                     shard_index.insert(unit.source_file.clone(), idx);
                     idx
                 }
@@ -115,7 +118,7 @@ impl MmapWeightStore {
                     return Err(format!(
                         "Native backend does not support dtype {other} for unit {}.",
                         unit.unit_id
-                    ))
+                    ));
                 }
             };
             let end = unit.source_offset as usize + unit.bytes as usize;
@@ -128,7 +131,8 @@ impl MmapWeightStore {
             units_by_layer
                 .entry(unit.layer_id)
                 .or_default()
-                .push(unit.unit_id.clone());            index.insert(
+                .push(unit.unit_id.clone());
+            index.insert(
                 unit.unit_id.clone(),
                 UnitSlice {
                     shard: shard_idx,
@@ -178,7 +182,9 @@ impl MmapWeightStore {
         let start = unit.offset;
         let end = start + unit.bytes;
         if end > shard.mmap.len() {
-            return Err(format!("Native backend: unit '{unit_id}' is out of bounds."));
+            return Err(format!(
+                "Native backend: unit '{unit_id}' is out of bounds."
+            ));
         }
         Ok((&shard.mmap[start..end], unit.dtype, &unit.shape))
     }

@@ -64,8 +64,14 @@ impl Qwen2Config {
                 .and_then(Value::as_u64)
                 .map(|value| value as usize)
         };
-        let field_f = |name: &str| raw.and_then(|value| value.get(name)).and_then(Value::as_f64);
-        let field_b = |name: &str| raw.and_then(|value| value.get(name)).and_then(Value::as_bool);
+        let field_f = |name: &str| {
+            raw.and_then(|value| value.get(name))
+                .and_then(Value::as_f64)
+        };
+        let field_b = |name: &str| {
+            raw.and_then(|value| value.get(name))
+                .and_then(Value::as_bool)
+        };
         let family = family.unwrap_or(crate::chat::models::ModelFamily {
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
@@ -82,8 +88,8 @@ impl Qwen2Config {
         }
         let hidden_size = field_u("hidden_size").unwrap_or(embed_shape[1]);
         let vocab_size = field_u("vocab_size").unwrap_or(embed_shape[0]);
-        let num_layers = field_u("num_hidden_layers")
-            .unwrap_or((store.max_layer_id() + 1).max(1) as usize);
+        let num_layers =
+            field_u("num_hidden_layers").unwrap_or((store.max_layer_id() + 1).max(1) as usize);
         let q_out = store
             .unit_shape("model.layers.0.self_attn.q_proj.weight")
             .ok_or_else(|| "Native backend: units manifest has no q_proj tensor.".to_string())?[0];
@@ -131,8 +137,7 @@ impl Qwen2Config {
             head_dim,
             intermediate_size,
             vocab_size,
-            rms_eps: field_f("rms_norm_eps")
-                .unwrap_or(family.rms_norm_eps) as f32,
+            rms_eps: field_f("rms_norm_eps").unwrap_or(family.rms_norm_eps) as f32,
             rope_theta: field_f("rope_theta").unwrap_or(family.rope_theta) as f32,
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
@@ -304,40 +309,43 @@ impl Qwen2Native {
         self.scratch.normed.clear();
         self.scratch.normed.extend_from_slice(&self.scratch.hidden);
         {
-            let (weight, dtype, _) =
-                self.store
-                    .slice(&format!("{prefix}input_layernorm.weight"))?;
+            let (weight, dtype, _) = self
+                .store
+                .slice(&format!("{prefix}input_layernorm.weight"))?;
             kernels::rmsnorm(&mut self.scratch.normed, weight, dtype, cfg.rms_eps);
         }
         if self.debug_capture_layer0_attn && layer == 0 {
             self.normed_capture = self.scratch.normed.clone();
         }
 
-        let (q_weight, q_dtype, _) =
-            self.store.slice(&format!("{prefix}self_attn.q_proj.weight"))?;
+        let (q_weight, q_dtype, _) = self
+            .store
+            .slice(&format!("{prefix}self_attn.q_proj.weight"))?;
         // Biases are family-optional (qwen2 has them, llama does not).
         let (q_bias, q_bias_dtype, _) = self
             .store
             .slice(&format!("{prefix}self_attn.q_proj.bias"))
             .unwrap_or((&[], q_dtype, &[]));
-        let (k_weight, k_dtype, _) =
-            self.store.slice(&format!("{prefix}self_attn.k_proj.weight"))?;
+        let (k_weight, k_dtype, _) = self
+            .store
+            .slice(&format!("{prefix}self_attn.k_proj.weight"))?;
         let (k_bias, k_bias_dtype, _) = self
             .store
             .slice(&format!("{prefix}self_attn.k_proj.bias"))
             .unwrap_or((&[], k_dtype, &[]));
-        let (v_weight, v_dtype, _) =
-            self.store.slice(&format!("{prefix}self_attn.v_proj.weight"))?;
+        let (v_weight, v_dtype, _) = self
+            .store
+            .slice(&format!("{prefix}self_attn.v_proj.weight"))?;
         let (v_bias, v_bias_dtype, _) = self
             .store
             .slice(&format!("{prefix}self_attn.v_proj.bias"))
             .unwrap_or((&[], v_dtype, &[]));
-        let (o_weight, o_dtype, _) =
-            self.store.slice(&format!("{prefix}self_attn.o_proj.weight"))?;
+        let (o_weight, o_dtype, _) = self
+            .store
+            .slice(&format!("{prefix}self_attn.o_proj.weight"))?;
         let (gate_weight, gate_dtype, _) =
             self.store.slice(&format!("{prefix}mlp.gate_proj.weight"))?;
-        let (up_weight, up_dtype, _) =
-            self.store.slice(&format!("{prefix}mlp.up_proj.weight"))?;
+        let (up_weight, up_dtype, _) = self.store.slice(&format!("{prefix}mlp.up_proj.weight"))?;
         let (down_weight, down_dtype, _) =
             self.store.slice(&format!("{prefix}mlp.down_proj.weight"))?;
 
@@ -354,9 +362,13 @@ impl Qwen2Native {
         add_bias(&mut self.scratch.q, q_bias, q_bias_dtype);
         // qwen3-style per-head RMSNorm on q, applied before rope when the
         // family carries a q_norm unit.
-        if self.store.contains(&format!("{prefix}self_attn.q_norm.weight")) {
-            let (weight, dtype, _) =
-                self.store.slice(&format!("{prefix}self_attn.q_norm.weight"))?;
+        if self
+            .store
+            .contains(&format!("{prefix}self_attn.q_norm.weight"))
+        {
+            let (weight, dtype, _) = self
+                .store
+                .slice(&format!("{prefix}self_attn.q_norm.weight"))?;
             for head in 0..cfg.q_heads {
                 let start = head * cfg.head_dim;
                 kernels::rmsnorm(
@@ -381,9 +393,13 @@ impl Qwen2Native {
             &mut self.scratch.k,
         );
         add_bias(&mut self.scratch.k, k_bias, k_bias_dtype);
-        if self.store.contains(&format!("{prefix}self_attn.k_norm.weight")) {
-            let (weight, dtype, _) =
-                self.store.slice(&format!("{prefix}self_attn.k_norm.weight"))?;
+        if self
+            .store
+            .contains(&format!("{prefix}self_attn.k_norm.weight"))
+        {
+            let (weight, dtype, _) = self
+                .store
+                .slice(&format!("{prefix}self_attn.k_norm.weight"))?;
             for head in 0..cfg.kv_heads {
                 let start = head * cfg.head_dim;
                 kernels::rmsnorm(
@@ -439,7 +455,9 @@ impl Qwen2Native {
         // Attention: GQA — every q_heads/kv_heads query heads share one kv head.
         let head_group = cfg.q_heads / cfg.kv_heads;
         self.scratch.attn_out.clear();
-        self.scratch.attn_out.resize(cfg.q_heads * cfg.head_dim, 0.0);
+        self.scratch
+            .attn_out
+            .resize(cfg.q_heads * cfg.head_dim, 0.0);
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         for head in 0..cfg.q_heads {
             let kv_head = head / head_group;
@@ -476,9 +494,7 @@ impl Qwen2Native {
         }
 
         self.scratch.attn_projected.clear();
-        self.scratch
-            .attn_projected
-            .resize(cfg.hidden_size, 0.0);
+        self.scratch.attn_projected.resize(cfg.hidden_size, 0.0);
         kernels::gemv(
             o_weight,
             o_dtype,
@@ -512,9 +528,9 @@ impl Qwen2Native {
         self.scratch.normed.clear();
         self.scratch.normed.extend_from_slice(&self.scratch.hidden);
         {
-            let (weight, dtype, _) =
-                self.store
-                    .slice(&format!("{prefix}post_attention_layernorm.weight"))?;
+            let (weight, dtype, _) = self
+                .store
+                .slice(&format!("{prefix}post_attention_layernorm.weight"))?;
             kernels::rmsnorm(&mut self.scratch.normed, weight, dtype, cfg.rms_eps);
         }
         self.scratch.gate.clear();
@@ -781,9 +797,14 @@ mod tests {
 
         // Two-token input hidden states after embedding.
         let tokens: Vec<u32> = vec![9707, 11];
-        let embed = vb.get((cfg.vocab_size, hidden), "model.embed_tokens.weight").unwrap();
+        let embed = vb
+            .get((cfg.vocab_size, hidden), "model.embed_tokens.weight")
+            .unwrap();
         let xs = embed
-            .index_select(&Tensor::from_slice(&tokens, (tokens.len(),), &device).unwrap(), 0)
+            .index_select(
+                &Tensor::from_slice(&tokens, (tokens.len(),), &device).unwrap(),
+                0,
+            )
             .unwrap(); // (2, hidden)
 
         // input_layernorm
@@ -793,13 +814,26 @@ mod tests {
             .unwrap();
 
         // q/k/v projections (with bias)
-        let linear = |out: usize, name: &str, bias: bool| candle_nn::Linear::new(
-            vb.get((out, hidden), &format!("{prefix}{name}.weight")).unwrap(),
-            if bias { Some(vb.get((out,), &format!("{prefix}{name}.bias")).unwrap()) } else { None },
-        );
-        let q = linear(cfg.q_heads * head_dim, "self_attn.q_proj", true).forward(&normed).unwrap();
-        let k = linear(cfg.kv_heads * head_dim, "self_attn.k_proj", true).forward(&normed).unwrap();
-        let v = linear(cfg.kv_heads * head_dim, "self_attn.v_proj", true).forward(&normed).unwrap();
+        let linear = |out: usize, name: &str, bias: bool| {
+            candle_nn::Linear::new(
+                vb.get((out, hidden), &format!("{prefix}{name}.weight"))
+                    .unwrap(),
+                if bias {
+                    Some(vb.get((out,), &format!("{prefix}{name}.bias")).unwrap())
+                } else {
+                    None
+                },
+            )
+        };
+        let q = linear(cfg.q_heads * head_dim, "self_attn.q_proj", true)
+            .forward(&normed)
+            .unwrap();
+        let k = linear(cfg.kv_heads * head_dim, "self_attn.k_proj", true)
+            .forward(&normed)
+            .unwrap();
+        let v = linear(cfg.kv_heads * head_dim, "self_attn.v_proj", true)
+            .forward(&normed)
+            .unwrap();
 
         // rope (replicating candle qwen2: duplicated-frequency rotate-half)
         let rotate = |xs: &Tensor| -> Tensor {
@@ -838,9 +872,8 @@ mod tests {
                 .unwrap()
                 .unsqueeze(1)
                 .unwrap();
-            (states.broadcast_mul(&cos).unwrap()
-                + rotate(&states).broadcast_mul(&sin).unwrap())
-            .unwrap()
+            (states.broadcast_mul(&cos).unwrap() + rotate(&states).broadcast_mul(&sin).unwrap())
+                .unwrap()
         };
         let q_rope = rope_for(&q, cfg.q_heads);
         let k_rope = rope_for(&k, cfg.kv_heads);
@@ -857,7 +890,13 @@ mod tests {
                     let k_head = k_rope.get(pos).unwrap().get(kv_head).unwrap(); // (head_dim,)
                     let dot: f32 = (0..head_dim)
                         .map(|i| {
-                            q_vec.get(head).unwrap().get(i).unwrap().to_scalar::<f32>().unwrap()
+                            q_vec
+                                .get(head)
+                                .unwrap()
+                                .get(i)
+                                .unwrap()
+                                .to_scalar::<f32>()
+                                .unwrap()
                                 * k_head.get(i).unwrap().to_scalar::<f32>().unwrap()
                         })
                         .sum();
@@ -911,7 +950,10 @@ mod tests {
         };
         eprintln!(
             "normed max|diff|={:.5} q_raw max|diff|={:.5} k_raw max|diff|={:.5} q_rope max|diff|={:.5} k_rope max|diff|={:.5} head0 scores max|diff|={:.5} attn_out max|diff|={:.5} o max|diff|={:.5}",
-            diff(&cap.normed, &normed.get(1).unwrap().to_vec1::<f32>().unwrap()),
+            diff(
+                &cap.normed,
+                &normed.get(1).unwrap().to_vec1::<f32>().unwrap()
+            ),
             diff(&cap.q_raw, &q_candle_row),
             diff(&cap.k_raw, &k_candle_row),
             diff(&cap.q, &q_candle_row),
@@ -920,7 +962,10 @@ mod tests {
             diff(&cap.attn_out, &attn_ref),
             {
                 let o_native = linear(cfg.hidden_size, "self_attn.o_proj", false)
-                    .forward(&Tensor::from_vec(cap.attn_out.clone(), (1, cap.attn_out.len()), &device).unwrap())
+                    .forward(
+                        &Tensor::from_vec(cap.attn_out.clone(), (1, cap.attn_out.len()), &device)
+                            .unwrap(),
+                    )
                     .unwrap()
                     .get(0)
                     .unwrap()
@@ -967,7 +1012,9 @@ mod tests {
         let tokens: Vec<u32> = vec![9707, 11];
         let cap = native.debug_attention_out(&tokens).unwrap();
 
-        let (w_bytes, w_dtype, w_shape) = store.slice("model.layers.0.self_attn.q_proj.weight").unwrap();
+        let (w_bytes, w_dtype, w_shape) = store
+            .slice("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
         let (b_bytes, b_dtype, _) = store.slice("model.layers.0.self_attn.q_proj.bias").unwrap();
         assert_eq!(w_shape, &[896, 896]);
         let rows = cfg.q_heads * cfg.head_dim;
@@ -982,7 +1029,10 @@ mod tests {
         }
         let max_diff = diff_fn(&naive, &cap.q_raw);
         eprintln!("q_proj naive vs runtime gemv max|diff|={max_diff:.5}");
-        assert!(max_diff < 1e-3, "gemv diverges from naive reference ({max_diff})");
+        assert!(
+            max_diff < 1e-3,
+            "gemv diverges from naive reference ({max_diff})"
+        );
     }
 
     fn diff_fn(a: &[f32], b: &[f32]) -> f32 {

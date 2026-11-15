@@ -105,7 +105,11 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
     let source = PathBuf::from(&positional[0]);
     let metadata = runtime(chat::model_metadata_for_init(&source))?;
     let destination = PathBuf::from(&positional[1]);
-    runtime(native::init_model_with_metadata(&source, &destination, metadata))?;
+    runtime(native::init_model_with_metadata(
+        &source,
+        &destination,
+        metadata,
+    ))?;
 
     // Ant: after native preparation, route each atomic unit through the
     // built-in residency planner (VRAM -> RAM -> disk), honoring the

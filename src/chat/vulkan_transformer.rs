@@ -1,7 +1,7 @@
 use crate::color::{self, Color};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
-use std::collections::BTreeMap;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
@@ -447,7 +447,9 @@ impl WeightData {
 
     /// Row-wise symmetric int8 quantization: scale = max|w| / 127 per row.
     fn quantize_q8_rowwise(&self, rows: usize, cols: usize) -> Result<Self, String> {
-        let expected = rows.checked_mul(cols).ok_or("Q8 quantization size overflow")?;
+        let expected = rows
+            .checked_mul(cols)
+            .ok_or("Q8 quantization size overflow")?;
         if self.len() != expected {
             return Err(format!(
                 "Q8 quantization expected {expected} elements, found {}.",
@@ -505,11 +507,7 @@ impl WeightData {
             Self::F32(values) => (values.as_ptr().cast(), 0, values.len()),
             Self::F16(values) => (values.as_ptr().cast(), 2, values.len()),
             Self::BF16(values) => (values.as_ptr().cast(), 3, values.len()),
-            Self::Q8(matrix) => (
-                matrix.buffer.as_ptr().cast(),
-                4,
-                matrix.buffer_bytes() / 4,
-            ),
+            Self::Q8(matrix) => (matrix.buffer.as_ptr().cast(), 4, matrix.buffer_bytes() / 4),
         }
     }
 
@@ -705,7 +703,13 @@ impl Linear {
             // + packed int8 rows) stages in one pass — roughly half the size
             // of the BF16 weights and far below the storage-buffer range.
             let output_len = rows * self.output_size;
-            eprintln!("dbg: Q8 forward rows={rows} k={} n={} buffer_bytes={} row_bytes={}", self.input_size, self.output_size, matrix.buffer_bytes(), matrix.row_bytes());
+            eprintln!(
+                "dbg: Q8 forward rows={rows} k={} n={} buffer_bytes={} row_bytes={}",
+                self.input_size,
+                self.output_size,
+                matrix.buffer_bytes(),
+                matrix.row_bytes()
+            );
             let mut output = vec![0.0; output_len];
             for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
                 let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
@@ -980,14 +984,12 @@ impl VulkanTransformerExecutor {
                     }
                 }
                 FeedForward::MixtureOfExperts {
-                    router,
-                    experts,
-                    ..
+                    router, experts, ..
                 } => {
                     for linear in
-                        std::iter::once(&mut *router).chain(experts.iter_mut().flat_map(
-                            |expert| [&mut expert.gate, &mut expert.up, &mut expert.down],
-                        ))
+                        std::iter::once(&mut *router).chain(experts.iter_mut().flat_map(|expert| {
+                            [&mut expert.gate, &mut expert.up, &mut expert.down]
+                        }))
                     {
                         if linear.name != unit_id {
                             continue;
@@ -1563,12 +1565,10 @@ fn take_linear(
     let slot = if resident {
         match &weight.data {
             WeightData::BF16(values) => {
-                cheetah::native::vulkan::weight_upload_bf16(values).map(|handle| {
-                    VulkanWeightSlot {
-                        handle,
-                        element_count: values.len(),
-                        device_local: true,
-                    }
+                cheetah::native::vulkan::weight_upload_bf16(values).map(|handle| VulkanWeightSlot {
+                    handle,
+                    element_count: values.len(),
+                    device_local: true,
                 })
             }
             _ => None, // F32/F16 resident upload lands with the bf16 path
@@ -2299,7 +2299,11 @@ mod q8_tests {
         .unwrap();
 
         let mut shape_f32: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
-        shape_f32.push(("model.embed_tokens.weight".into(), vec![0.0; 128 * 64], vec![128, 64]));
+        shape_f32.push((
+            "model.embed_tokens.weight".into(),
+            vec![0.0; 128 * 64],
+            vec![128, 64],
+        ));
         shape_f32.push(("lm_head.weight".into(), vec![0.0; 128 * 64], vec![128, 64]));
         shape_f32.push(("model.norm.weight".into(), vec![1.0; 64], vec![64]));
         for layer in 0..2usize {
@@ -2307,13 +2311,41 @@ mod q8_tests {
             for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
                 shape_f32.push((format!("{prefix}{name}"), vec![1.0; 64], vec![64]));
             }
-            shape_f32.push((format!("{prefix}self_attn.q_proj.weight"), vec![0.5; 4096], vec![64, 64]));
-            shape_f32.push((format!("{prefix}self_attn.k_proj.weight"), vec![0.25; 2048], vec![32, 64]));
-            shape_f32.push((format!("{prefix}self_attn.v_proj.weight"), vec![0.25; 2048], vec![32, 64]));
-            shape_f32.push((format!("{prefix}self_attn.o_proj.weight"), vec![0.5; 4096], vec![64, 64]));
-            shape_f32.push((format!("{prefix}mlp.gate_proj.weight"), vec![0.5; 8192], vec![128, 64]));
-            shape_f32.push((format!("{prefix}mlp.up_proj.weight"), vec![0.5; 8192], vec![128, 64]));
-            shape_f32.push((format!("{prefix}mlp.down_proj.weight"), vec![0.5; 8192], vec![64, 128]));
+            shape_f32.push((
+                format!("{prefix}self_attn.q_proj.weight"),
+                vec![0.5; 4096],
+                vec![64, 64],
+            ));
+            shape_f32.push((
+                format!("{prefix}self_attn.k_proj.weight"),
+                vec![0.25; 2048],
+                vec![32, 64],
+            ));
+            shape_f32.push((
+                format!("{prefix}self_attn.v_proj.weight"),
+                vec![0.25; 2048],
+                vec![32, 64],
+            ));
+            shape_f32.push((
+                format!("{prefix}self_attn.o_proj.weight"),
+                vec![0.5; 4096],
+                vec![64, 64],
+            ));
+            shape_f32.push((
+                format!("{prefix}mlp.gate_proj.weight"),
+                vec![0.5; 8192],
+                vec![128, 64],
+            ));
+            shape_f32.push((
+                format!("{prefix}mlp.up_proj.weight"),
+                vec![0.5; 8192],
+                vec![128, 64],
+            ));
+            shape_f32.push((
+                format!("{prefix}mlp.down_proj.weight"),
+                vec![0.5; 8192],
+                vec![64, 128],
+            ));
         }
 
         let tensors: Vec<(String, safetensors::tensor::TensorView<'static>)> = shape_f32
@@ -2345,7 +2377,8 @@ mod q8_tests {
             .unwrap()
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
-                (path.extension().and_then(|ext| ext.to_str()) == Some("safetensors")).then_some(path)
+                (path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
+                    .then_some(path)
             })
             .collect();
         let plan = std::collections::BTreeMap::new(); // all units resident
@@ -2353,8 +2386,7 @@ mod q8_tests {
             serde_json::from_slice(&std::fs::read(dst.join("config.json")).unwrap()).unwrap();
         let features = TransformerFeatures::standard("Llama");
         let config = VulkanTransformerConfig::from_raw(&raw, features).unwrap();
-        let mut model =
-            VulkanTransformerExecutor::load(&paths, &config, &plan).unwrap();
+        let mut model = VulkanTransformerExecutor::load(&paths, &config, &plan).unwrap();
 
         let tokens: Vec<u32> = vec![3, 41, 17];
         let started = std::time::Instant::now();

@@ -533,7 +533,15 @@ fn handle_chat_completions(
         std::thread::spawn(move || {
             let mut sink =
                 SseSink::new_with_disconnect(tx, completion_id, created, model, disconnected);
-            let result = generate_chat(&gen_state, guard, tokens, &options, &stop, &mut sink, &resident_overrides);
+            let result = generate_chat(
+                &gen_state,
+                guard,
+                tokens,
+                &options,
+                &stop,
+                &mut sink,
+                &resident_overrides,
+            );
             match result {
                 Ok(generation) => {
                     if let Err(err) = sink
@@ -562,7 +570,15 @@ fn handle_chat_completions(
         let _ = request.respond(response);
     } else {
         let mut sink = NullSink;
-        match generate_chat(&state, guard, tokens, &options, &stop, &mut sink, &resident_overrides) {
+        match generate_chat(
+            &state,
+            guard,
+            tokens,
+            &options,
+            &stop,
+            &mut sink,
+            &resident_overrides,
+        ) {
             Ok(generation) => {
                 let (content, calls, finish_reason) =
                     chat_completion_parts(&generation.text, generation.finish_reason.as_str());
@@ -760,7 +776,15 @@ fn handle_completions(state: Arc<ServerState>, request: Request, generation_tick
     let created = openai::now_unix();
 
     let mut sink = NullSink;
-    match generate_chat(&state, guard, tokens, &options, &stop, &mut sink, &resident_overrides) {
+    match generate_chat(
+        &state,
+        guard,
+        tokens,
+        &options,
+        &stop,
+        &mut sink,
+        &resident_overrides,
+    ) {
         Ok(generation) => {
             let body = serde_json::to_string(&TextCompletionResponse {
                 id: completion_id,
@@ -795,9 +819,14 @@ fn generate_chat(
     resident_overrides: &HashSet<String>,
 ) -> Result<Generation, String> {
     let mut context = state.engine.new_context()?;
-    state
-        .engine
-        .generate(&mut context, &tokens, options, stop, sink, resident_overrides)
+    state.engine.generate(
+        &mut context,
+        &tokens,
+        options,
+        stop,
+        sink,
+        resident_overrides,
+    )
 }
 
 fn prompt_error_status(error: &str) -> u16 {

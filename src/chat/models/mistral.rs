@@ -1,11 +1,10 @@
-use super::{ModelRuntime};
+use super::ModelRuntime;
 use candle_core::Device;
 use candle_nn::VarBuilder;
 use candle_transformers::models::mistral;
 use serde_json::Value;
 #[cfg(feature = "vulkan")]
 use std::path::PathBuf;
-
 
 #[derive(Clone)]
 struct Runtime {
@@ -17,12 +16,8 @@ impl ModelRuntime for Runtime {
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         // Bridge the backend-agnostic runtime boundary to the Candle model:
         // tokens in, final-position logits out.
-        let input = candle_core::Tensor::from_vec(
-            tokens.to_vec(),
-            (1, tokens.len()),
-            &self.device,
-        )
-        .map_err(|error| error.to_string())?;
+        let input = candle_core::Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &self.device)
+            .map_err(|error| error.to_string())?;
         let logits = self
             .model
             .forward(&input, offset)
@@ -103,7 +98,6 @@ fn candle_config(config: &Value) -> Result<mistral::Config, String> {
     }
 }
 
-
 #[cfg(feature = "vulkan")]
 pub(super) fn load_vulkan(
     weight_paths: &[PathBuf],
@@ -140,9 +134,11 @@ pub(super) fn load_vulkan(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let config = VulkanTransformerConfig::from_raw(&raw_config, features)?;
-    Ok(Box::new(
-        VulkanTransformerExecutor::load(weight_paths, &config, plan)?,
-    ))
+    Ok(Box::new(VulkanTransformerExecutor::load(
+        weight_paths,
+        &config,
+        plan,
+    )?))
 }
 
 #[cfg(test)]

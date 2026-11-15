@@ -168,7 +168,11 @@ mod tests {
                 vec![128, hidden],
             ));
         }
-        shape_f32.push(("model.norm.weight".into(), fill("norm", hidden), vec![hidden]));
+        shape_f32.push((
+            "model.norm.weight".into(),
+            fill("norm", hidden),
+            vec![hidden],
+        ));
         for layer in 0..2usize {
             let prefix = format!("model.layers.{layer}.");
             for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
@@ -245,7 +249,8 @@ mod tests {
         let cfg = qwen2::Qwen2Config::resolve(Some(&raw), &store, Some(family)).unwrap();
         let mut native = qwen2::Qwen2Native::with_store(cfg, Arc::clone(&store));
 
-        let registration = crate::chat::models::registration_for_architecture(architecture).unwrap();
+        let registration =
+            crate::chat::models::registration_for_architecture(architecture).unwrap();
         let mut weight_paths: Vec<std::path::PathBuf> =
             std::fs::read_dir(model_dir.join(".cheetah/weights"))
                 .unwrap()
@@ -296,8 +301,13 @@ mod tests {
             .zip(&candle_decode)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        eprintln!("synthetic {label}: prefill max|diff|={prefill_diff:.5} decode max|diff|={decode_diff:.5}");
-        assert!(prefill_diff < 1e-3, "prefill logits diverge ({prefill_diff})");
+        eprintln!(
+            "synthetic {label}: prefill max|diff|={prefill_diff:.5} decode max|diff|={decode_diff:.5}"
+        );
+        assert!(
+            prefill_diff < 1e-3,
+            "prefill logits diverge ({prefill_diff})"
+        );
         assert!(decode_diff < 1e-3, "decode logits diverge ({decode_diff})");
 
         let _ = std::fs::remove_dir_all(&model_dir.parent().unwrap());
@@ -307,7 +317,8 @@ mod tests {
     /// comparisons do not exercise.
     #[test]
     fn native_llama_matches_candle_on_synthetic_model() {
-        let model_dir = prepare_synthetic_decoder("llama", "llama", "LlamaForCausalLM", false, false);
+        let model_dir =
+            prepare_synthetic_decoder("llama", "llama", "LlamaForCausalLM", false, false);
         compare_native_vs_candle(&model_dir, "llama", "llama");
     }
 
@@ -315,7 +326,8 @@ mod tests {
     /// explicit head_dim resolution.
     #[test]
     fn native_qwen3_matches_candle_on_synthetic_model() {
-        let model_dir = prepare_synthetic_decoder("qwen3", "qwen3", "Qwen3ForCausalLM", false, true);
+        let model_dir =
+            prepare_synthetic_decoder("qwen3", "qwen3", "Qwen3ForCausalLM", false, true);
         compare_native_vs_candle(&model_dir, "qwen3", "qwen3");
     }
 }

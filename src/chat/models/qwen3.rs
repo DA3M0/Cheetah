@@ -1,4 +1,4 @@
-use super::{ModelRuntime};
+use super::ModelRuntime;
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Activation, VarBuilder};
 use serde::Deserialize;
@@ -6,7 +6,6 @@ use serde_json::Value;
 #[cfg(feature = "vulkan")]
 use std::path::PathBuf;
 use std::sync::Arc;
-
 
 #[derive(Clone)]
 struct Runtime {
@@ -18,12 +17,8 @@ impl ModelRuntime for Runtime {
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         // Bridge the backend-agnostic runtime boundary to the Candle model:
         // tokens in, final-position logits out.
-        let input = candle_core::Tensor::from_vec(
-            tokens.to_vec(),
-            (1, tokens.len()),
-            &self.device,
-        )
-        .map_err(|error| error.to_string())?;
+        let input = candle_core::Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &self.device)
+            .map_err(|error| error.to_string())?;
         let logits = self
             .model
             .forward(&input, offset)
@@ -96,7 +91,9 @@ impl Config {
             || self.num_hidden_layers == 0
             || self.num_attention_heads == 0
             || self.num_key_value_heads == 0
-            || !self.num_attention_heads.is_multiple_of(self.num_key_value_heads.max(1))
+            || !self
+                .num_attention_heads
+                .is_multiple_of(self.num_key_value_heads.max(1))
             || head_dim == 0
             || !head_dim.is_multiple_of(2)
             || self.max_position_embeddings == 0
@@ -105,7 +102,9 @@ impl Config {
             || !self.rms_norm_eps.is_finite()
             || self.rms_norm_eps <= 0.0
         {
-            return Err("Qwen3 model dimensions or normalization settings are inconsistent.".into());
+            return Err(
+                "Qwen3 model dimensions or normalization settings are inconsistent.".into(),
+            );
         }
         if self.use_sliding_window {
             return Err("Qwen3 sliding-window attention is not supported.".into());
@@ -147,10 +146,9 @@ impl RotaryEmbedding {
             .map(|index| 1.0 / config.rope_theta.powf(index as f64 / dim as f64) as f32)
             .collect::<Vec<_>>();
         let inv_freq = Tensor::from_vec(inv_freq, (1, dim / 2), device)?;
-        let positions =
-            Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
-                .to_dtype(DType::F32)?
-                .reshape((config.max_position_embeddings, 1))?;
+        let positions = Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((config.max_position_embeddings, 1))?;
         let frequencies = positions.matmul(&inv_freq)?;
         let frequencies = Tensor::cat(&[&frequencies, &frequencies], candle_core::D::Minus1)?;
         Ok(Self {
@@ -261,14 +259,18 @@ impl Attention {
         let values = values
             .reshape((batch, sequence, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let query = self
-            .q_norm
-            .forward(&query.flatten(0, 2)?)?
-            .reshape((batch, self.num_heads, sequence, self.head_dim))?;
-        let keys = self
-            .k_norm
-            .forward(&keys.flatten(0, 2)?)?
-            .reshape((batch, self.num_kv_heads, sequence, self.head_dim))?;
+        let query = self.q_norm.forward(&query.flatten(0, 2)?)?.reshape((
+            batch,
+            self.num_heads,
+            sequence,
+            self.head_dim,
+        ))?;
+        let keys = self.k_norm.forward(&keys.flatten(0, 2)?)?.reshape((
+            batch,
+            self.num_kv_heads,
+            sequence,
+            self.head_dim,
+        ))?;
         let (query, keys) = self.rotary.apply(&query, &keys, offset)?;
         let (keys, values) = match &self.cache {
             Some((cached_keys, cached_values)) => (
@@ -369,10 +371,15 @@ impl DecoderLayer {
         offset: usize,
     ) -> candle_core::Result<Tensor> {
         let normalized = self.input_norm.forward(input)?;
-        let attended = self.attention.forward(&normalized, attention_mask, offset)?;
+        let attended = self
+            .attention
+            .forward(&normalized, attention_mask, offset)?;
         let residual = (input + attended)?;
         let normalized = self.post_attention_norm.forward(&residual)?;
-        let gate = self.gate_proj.forward(&normalized)?.apply(&self.activation)?;
+        let gate = self
+            .gate_proj
+            .forward(&normalized)?
+            .apply(&self.activation)?;
         let up = self.up_proj.forward(&normalized)?;
         let feed_forward = (gate * up)?.apply(&self.down_proj)?;
         residual + feed_forward
@@ -395,24 +402,18 @@ struct Model {
 
 impl Model {
     fn new(config: &Config, vb: VarBuilder<'_>) -> candle_core::Result<Self> {
-        let embedding =
-            candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))?;
+        let embedding = candle_nn::embedding(
+            config.vocab_size,
+            config.hidden_size,
+            vb.pp("model.embed_tokens"),
+        )?;
         let rotary = Arc::new(RotaryEmbedding::new(config, vb.device(), vb.dtype())?);
         let layers = (0..config.num_hidden_layers)
-            .map(|index| {
-                DecoderLayer::new(config, rotary.clone(), vb.pp("model.layers").pp(index))
-            })
+            .map(|index| DecoderLayer::new(config, rotary.clone(), vb.pp("model.layers").pp(index)))
             .collect::<candle_core::Result<Vec<_>>>()?;
-        let norm = RmsNorm::new(
-            config.hidden_size,
-            config.rms_norm_eps,
-            vb.pp("model.norm"),
-        )?;
-        let lm_head = candle_nn::linear_no_bias(
-            config.hidden_size,
-            config.vocab_size,
-            vb.pp("lm_head"),
-        )?;
+        let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
+        let lm_head =
+            candle_nn::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
         Ok(Self {
             embedding,
             layers,
@@ -485,7 +486,6 @@ pub(super) fn load(
     }))
 }
 
-
 #[cfg(feature = "vulkan")]
 pub(super) fn load_vulkan(
     weight_paths: &[PathBuf],
@@ -495,7 +495,11 @@ pub(super) fn load_vulkan(
 ) -> Result<Box<dyn ModelRuntime>, String> {
     let config = vulkan_config(&raw_config)?;
     Ok(Box::new(
-        super::super::vulkan_transformer::VulkanTransformerExecutor::load(weight_paths, &config, plan)?,
+        super::super::vulkan_transformer::VulkanTransformerExecutor::load(
+            weight_paths,
+            &config,
+            plan,
+        )?,
     ))
 }
 
@@ -632,7 +636,10 @@ mod tests {
         let builder = VarBuilder::from_tensors(weights, DType::F32, &device);
         let mut model = Model::new(&config, builder).unwrap();
         let prompt = Tensor::from_vec(vec![1u32, 2], (1, 2), &device).unwrap();
-        assert_eq!(model.forward(&prompt, 0).unwrap().dims3().unwrap(), (1, 1, 8));
+        assert_eq!(
+            model.forward(&prompt, 0).unwrap().dims3().unwrap(),
+            (1, 1, 8)
+        );
 
         let next_token = Tensor::from_vec(vec![3u32], (1, 1), &device).unwrap();
         assert_eq!(

@@ -103,8 +103,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 fn dot_row_bf16_fused(row: &[u8], x: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             // SAFETY: guarded by the runtime feature detection above; the
             // intrinsics read exactly row/len bytes and x/len floats.
@@ -147,46 +146,42 @@ fn dot_row_bf16_fused_portable(row: &[u8], x: &[f32]) -> f32 {
 /// Callers must guarantee AVX2 + FMA support (runtime detection).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 { unsafe {
-    use std::arch::x86_64::*;
+unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let (full, tail) = row.as_chunks::<32>(); // 32 bytes = 16 bf16 per chunk
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    for (index, chunk) in full.iter().enumerate() {
-        let w = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
-        let lo = _mm256_castsi256_si128(w); // bf16[0..8]
-        let hi = _mm256_extracti128_si256::<1>(w); // bf16[8..16]
-        // Zero-extend u16 → u32 then shift left 16: the u32 lane becomes
-        // `bf16 << 16`, bit-casting to the exact f32 value, lanes preserved.
-        let f_lo = _mm256_castsi256_ps(_mm256_slli_epi32(
-            _mm256_cvtepu16_epi32(lo),
-            16,
-        ));
-        let f_hi = _mm256_castsi256_ps(_mm256_slli_epi32(
-            _mm256_cvtepu16_epi32(hi),
-            16,
-        ));
-        let base = index * 16;
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(base));
-        let x1 = _mm256_loadu_ps(x.as_ptr().add(base + 8));
-        acc0 = _mm256_fmadd_ps(f_lo, x0, acc0);
-        acc1 = _mm256_fmadd_ps(f_hi, x1, acc1);
+        let (full, tail) = row.as_chunks::<32>(); // 32 bytes = 16 bf16 per chunk
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        for (index, chunk) in full.iter().enumerate() {
+            let w = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+            let lo = _mm256_castsi256_si128(w); // bf16[0..8]
+            let hi = _mm256_extracti128_si256::<1>(w); // bf16[8..16]
+            // Zero-extend u16 → u32 then shift left 16: the u32 lane becomes
+            // `bf16 << 16`, bit-casting to the exact f32 value, lanes preserved.
+            let f_lo = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(lo), 16));
+            let f_hi = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(hi), 16));
+            let base = index * 16;
+            let x0 = _mm256_loadu_ps(x.as_ptr().add(base));
+            let x1 = _mm256_loadu_ps(x.as_ptr().add(base + 8));
+            acc0 = _mm256_fmadd_ps(f_lo, x0, acc0);
+            acc1 = _mm256_fmadd_ps(f_hi, x1, acc1);
+        }
+        // Horizontal reduction of the two accumulators (once per row — scalar
+        // store + sum is negligible next to the FMA loop).
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc0);
+        let mut lanes1 = [0f32; 8];
+        _mm256_storeu_ps(lanes1.as_mut_ptr(), acc1);
+        let total: f32 = lanes.iter().sum::<f32>() + lanes1.iter().sum::<f32>();
+        let mut tail_total = 0f32;
+        for (index, byte_pair) in tail.as_chunks::<2>().0.iter().enumerate() {
+            let x_index = full.len() * 16 + index;
+            tail_total += widen_bf16(byte_pair[0], byte_pair[1]) * x[x_index];
+        }
+        total + tail_total
     }
-    // Horizontal reduction of the two accumulators (once per row — scalar
-    // store + sum is negligible next to the FMA loop).
-    let mut lanes = [0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc0);
-    let mut lanes1 = [0f32; 8];
-    _mm256_storeu_ps(lanes1.as_mut_ptr(), acc1);
-    let total: f32 = lanes.iter().sum::<f32>() + lanes1.iter().sum::<f32>();
-    let mut tail_total = 0f32;
-    for (index, byte_pair) in tail.as_chunks::<2>().0.iter().enumerate() {
-        let x_index = full.len() * 16 + index;
-        tail_total += widen_bf16(byte_pair[0], byte_pair[1]) * x[x_index];
-    }
-    total + tail_total
-}}
+}
 
 pub fn gemv(
     weight: &[u8],
@@ -240,7 +235,13 @@ pub fn rmsnorm(x: &mut [f32], weight: &[u8], dtype: super::store::WeightDType, e
 
 /// Rotary embedding (GPT-NeoX rotate-half style, matching candle's rope):
 /// for each head of dim d, split [x1 | x2] and pair angle i with both halves.
-pub fn rope_in_place(values: &mut [f32], heads: usize, head_dim: usize, position: usize, theta: f32) {
+pub fn rope_in_place(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    position: usize,
+    theta: f32,
+) {
     let half = head_dim / 2;
     for head in 0..heads {
         let base = head * head_dim;
@@ -281,8 +282,8 @@ pub fn softmax(scores: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::store::WeightDType;
+    use super::*;
 
     #[test]
     fn bf16_widening_matches_bit_shift() {
@@ -399,8 +400,8 @@ mod tests {
 
 #[cfg(test)]
 mod dot_tests {
-    use super::*;
     use super::super::store::WeightDType;
+    use super::*;
 
     #[test]
     fn dot_row_bf16_fused_matches_dequant_dot() {

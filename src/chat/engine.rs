@@ -1,5 +1,5 @@
 use super::models::ModelRuntime;
-use crate::ant::{ant_swap_fit, Ant, AntLayerResidency, AntSettings, AntUnit};
+use crate::ant::{Ant, AntLayerResidency, AntSettings, AntUnit, ant_swap_fit};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
@@ -264,7 +264,8 @@ fn ant_resident_weight_paths(
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     for unit in units {
         let tier = plan
-            .get(&unit.unit_id).map(|tier| tier.as_str())
+            .get(&unit.unit_id)
+            .map(|tier| tier.as_str())
             .unwrap_or("vram");
         if tier == "disk" || evicted.iter().any(|e| e == &unit.unit_id) {
             continue;
@@ -293,11 +294,16 @@ fn ant_apply_budget(
     let mut resident: Vec<(u64, u64, String)> = Vec::new();
     for unit in units {
         let tier = plan
-            .get(&unit.unit_id).map(|tier| tier.as_str())
+            .get(&unit.unit_id)
+            .map(|tier| tier.as_str())
             .unwrap_or("vram");
         if tier != "disk" {
             resident_bytes = resident_bytes.saturating_add(unit.byte_size());
-            resident.push((ant_tier_priority(tier), unit.byte_size(), unit.unit_id.clone()));
+            resident.push((
+                ant_tier_priority(tier),
+                unit.byte_size(),
+                unit.unit_id.clone(),
+            ));
         }
     }
     if device_is_accelerator && budget_bytes > 0 && resident_bytes > budget_bytes {
@@ -421,7 +427,8 @@ impl Engine {
         } else {
             registration.chat_template.render
         };
-        let device_is_accelerator = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into()) != "cpu";
+        let device_is_accelerator =
+            std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into()) != "cpu";
         let mut effective_weight_paths = weight_paths.to_vec();
         let mut ant_plan = std::collections::BTreeMap::new();
         let mut ant_resident_bytes = 0u64;
@@ -443,7 +450,8 @@ impl Engine {
                         let plan = manager.plan_residency(&units);
                         for unit in &units {
                             let tier = plan
-                                .get(&unit.unit_id).map(|tier| tier.as_str())
+                                .get(&unit.unit_id)
+                                .map(|tier| tier.as_str())
                                 .unwrap_or("vram");
                             ant_plan.insert(unit.unit_id.clone(), tier.to_string());
                         }
@@ -489,17 +497,18 @@ impl Engine {
                                         .saturating_add(unit.byte_size());
                                 }
                                 "ram" => {
-                                    ant_runtime.ram_used_bytes = ant_runtime
-                                        .ram_used_bytes
-                                        .saturating_add(unit.byte_size());
+                                    ant_runtime.ram_used_bytes =
+                                        ant_runtime.ram_used_bytes.saturating_add(unit.byte_size());
                                     promotion_queue.push((unit.layer_id, unit.unit_id.clone()));
                                 }
                                 _ => {}
                             }
                         }
                         promotion_queue.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                        ant_runtime.promotion_queue =
-                            promotion_queue.into_iter().map(|(_, unit_id)| unit_id).collect();
+                        ant_runtime.promotion_queue = promotion_queue
+                            .into_iter()
+                            .map(|(_, unit_id)| unit_id)
+                            .collect();
                         ant_units = units;
                         ant_evicted = evicted_units;
                     }
@@ -508,41 +517,42 @@ impl Engine {
             }
         }
         if let Some(settings) = ant
-            && settings.enabled && !ant_units.is_empty() {
-                effective_weight_paths = ant_resident_weight_paths(
-                    &weight_paths,
-                    &ant_units,
-                    &ant_plan,
-                    &ant_evicted,
-                );
-            }
+            && settings.enabled
+            && !ant_units.is_empty()
+        {
+            effective_weight_paths =
+                ant_resident_weight_paths(&weight_paths, &ant_units, &ant_plan, &ant_evicted);
+        }
         // Ant: resolve the inference device from the residency plan. Resident VRAM
         // units load into the accelerator device; resident RAM-only units load into
         // the CPU device; disk units are excluded before the loader runs.
         let mut ant_resident_device: Option<Device> = None;
         let mut ant_resident_device_is_accelerator = device_is_accelerator;
         if let Some(settings) = ant_settings.as_ref()
-            && settings.enabled && !ant_units.is_empty() {
-                let mut resident_tiers: Vec<&str> = Vec::new();
-                for unit in &ant_units {
-                    let tier = ant_plan
-                        .get(&unit.unit_id).map(|tier| tier.as_str())
-                        .unwrap_or("vram");
-                    if tier == "disk" || ant_evicted.iter().any(|e| e == &unit.unit_id) {
-                        continue;
-                    }
-                    resident_tiers.push(tier);
+            && settings.enabled
+            && !ant_units.is_empty()
+        {
+            let mut resident_tiers: Vec<&str> = Vec::new();
+            for unit in &ant_units {
+                let tier = ant_plan
+                    .get(&unit.unit_id)
+                    .map(|tier| tier.as_str())
+                    .unwrap_or("vram");
+                if tier == "disk" || ant_evicted.iter().any(|e| e == &unit.unit_id) {
+                    continue;
                 }
-                if !resident_tiers.is_empty() {
-                    if resident_tiers.contains(&"vram") && device_is_accelerator {
-                        let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
-                        ant_resident_device = Some(super::models::backend_device(&selected)?);
-                    } else if !resident_tiers.contains(&"vram") {
-                        ant_resident_device = Some(Device::Cpu);
-                        ant_resident_device_is_accelerator = false;
-                    }
+                resident_tiers.push(tier);
+            }
+            if !resident_tiers.is_empty() {
+                if resident_tiers.contains(&"vram") && device_is_accelerator {
+                    let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
+                    ant_resident_device = Some(super::models::backend_device(&selected)?);
+                } else if !resident_tiers.contains(&"vram") {
+                    ant_resident_device = Some(Device::Cpu);
+                    ant_resident_device_is_accelerator = false;
                 }
             }
+        }
         // Ant: prefer the native mmap-backed CPU backend for architectures that
         // register a native loader — its tiers act on real pages.
         // Set CHEETAH_NATIVE=0 to fall back to the Candle CPU path.
@@ -580,7 +590,13 @@ impl Engine {
                 &ant_plan,
             )?
         } else {
-            super::models::load_model(&effective_weight_paths, &config_bytes, raw_config, &architecture, &ant_plan)?
+            super::models::load_model(
+                &effective_weight_paths,
+                &config_bytes,
+                raw_config,
+                &architecture,
+                &ant_plan,
+            )?
         };
         let mut eos_token_ids = HashSet::new();
         if let Some(value) = config.eos_token_id {
@@ -664,10 +680,7 @@ impl Engine {
     /// the Phase 3 bookkeeping) stays within the configured budget.
     pub fn ant_within_budget(&self) -> bool {
         let state = self.ant_lock_runtime();
-        state
-            .vram_used_bytes
-            .saturating_add(state.ram_used_bytes)
-            <= self.ant_budget_bytes
+        state.vram_used_bytes.saturating_add(state.ram_used_bytes) <= self.ant_budget_bytes
     }
 
     /// Ant: push tier transitions into the model's real memory pages when the
@@ -755,9 +768,8 @@ impl Engine {
                 for eviction in &evictions {
                     if manager.evict_unit(model_dir, eviction).is_ok() {
                         if let Some(evicted_runtime) = self.ant_unit_index.get(eviction) {
-                            state.vram_used_bytes = state
-                                .vram_used_bytes
-                                .saturating_sub(evicted_runtime.bytes);
+                            state.vram_used_bytes =
+                                state.vram_used_bytes.saturating_sub(evicted_runtime.bytes);
                         }
                         state.evicted.insert(eviction.clone());
                         state.swaps_out = state.swaps_out.saturating_add(1);
@@ -766,9 +778,7 @@ impl Engine {
                     }
                 }
                 // Re-check before the swap: only proceed once the pool fits.
-                if state.vram_used_bytes.saturating_add(runtime.bytes)
-                    > settings.vram_pool_bytes
-                {
+                if state.vram_used_bytes.saturating_add(runtime.bytes) > settings.vram_pool_bytes {
                     state.swap_skips = state.swap_skips.saturating_add(1);
                     return false;
                 }
@@ -797,9 +807,7 @@ impl Engine {
             // Ant: fault the unit's real pages in on mmap backends.
             self.ant_apply_real_tier(&[(unit_id.to_string(), 1)], &[]);
             state.swaps_in = state.swaps_in.saturating_add(1);
-            if state.evicted.remove(unit_id)
-                || state.runtime_resident.insert(unit_id.to_string())
-            {
+            if state.evicted.remove(unit_id) || state.runtime_resident.insert(unit_id.to_string()) {
                 state.ram_used_bytes = state.ram_used_bytes.saturating_add(runtime.bytes);
             }
             // A newly RAM-resident unit joins the promotion line.
@@ -812,10 +820,7 @@ impl Engine {
         }
     }
 
-    fn apply_ant_request_overrides(
-        &self,
-        overrides: &HashSet<String>,
-    ) -> Result<(), String> {
+    fn apply_ant_request_overrides(&self, overrides: &HashSet<String>) -> Result<(), String> {
         let Some(settings) = self.ant_settings.as_ref() else {
             return Ok(());
         };
@@ -861,10 +866,7 @@ impl Engine {
         let Some(settings) = self.ant_settings.as_ref() else {
             return Ok(());
         };
-        if !settings.enabled
-            || settings.prefetch_stages <= 0
-            || self.ant_units.is_empty()
-        {
+        if !settings.enabled || settings.prefetch_stages <= 0 || self.ant_units.is_empty() {
             return Ok(());
         }
         let Ok(manager) = Ant::with_settings(settings) else {
@@ -954,9 +956,7 @@ impl Engine {
         let evicted_targets: Vec<(String, i32)> = {
             let state = self.ant_lock_runtime();
             if state.evicted.is_empty()
-                && state
-                    .vram_used_bytes
-                    .saturating_add(state.ram_used_bytes)
+                && state.vram_used_bytes.saturating_add(state.ram_used_bytes)
                     <= settings.vram_pool_bytes
             {
                 return;
@@ -987,9 +987,7 @@ impl Engine {
         }
 
         let mut state = self.ant_lock_runtime();
-        let mut resident_bytes = state
-            .vram_used_bytes
-            .saturating_add(state.ram_used_bytes);
+        let mut resident_bytes = state.vram_used_bytes.saturating_add(state.ram_used_bytes);
         if resident_bytes <= settings.vram_pool_bytes || !self.ant_device_accelerator {
             return;
         }
@@ -1037,12 +1035,10 @@ impl Engine {
                 resident_bytes = resident_bytes.saturating_sub(runtime.bytes);
                 match runtime.tier.as_str() {
                     "vram" => {
-                        state.vram_used_bytes =
-                            state.vram_used_bytes.saturating_sub(runtime.bytes);
+                        state.vram_used_bytes = state.vram_used_bytes.saturating_sub(runtime.bytes);
                     }
                     _ => {
-                        state.ram_used_bytes =
-                            state.ram_used_bytes.saturating_sub(runtime.bytes);
+                        state.ram_used_bytes = state.ram_used_bytes.saturating_sub(runtime.bytes);
                         state.runtime_resident.remove(&unit_id);
                     }
                 }
@@ -1371,7 +1367,10 @@ fn synth_config_from_manifest(
             synthesized.insert("rope_theta".into(), serde_json::json!(family.rope_theta));
         }
         if !synthesized.contains_key("rms_norm_eps") {
-            synthesized.insert("rms_norm_eps".into(), serde_json::json!(family.rms_norm_eps));
+            synthesized.insert(
+                "rms_norm_eps".into(),
+                serde_json::json!(family.rms_norm_eps),
+            );
         }
         if !synthesized.contains_key("tie_word_embeddings") {
             synthesized.insert(
@@ -1380,8 +1379,8 @@ fn synth_config_from_manifest(
             );
         }
         if !family.extra_config_json.trim().is_empty() {
-            let extra: serde_json::Value = serde_json::from_str(family.extra_config_json)
-                .map_err(|error| {
+            let extra: serde_json::Value =
+                serde_json::from_str(family.extra_config_json).map_err(|error| {
                     format!("Invalid family extra_config_json for '{model_type}': {error}")
                 })?;
             if let Some(source) = extra.as_object() {
@@ -1689,7 +1688,9 @@ fn chat_loop(
                 }
                 archive.name = name.to_owned();
                 archive.turns = messages
-                    .as_chunks::<2>().0.iter()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| ConversationTurn {
                         user: pair[0].content.clone(),
                         assistant: pair[1].content.clone(),
@@ -1711,7 +1712,14 @@ fn chat_loop(
             engine.prepare(&mut messages, options.system.as_deref(), options.max_tokens)?;
         let mut context = engine.new_context()?;
         let mut sink = StdoutSink;
-        match engine.generate(&mut context, &tokens, &options, &[], &mut sink, &HashSet::new()) {
+        match engine.generate(
+            &mut context,
+            &tokens,
+            &options,
+            &[],
+            &mut sink,
+            &HashSet::new(),
+        ) {
             Ok(generation) => {
                 println!(
                     "{}",

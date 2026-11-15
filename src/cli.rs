@@ -183,19 +183,23 @@ pub fn parse_chat_args(
             }
             "--ant-resident" => {
                 index += 1;
-                ant.resident_units.push(parse_text_option(args, index, "--ant-resident")?);
+                ant.resident_units
+                    .push(parse_text_option(args, index, "--ant-resident")?);
             }
             "--ant-eviction-policy" => {
                 index += 1;
-                ant.eviction_policy = Some(parse_text_option(args, index, "--ant-eviction-policy")?);
+                ant.eviction_policy =
+                    Some(parse_text_option(args, index, "--ant-eviction-policy")?);
             }
             "--ant-prefetch-stages" => {
                 index += 1;
-                ant.prefetch_stages = Some(parse_nonnegative_option(args, index, "--ant-prefetch-stages")? as i64);
+                ant.prefetch_stages =
+                    Some(parse_nonnegative_option(args, index, "--ant-prefetch-stages")? as i64);
             }
             "--ant-allow-vram-swap" => {
                 index += 1;
-                ant.allow_vram_swap = Some(parse_bool_option(args, index, "--ant-allow-vram-swap")?);
+                ant.allow_vram_swap =
+                    Some(parse_bool_option(args, index, "--ant-allow-vram-swap")?);
             }
             option if option.starts_with('-') => {
                 return Err(RunError::usage(format!(
@@ -543,18 +547,9 @@ fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<Stri
 
 /// 解析布尔开关值,接受 true/false/1/0/yes/no/on/off。
 pub fn is_boolean_literal(value: &str) -> bool {
-    [
-        "true",
-        "false",
-        "1",
-        "0",
-        "yes",
-        "no",
-        "on",
-        "off",
-    ]
-    .iter()
-    .any(|candidate| candidate.eq_ignore_ascii_case(value))
+    ["true", "false", "1", "0", "yes", "no", "on", "off"]
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(value))
 }
 
 fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool, RunError> {
@@ -668,7 +663,9 @@ pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
             }
             "--ant-resident" => {
                 index += 1;
-                options.resident_units.push(parse_text_option(args, index, option)?);
+                options
+                    .resident_units
+                    .push(parse_text_option(args, index, option)?);
             }
             "--ant-eviction-policy" => {
                 index += 1;
@@ -676,7 +673,8 @@ pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
             }
             "--ant-prefetch-stages" => {
                 index += 1;
-                options.prefetch_stages = Some(parse_nonnegative_option(args, index, option)? as i64);
+                options.prefetch_stages =
+                    Some(parse_nonnegative_option(args, index, option)? as i64);
             }
             "--ant-allow-vram-swap" => {
                 index += 1;
@@ -685,7 +683,7 @@ pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
             _ => {
                 return Err(RunError::usage(format!(
                     "Unknown Ant option '{option}'. Run `cheetah help` for usage."
-                )))
+                )));
             }
         }
         index += 1;
@@ -870,8 +868,15 @@ mod tests {
 
     #[test]
     fn parses_ant_flags_into_chat_options() {
-        let ant = parse_ant_args(&args(&["--ant", "true", "--ant-vram", "1024", "--ant-ram", "2048"]))
-            .unwrap();
+        let ant = parse_ant_args(&args(&[
+            "--ant",
+            "true",
+            "--ant-vram",
+            "1024",
+            "--ant-ram",
+            "2048",
+        ]))
+        .unwrap();
         assert_eq!(ant.enabled, Some(true));
         assert_eq!(ant.vram_pool_bytes, Some(1024));
         assert_eq!(ant.ram_budget_bytes, Some(2048));
@@ -901,7 +906,10 @@ mod tests {
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert_eq!(ant.enabled, Some(false));
         assert_eq!(ant.vram_pool_bytes, Some(512));
-        assert_eq!(ant.resident_units, vec!["model.embed_tokens.weight".to_string()]);
+        assert_eq!(
+            ant.resident_units,
+            vec!["model.embed_tokens.weight".to_string()]
+        );
     }
 
     #[test]
@@ -950,8 +958,13 @@ mod tests {
         assert_eq!(ant.interactive, Some(true));
 
         // A bare setup flag does not swallow a following model path.
-        let (path, _, _, ant) =
-            parse_chat_args(&args(&["model.safetensors", "--setup", "--max-tokens", "8"])).unwrap();
+        let (path, _, _, ant) = parse_chat_args(&args(&[
+            "model.safetensors",
+            "--setup",
+            "--max-tokens",
+            "8",
+        ]))
+        .unwrap();
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert_eq!(ant.interactive, Some(true));
     }

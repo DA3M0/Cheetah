@@ -33,8 +33,8 @@ pub fn serve(
     // Ant: resolve the effective settings against the resolved model directory
     // so the user-managed preset (`--setup`) is honored, with CLI overrides on
     // top; `--setup` / `--ant-setup` runs the interactive wizard first.
-    let ant_settings = crate::resolve_ant_settings(&model_path, ant_options)
-        .map_err(|error| error.to_string())?;
+    let ant_settings =
+        crate::resolve_ant_settings(&model_path, ant_options).map_err(|error| error.to_string())?;
     eprintln!(
         "{}",
         color::stderr(

@@ -1,4 +1,4 @@
-use super::{ModelRuntime};
+use super::ModelRuntime;
 use candle_core::Device;
 use candle_nn::VarBuilder;
 use candle_transformers::models::phi;
@@ -6,13 +6,11 @@ use serde_json::Value;
 #[cfg(feature = "vulkan")]
 use std::path::PathBuf;
 
-
 #[derive(Clone)]
 struct Runtime {
     model: phi::Model,
     device: Device,
 }
-
 
 #[cfg(feature = "vulkan")]
 pub(super) fn load_vulkan(
@@ -21,8 +19,7 @@ pub(super) fn load_vulkan(
     raw_config: Value,
     plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<Box<dyn ModelRuntime>, String> {
-    let config =
-        super::super::vulkan_transformer::VulkanPhiConfig::parse(&raw_config)?;
+    let config = super::super::vulkan_transformer::VulkanPhiConfig::parse(&raw_config)?;
     Ok(Box::new(
         super::super::vulkan_transformer::VulkanPhiExecutor::load(weight_paths, &config)?,
     ))
@@ -32,12 +29,8 @@ impl ModelRuntime for Runtime {
     fn forward(&mut self, tokens: &[u32], _offset: usize) -> Result<Vec<f32>, String> {
         // Bridge the backend-agnostic runtime boundary to the Candle model:
         // tokens in, final-position logits out (Phi has no KV cache).
-        let input = candle_core::Tensor::from_vec(
-            tokens.to_vec(),
-            (1, tokens.len()),
-            &self.device,
-        )
-        .map_err(|error| error.to_string())?;
+        let input = candle_core::Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &self.device)
+            .map_err(|error| error.to_string())?;
         let logits = self
             .model
             .forward(&input)

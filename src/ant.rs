@@ -1,11 +1,11 @@
 //! Ant: extremely fine-grained model memory optimization for Cheetah.
 
+use cheetah::native::{self, AntFfiSettings};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
-use cheetah::native::{self, AntFfiSettings};
 
 pub const CHEETAH_UNITS_FILENAME: &str = "cheetah_units.json";
 pub const CHEETAH_ANT_SETTINGS_FILENAME: &str = "cheetah_ant_settings.json";
@@ -41,13 +41,17 @@ impl Default for AntSettings {
 pub struct AntUnit {
     pub unit_id: String,
     pub name: String,
-    #[serde(default)] pub dtype: String,
-    #[serde(default)] pub shape: Vec<u64>,
-    #[serde(default)] pub bytes: u64,
+    #[serde(default)]
+    pub dtype: String,
+    #[serde(default)]
+    pub shape: Vec<u64>,
+    #[serde(default)]
+    pub bytes: u64,
     pub source_file: String,
     pub source_offset: u64,
     pub shard: String,
-    #[serde(default)] pub layer_id: i32,
+    #[serde(default)]
+    pub layer_id: i32,
 }
 
 impl AntUnit {
@@ -222,7 +226,11 @@ impl Ant {
         native::ant_model_not_initialized_warning(model_id, dst_dir);
     }
 
-    pub fn write_settings_for_model(&self, dst_dir: &Path, settings: &AntSettings) -> Result<(), String> {
+    pub fn write_settings_for_model(
+        &self,
+        dst_dir: &Path,
+        settings: &AntSettings,
+    ) -> Result<(), String> {
         let path = dst_dir.join(CHEETAH_ANT_SETTINGS_FILENAME);
         let document = serde_json::json!({
             "enabled": settings.enabled,
@@ -252,29 +260,47 @@ impl Ant {
                 if let Some(enabled) = object.get("enabled").and_then(serde_json::Value::as_bool) {
                     settings.enabled = enabled;
                 }
-                if let Some(vram) = object.get("vram_pool_bytes").and_then(serde_json::Value::as_u64) {
+                if let Some(vram) = object
+                    .get("vram_pool_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     settings.vram_pool_bytes = vram;
                 }
-                if let Some(ram) = object.get("ram_budget_bytes").and_then(serde_json::Value::as_u64) {
+                if let Some(ram) = object
+                    .get("ram_budget_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     settings.ram_budget_bytes = ram;
                 }
                 if let Some(disk) = object.get("disk_dir").and_then(serde_json::Value::as_str) {
                     settings.disk_dir = Some(disk.to_string());
                 }
-                if let Some(resident) = object.get("resident_units").and_then(serde_json::Value::as_array) {
+                if let Some(resident) = object
+                    .get("resident_units")
+                    .and_then(serde_json::Value::as_array)
+                {
                     settings.resident_units = resident
                         .iter()
                         .filter_map(serde_json::Value::as_str)
                         .map(str::to_string)
                         .collect();
                 }
-                if let Some(policy) = object.get("eviction_policy").and_then(serde_json::Value::as_str) {
+                if let Some(policy) = object
+                    .get("eviction_policy")
+                    .and_then(serde_json::Value::as_str)
+                {
                     settings.eviction_policy = policy.to_string();
                 }
-                if let Some(prefetch) = object.get("prefetch_stages").and_then(serde_json::Value::as_i64) {
+                if let Some(prefetch) = object
+                    .get("prefetch_stages")
+                    .and_then(serde_json::Value::as_i64)
+                {
                     settings.prefetch_stages = prefetch as i32;
                 }
-                if let Some(swap) = object.get("allow_vram_swap").and_then(serde_json::Value::as_bool) {
+                if let Some(swap) = object
+                    .get("allow_vram_swap")
+                    .and_then(serde_json::Value::as_bool)
+                {
                     settings.allow_vram_swap = swap;
                 }
             }
@@ -382,10 +408,7 @@ impl Ant {
         println!("  ram_budget_bytes: {}", settings.ram_budget_bytes);
         println!(
             "  disk_dir:         {}",
-            settings
-                .disk_dir
-                .as_deref()
-                .unwrap_or("<model directory>")
+            settings.disk_dir.as_deref().unwrap_or("<model directory>")
         );
         println!("  eviction_policy:  {}", settings.eviction_policy);
         println!("  prefetch_stages:  {}", settings.prefetch_stages);
@@ -429,12 +452,7 @@ impl Ant {
             let shape = entry
                 .get("shape")
                 .and_then(serde_json::Value::as_array)
-                .map(|shape| {
-                    shape
-                        .iter()
-                        .filter_map(serde_json::Value::as_u64)
-                        .collect()
-                })
+                .map(|shape| shape.iter().filter_map(serde_json::Value::as_u64).collect())
                 .unwrap_or_default();
             let bytes_size = entry
                 .get("bytes")
@@ -731,10 +749,7 @@ mod tests {
 
     #[test]
     fn ant_swap_fit_decision_rules() {
-        let evictable = vec![
-            (300u64, "b".to_string()),
-            (500, "a".to_string()),
-        ];
+        let evictable = vec![(300u64, "b".to_string()), (500, "a".to_string())];
         // Fits without eviction.
         assert_eq!(
             ant_swap_fit(500, 2000, 300, true, &evictable),
@@ -787,7 +802,10 @@ mod tests {
         let dst = std::path::Path::new("/home/benny/models/qwen-0.5b-prepared");
         if !dst.exists() {
             // The lifecycle test needs a locally prepared model; skip elsewhere.
-            eprintln!("skipping ant lifecycle test: {} is not prepared", dst.display());
+            eprintln!(
+                "skipping ant lifecycle test: {} is not prepared",
+                dst.display()
+            );
             return;
         }
         assert!(ant.load_model(dst).is_ok());
@@ -796,16 +814,22 @@ mod tests {
         assert_eq!(units.len(), 290);
         let plan = ant.plan_residency(&units);
         assert_eq!(plan.len(), 290);
-        let tier = ant.unit_tier(dst, "model.embed_tokens.weight").expect("tier");
+        let tier = ant
+            .unit_tier(dst, "model.embed_tokens.weight")
+            .expect("tier");
         assert_eq!(tier, 0);
-        ant.unit_pin("model.embed_tokens.weight", true).expect("pin");
+        ant.unit_pin("model.embed_tokens.weight", true)
+            .expect("pin");
         assert_eq!(
-            ant.unit_tier(dst, "model.embed_tokens.weight").expect("tier"),
+            ant.unit_tier(dst, "model.embed_tokens.weight")
+                .expect("tier"),
             1
         );
-        ant.evict_unit(dst, "model.embed_tokens.weight").expect("evict");
+        ant.evict_unit(dst, "model.embed_tokens.weight")
+            .expect("evict");
         assert_eq!(
-            ant.unit_tier(dst, "model.embed_tokens.weight").expect("tier"),
+            ant.unit_tier(dst, "model.embed_tokens.weight")
+                .expect("tier"),
             2
         );
     }

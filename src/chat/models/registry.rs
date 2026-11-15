@@ -125,14 +125,17 @@ pub(in crate::chat) fn load_model_for_device(
     if matches!(device, Device::Cpu) {
         return Err(retired_cpu_candle_message(architecture));
     }
-    let model = candle::load_model(weight_paths, config_bytes, raw_config, model_registration, &device)?;
+    let model = candle::load_model(
+        weight_paths,
+        config_bytes,
+        raw_config,
+        model_registration,
+        &device,
+    )?;
     Ok((device, model))
 }
 
-#[cfg_attr(
-    not(feature = "vulkan"),
-    allow(unused_variables, unused_mut)
-)]
+#[cfg_attr(not(feature = "vulkan"), allow(unused_variables, unused_mut))]
 fn load_vulkan_or_fallback(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
