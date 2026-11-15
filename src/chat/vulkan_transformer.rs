@@ -2365,7 +2365,7 @@ mod q8_tests {
             .collect();
         std::fs::write(
             src.join("model.safetensors"),
-            safetensors::serialize(tensors, &None).unwrap(),
+            safetensors::serialize(tensors, None).unwrap(),
         )
         .unwrap();
 

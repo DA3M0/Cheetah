@@ -231,7 +231,7 @@ mod tests {
             .into_iter()
             .map(|(name, _, shape)| tensor_view(&name, shape))
             .collect();
-        let serialized = safetensors::serialize(tensors, &None).unwrap();
+        let serialized = safetensors::serialize(tensors, None).unwrap();
         std::fs::write(src.join("model.safetensors"), serialized).unwrap();
 
         cheetah::native::init_model(&src, &dst).expect("synthetic decoder init");
