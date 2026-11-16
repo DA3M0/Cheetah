@@ -105,6 +105,7 @@ impl Default for TransformerWeightLayout {
 #[derive(Clone, Debug)]
 pub(crate) enum TransformerFeedForwardFeatures {
     Dense,
+    #[allow(dead_code)]
     MixtureOfExperts {
         num_experts: usize,
         top_k: usize,
@@ -231,6 +232,7 @@ impl VulkanTransformerConfig {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct VulkanPhiConfig {
     vocab_size: usize,
     hidden_size: usize,
@@ -249,6 +251,7 @@ pub(crate) struct VulkanPhiConfig {
 }
 
 impl VulkanPhiConfig {
+    #[allow(dead_code)]
     pub(crate) fn parse(raw: &Value) -> Result<Self, String> {
         let vocab_size = required_usize(raw, "vocab_size")?;
         let hidden_size = required_usize(raw, "hidden_size")?;
@@ -534,6 +537,7 @@ impl WeightData {
         }
     }
 
+    #[allow(dead_code)]
     fn layer_norm(
         &self,
         bias: &Self,
@@ -643,6 +647,7 @@ struct NamedWeight {
 /// bucket (device-local when available, persistent host-coherent otherwise);
 /// None = streaming path (weights re-staged per matmul from host memory).
 #[derive(Clone)]
+#[allow(dead_code)]
 struct VulkanWeightSlot {
     handle: u64,
     element_count: usize,
@@ -673,7 +678,7 @@ impl Linear {
                 input.len()
             ));
         }
-        let mut output = if let (WeightData::Q8(matrix), Some(slot)) = (&self.weight, &self.slot) {
+        let mut output = if let (WeightData::Q8(_matrix), Some(slot)) = (&self.weight, &self.slot) {
             // Ant resident q8: the quantized buffer stays bound on the GPU.
             let mut output = vec![0.0; rows * self.output_size];
             for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
@@ -1603,12 +1608,14 @@ fn take_linear(
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct PhiNorm {
     weight: WeightData,
     bias: WeightData,
 }
 
 impl PhiNorm {
+    #[allow(dead_code)]
     fn forward(
         &self,
         input: &[f32],
@@ -1621,6 +1628,7 @@ impl PhiNorm {
     }
 }
 
+#[allow(dead_code)]
 fn take_phi_norm(
     weights: &mut HashMap<String, NamedWeight>,
     prefix: &str,
@@ -1635,6 +1643,7 @@ fn take_phi_norm(
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct PhiLayer {
     input_norm: PhiNorm,
     q_norm: Option<PhiNorm>,
@@ -1650,6 +1659,7 @@ struct PhiLayer {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct VulkanPhiExecutor {
     config: VulkanPhiConfig,
     embedding: WeightData,
@@ -1676,6 +1686,7 @@ impl super::models::ModelRuntime for VulkanPhiExecutor {
 }
 
 impl VulkanPhiExecutor {
+    #[allow(dead_code)]
     pub(crate) fn load(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
         let result = (|| {
             cheetah::native::vulkan::initialize()?;
@@ -1819,6 +1830,7 @@ impl VulkanPhiExecutor {
         })
     }
 
+    #[allow(dead_code)]
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         let sequence = tokens.len();
         if sequence == 0 {

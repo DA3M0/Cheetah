@@ -835,8 +835,8 @@ pub mod vulkan {
     pub fn matmul_q8_transposed(
         a: &[f32],
         q8: &[u8],
-        weight_rows: usize,
-        weight_cols: usize,
+        _weight_rows: usize,
+        _weight_cols: usize,
         m: usize,
         k: usize,
         n: usize,

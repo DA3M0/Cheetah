@@ -77,7 +77,7 @@ impl Clone for Box<dyn ModelRuntime> {
 #[derive(Clone, Copy)]
 pub(super) enum BackendLoader {
     /// Vulkan compute path: receives the aligned shard paths.
-    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    #[allow(dead_code)]
     Vulkan(
         fn(
             &[PathBuf],

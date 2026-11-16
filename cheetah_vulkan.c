@@ -2313,7 +2313,6 @@ int vk_qwen_bias_add(const float *values, const void *bias,
 static int ensure_matmul_q8_pipeline(void) {
     VkShaderModule shader = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkShaderModuleCreateInfo module_info;
     VkPipelineShaderStageCreateInfo stage_info;
     VkComputePipelineCreateInfo pipeline_info;
     VkDescriptorSetLayoutBinding bindings[3];
@@ -2404,7 +2403,6 @@ int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
     uint32_t groups_x;
     uint32_t groups_y;
     VkBuffer pool_buffer = VK_NULL_HANDLE;
-    VkBuffer weight_buffer = VK_NULL_HANDLE;
     VkDeviceSize offset_a = 0;
     VkDeviceSize offset_c = 0;
     VkDeviceSize size_a = 0;

@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[cfg(feature = "vulkan")]
+#[allow(dead_code)]
 pub(super) fn load_vulkan(
     weight_paths: &[PathBuf],
     _config_bytes: &[u8],
@@ -23,6 +24,7 @@ pub(super) fn load_vulkan(
 }
 
 #[cfg(feature = "vulkan")]
+#[allow(dead_code)]
 fn vulkan_config(
     raw_config: &Value,
 ) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {

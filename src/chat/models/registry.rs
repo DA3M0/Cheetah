@@ -245,15 +245,6 @@ fn load_vulkan_or_fallback(
             );
             return Err(no_native_backend_message(architecture));
         }
-        if !super::shader_is_registered("shared_ops") {
-            eprintln!(
-                "{}",
-                color::stderr(
-                    &format!("cheetah: Vulkan model references an unregistered shader."),
-                    Color::Yellow
-                )
-            );
-        }
         let vulkan_model = (|| {
             match architecture {
                 "llama" | "LlamaForCausalLM" => {
@@ -293,9 +284,8 @@ fn load_vulkan_or_fallback(
                 Color::Yellow
             )
         );
+        Err(no_native_backend_message(architecture))
     }
-
-    Err(no_native_backend_message(architecture))
 }
 
 #[cfg(test)]
