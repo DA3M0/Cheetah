@@ -1,6 +1,6 @@
 [package]
 name = "cheetah"
-version = "2.0.0"
+version = "0.9.0"
 edition = "2024"
 description = "Local model chat and OpenAI-compatible inference powered by Candle and Safetensors."
 license = "Apache-2.0"
