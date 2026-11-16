@@ -123,7 +123,7 @@ pub(super) fn load(
 ) -> Result<Box<dyn ModelRuntime>, String> {
     let config: gemma::Config = serde_json::from_slice(config_bytes)
         .map_err(|error| format!("Invalid Gemma configuration: {error}"))?;
-    let model = gemma::Model::new(&config, builder)
+    let model = gemma::Model::new(false, &config, builder)
         .map_err(|error| format!("Failed to load Gemma weights: {error}"))?;
     Ok(Box::new(Runtime {
         model,

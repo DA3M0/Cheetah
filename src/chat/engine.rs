@@ -640,7 +640,7 @@ impl Engine {
             prompt_renderer,
             max_position_embeddings: config.max_position_embeddings.min(ctx_size).min(
                 if config.model_type == "llama" {
-                    llama::MAX_SEQ_LEN
+                    llama::DEFAULT_MAX_SEQ_LEN
                 } else {
                     usize::MAX
                 },

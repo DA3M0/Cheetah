@@ -32,6 +32,17 @@ impl SimpleBackend for TiedEmbeddingBackend<'_> {
         self.source.contains_tensor(name)
             || name == "lm_head.weight" && self.source.contains_tensor("model.embed_tokens.weight")
     }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let name = if name == "lm_head.weight" {
+            "model.embed_tokens.weight"
+        } else {
+            name
+        };
+        self.source
+            .get_unchecked_dtype(name, dtype)
+            .and_then(|tensor| tensor.to_device(dev))
+    }
 }
 
 pub(super) fn load_model(

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 #[derive(Clone)]
 struct Runtime {
-    model: qwen2::Model,
+    model: qwen2::ModelForCausalLM,
     device: Device,
 }
 
@@ -49,7 +49,7 @@ pub(super) fn load(
 ) -> Result<Box<dyn ModelRuntime>, String> {
     let config: qwen2::Config = serde_json::from_value(raw_config)
         .map_err(|error| format!("Invalid Qwen2 configuration: {error}"))?;
-    let model = qwen2::Model::new(&config, builder)
+    let model = qwen2::ModelForCausalLM::new(&config, builder)
         .map_err(|error| format!("Failed to load Qwen2 weights: {error}"))?;
     Ok(Box::new(Runtime {
         model,
