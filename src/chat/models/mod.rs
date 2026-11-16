@@ -100,16 +100,6 @@ pub(super) enum BackendLoader {
     ),
 }
 
-impl BackendLoader {
-    /// Test/registry diagnostic: the backend name this loader serves.
-    #[cfg(test)]
-    pub(super) fn name(&self) -> &'static str {
-        match self {
-            BackendLoader::Vulkan(_) => "vulkan",
-            BackendLoader::Native(_) => "native",
-        }
-    }
-}
 
 /// Family-level inference constants for a model family: used as fallbacks when
 /// the model directory does not carry them (missing or incomplete
@@ -142,24 +132,6 @@ impl ModelFamily {
             .find(|(hidden, vocab, _, _, _)| *hidden == hidden_size && *vocab == vocab_size)
             .map(|(_, _, q_heads, kv_heads, head_dim)| (*q_heads, *kv_heads, *head_dim))
     }
-}
-
-pub(crate) struct ShaderRegistration {
-    name: &'static str,
-    path: Option<&'static str>,
-}
-
-include!(concat!(env!("OUT_DIR"), "/shader_registry.rs"));
-
-pub(crate) fn shader_path(name: &str) -> Option<&'static str> {
-    SHADERS
-        .iter()
-        .find(|shader| shader.name == name)
-        .and_then(|shader| shader.path)
-}
-
-pub(super) fn shader_is_registered(name: &str) -> bool {
-    shader_path(name).is_some() || SHADERS.iter().any(|shader| shader.name == name)
 }
 
 /// Chat prompt renderer resolved from the architecture name (init-time

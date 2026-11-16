@@ -208,6 +208,7 @@ impl ChatParams {
 
 struct LoadedModel {
     model: Box<dyn ModelRuntime>,
+    #[allow(dead_code)]
     device: Device,
 }
 

@@ -40,6 +40,7 @@ impl Default for AntSettings {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AntUnit {
     pub unit_id: String,
+    #[allow(dead_code)]
     pub name: String,
     #[serde(default)]
     pub dtype: String,
@@ -49,6 +50,7 @@ pub struct AntUnit {
     pub bytes: u64,
     pub source_file: String,
     pub source_offset: u64,
+    #[allow(dead_code)]
     pub shard: String,
     #[serde(default)]
     pub layer_id: i32,
@@ -190,18 +192,22 @@ impl Ant {
         native::ant_set_settings(self.handle, &ffi)
     }
 
+    #[allow(dead_code)]
     pub fn settings(&self) -> &AntSettings {
         &self.settings
     }
 
+    #[allow(dead_code)]
     pub fn load_model(&self, dst_dir: &Path) -> Result<(), String> {
         native::ant_load_model(self.handle, dst_dir)
     }
 
+    #[allow(dead_code)]
     pub fn unit_tier(&self, dst_dir: &Path, unit_id: &str) -> Result<i32, String> {
         native::ant_unit_tier(self.handle, dst_dir, unit_id)
     }
 
+    #[allow(dead_code)]
     pub fn unit_pin(&self, unit_id: &str, pin: bool) -> Result<(), String> {
         native::ant_unit_pin(self.handle, unit_id, pin)
     }
@@ -218,6 +224,7 @@ impl Ant {
         native::ant_model_is_initialized(self.handle, dst_dir)
     }
 
+    #[allow(dead_code)]
     pub fn requires_init(&self) -> bool {
         native::ant_requires_init(self.handle)
     }

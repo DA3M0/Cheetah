@@ -37,8 +37,6 @@ fn main() {
     if env::var_os("CARGO_FEATURE_VULKAN").is_some() {
         compile_vulkan(&shader_sources);
         println!("cargo:rustc-link-lib=vulkan");
-    } else {
-        generate_shader_registry(&shader_sources, &HashSet::new());
     }
 }
 
@@ -205,30 +203,5 @@ fn compile_vulkan(shaders: &[ShaderSource]) {
         build.define(name, Some(value.as_str()));
     }
     build.compile("cheetah_vulkan");
-    generate_shader_registry(shaders, &compiled);
 }
 
-fn generate_shader_registry(shaders: &[ShaderSource], compiled: &HashSet<String>) {
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
-    let mut generated = String::from("pub(super) const SHADERS: &[ShaderRegistration] = &[\n");
-    for shader in shaders {
-        let path = if compiled.contains(&shader.name) {
-            let path = out_dir.join(&shader.output);
-            format!(
-                "Some(\"{}\")",
-                path.to_string_lossy()
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-            )
-        } else {
-            "None".into()
-        };
-        generated.push_str(&format!(
-            "    ShaderRegistration {{ name: {:?}, path: {path} }},\n",
-            shader.name
-        ));
-    }
-    generated.push_str("];\n");
-    fs::write(out_dir.join("shader_registry.rs"), generated)
-        .expect("failed to write generated shader registry");
-}

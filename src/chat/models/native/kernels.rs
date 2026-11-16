@@ -282,8 +282,8 @@ pub fn softmax(scores: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::WeightDType;
     use super::*;
+    use super::super::store::WeightDType;
 
     #[test]
     fn bf16_widening_matches_bit_shift() {
@@ -400,7 +400,6 @@ mod tests {
 
 #[cfg(test)]
 mod dot_tests {
-    use super::super::store::WeightDType;
     use super::*;
 
     #[test]

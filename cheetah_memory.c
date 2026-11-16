@@ -9,10 +9,64 @@
 #include <unistd.h>
 
 typedef struct {
+    char **keys;
+    size_t *vals;
+    size_t cap;
+    size_t count;
+} UnitHash;
+
+typedef struct {
     CheetahAntUnit *items;
     size_t count;
     size_t capacity;
+    UnitHash hash;
 } UnitIndex;
+
+static uint64_t unit_hash_string(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    while (s && *s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+static void unit_hash_clear(UnitHash *h) {
+    for (size_t i = 0; i < h->cap; ++i) free(h->keys[i]);
+    free(h->keys);
+    free(h->vals);
+    h->keys = NULL;
+    h->vals = NULL;
+    h->cap = 0;
+    h->count = 0;
+}
+
+static void unit_hash_put(UnitHash *h, const char *key, size_t value) {
+    if (h->count * 2 >= h->cap) {
+        size_t ncap = h->cap ? h->cap * 2 : 64;
+        char **nkeys = (char **)calloc(ncap, sizeof(*nkeys));
+        size_t *nvals = (size_t *)calloc(ncap, sizeof(*nvals));
+        if (!nkeys || !nvals) { free(nkeys); free(nvals); return; }
+        for (size_t i = 0; i < h->cap; ++i) {
+            if (!h->keys[i]) continue;
+            size_t slot = unit_hash_string(h->keys[i]) & (ncap - 1);
+            while (nkeys[slot]) slot = (slot + 1) & (ncap - 1);
+            nkeys[slot] = h->keys[i];
+            nvals[slot] = h->vals[i];
+        }
+        free(h->keys);
+        free(h->vals);
+        h->keys = nkeys;
+        h->vals = nvals;
+        h->cap = ncap;
+    }
+    size_t mask = h->cap - 1;
+    size_t slot = unit_hash_string(key) & mask;
+    while (h->keys[slot]) {
+        if (strcmp(h->keys[slot], key) == 0) { h->vals[slot] = value; return; }
+        slot = (slot + 1) & mask;
+    }
+    h->keys[slot] = strdup(key);
+    h->vals[slot] = value;
+    h->count++;
+}
 
 typedef struct CheetahAnt {
     CheetahAntSettings settings;
@@ -75,6 +129,7 @@ static void unit_free(CheetahAntUnit *u) {
 static void unit_index_free(UnitIndex *idx) {
     for (size_t i = 0; i < idx->count; ++i) unit_free(&idx->items[i]);
     free(idx->items); idx->items = NULL; idx->count = idx->capacity = 0;
+    unit_hash_clear(&idx->hash);
 }
 
 static int unit_index_append(UnitIndex *idx, const CheetahAntUnit *src) {
@@ -83,6 +138,7 @@ static int unit_index_append(UnitIndex *idx, const CheetahAntUnit *src) {
         idx->items = xrealloc(idx->items, ncap * sizeof(*idx->items));
         idx->capacity = ncap;
     }
+    unit_hash_put(&idx->hash, src->unit_id, idx->count);
     CheetahAntUnit *dst = &idx->items[idx->count++];
     dst->unit_id = src->unit_id ? xstrdup(src->unit_id) : NULL;
     dst->name = src->name ? xstrdup(src->name) : NULL;
@@ -277,10 +333,14 @@ int cheetah_ant_load_model(CheetahAnt *ant, const char *dst_dir) {
 }
 
 static CheetahAntUnit *unit_index_find(UnitIndex *idx, const char *unit_id) {
-    if (!idx) return NULL;
-    for (size_t i = 0; i < idx->count; ++i) {
-        if (idx->items[i].unit_id && strcmp(idx->items[i].unit_id, unit_id) == 0)
-            return &idx->items[i];
+    if (!idx || !unit_id) return NULL;
+    UnitHash *h = &idx->hash;
+    if (!h->keys || h->cap == 0) return NULL;
+    size_t mask = h->cap - 1;
+    size_t slot = unit_hash_string(unit_id) & mask;
+    while (h->keys[slot]) {
+        if (strcmp(h->keys[slot], unit_id) == 0) return &idx->items[h->vals[slot]];
+        slot = (slot + 1) & mask;
     }
     return NULL;
 }
