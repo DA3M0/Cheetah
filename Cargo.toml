@@ -1,6 +1,6 @@
 [package]
 name = "cheetah"
-version = "1.0.0-rc1.1"
+version = "1.0.0-rc1.2"
 edition = "2024"
 description = "Local model chat and OpenAI-compatible inference powered by Safetensors."
 license = "Apache-2.0"
@@ -42,3 +42,7 @@ vulkan = []
 
 [profile.dev]
 debug = "line-tables-only"
+
+[profile.release]
+lto = true
+codegen-units = 1
