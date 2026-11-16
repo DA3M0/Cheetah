@@ -1,4 +1,4 @@
-//! Shared options for Candle chat generation.
+//! Shared options for local chat generation.
 
 use serde::{Deserialize, Serialize};
 

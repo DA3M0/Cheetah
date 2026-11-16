@@ -6,8 +6,9 @@ file formats, the parameter-resolution chain, the residency planner, the
 native backend architecture, the SIMD kernels, the testing infrastructure, and
 the step-by-step process for adding a new model family.
 
-For the registration mechanism (how a model family declares itself and its
-backends), read [REGISTRY.md](REGISTRY.md) alongside this document.
+For the architecture-driven model resolution layer (how a model family gets
+its chat template, backend capability, and inference constants), read
+[REGISTRY.md](REGISTRY.md) alongside this document.
 
 ---
 
@@ -48,8 +49,8 @@ Candle's owned-tensor design cannot keep weights mmap-backed.
 - **Family** — a model family (llama, qwen2, …) with its own fallback
   inference constants (`ModelFamily`) and native backend support.
 - **Runner** — the native forward implementation
-  (`Qwen2Native` in `src/chat/models/native/qwen2.rs`); despite the historical
-  name it serves the whole decoder family (llama / qwen2 / qwen3 shape).
+  (`DecoderNative` in `src/chat/models/native/decoder.rs`); it serves the whole
+  decoder family (llama / mixtral / qwen2 / qwen3 shape, with MoE routing for mixtral).
 
 ---
 
@@ -166,8 +167,8 @@ The native backend must keep working when the model directory's
 `config.json` is missing or incomplete ("directory completeness"). Parameters
 resolve field-by-field through a three-level fallback:
 
-```
-config.json field  →  units-manifest derivation  →  registered family default
+```text
+config.json field  →  units-manifest derivation  →  architecture family default
 ```
 
 1. **config.json** (authoritative when present). `Engine::load` reads it; if
@@ -176,14 +177,14 @@ config.json field  →  units-manifest derivation  →  registered family defaul
    (Candle-struct fields such as `hidden_act`, `sliding_window`) and family
    fallback values for any field the snapshot does not carry (backwards
    compatible with manifests written before the snapshot was extended).
-2. **units-manifest derivation** (`Qwen2Config::resolve`):
+2. **units-manifest derivation** (`DecoderConfig::resolve`):
    - `hidden_size`, `vocab_size` ← `model.embed_tokens.weight` shape
      (`[vocab, hidden]`),
    - `num_hidden_layers` ← `max(layer_id) + 1`,
    - `intermediate_size` ← `mlp.gate_proj.weight` out-features,
    - `q_out`/`k_out` ← `self_attn.q_proj.weight` / `k_proj.weight`
      out-features.
-3. **family defaults** (`ModelFamily`, see [REGISTRY.md](REGISTRY.md) §5):
+3. **family defaults** (`ModelFamily`, see [REGISTRY.md](REGISTRY.md) §2):
    `rope_theta`, `rms_norm_eps`, `tie_word_embeddings`, and the **size
    profile table**.
 
@@ -236,8 +237,8 @@ units never move).
 The full sequence, in order:
 
 1. Read `config.json` (or synthesize from the manifest — §4).
-2. Parse `ModelConfig` (model_type → architecture registration lookup,
-   `max_position_embeddings`, eos ids).
+2. Parse `ModelConfig` (architecture lookup via the normalized architecture
+   name, `max_position_embeddings`, eos ids).
 3. Read tokenizer, resolve chat template / stop markers.
 4. Resolve Ant settings (§3.3).
 5. Open the units manifest and plan residency (`plan_residency`).
@@ -245,9 +246,9 @@ The full sequence, in order:
 7. Derive the layer summary (§5) and seed the runtime bookkeeping (§7.8).
 8. **Native selection**: on CPU devices, look up
    `backend_loader_for_architecture(architecture, "native")` (see
-   [REGISTRY.md](REGISTRY.md) §7). When registered, the native loader
-   receives `(model_dir, config_bytes, raw_config, plan, family)` and builds
-   the runtime with tiers applied to real pages.
+   [REGISTRY.md](REGISTRY.md) §2). When the architecture resolves to a native
+   backend, the native loader receives `(model_dir, config_bytes, raw_config,
+   plan, family)` and builds the runtime with tiers applied to real pages.
 9. Otherwise fall through to the device backends: CUDA/Metal → Candle;
    Vulkan → the independent executor. The Candle CPU path is retired
    (an explicit guidance error, not a silent fallback).
@@ -264,8 +265,8 @@ Files (all under `src/chat/models/native/`):
 |------|------|
 | `store.rs` | `MmapWeightStore`: shard mapping + unit index + tier table + madvise control |
 | `kernels.rs` | compute kernels: gemv, rmsnorm, rope, softmax, silu, dequant |
-| `qwen2.rs` | the decoder runner (`Qwen2Native` — historical name; serves llama / qwen2 / qwen3 shape) + `Qwen2Config` resolution |
-| `mod.rs` | `NativeCpuRuntime` (ModelRuntime + AntTierControl bridge), registry-facing loader, synthetic-model tests |
+| `decoder.rs` | the decoder runner (`DecoderNative`; serves llama / mixtral / qwen2 / qwen3 shape, MoE for mixtral) + `DecoderConfig` resolution |
+| `mod.rs` | `NativeCpuRuntime` (ModelRuntime + AntTierControl bridge), native family loader, native forward tests (mixtral = mixture-of-experts with router + top-k experts) |
 
 ### 7.1 `MmapWeightStore`
 
@@ -289,7 +290,7 @@ Files (all under `src/chat/models/native/`):
   - `run_lm_head` sweeps the embedding in 16k-row chunks and drops each chunk
     (the 272 MB embedding is the largest transient).
 
-### 7.2 Forward pipeline (`Qwen2Native::forward`)
+### 7.2 Forward pipeline (`DecoderNative::forward`)
 
 Per position (looped over the token sequence):
 
@@ -301,7 +302,7 @@ for each layer:
     k = gemv(k_proj, normed) [+ bias]
     v = gemv(v_proj, normed) [+ bias]
     [q_norm per head] [k_norm per head]         // qwen3-style, optional, pre-rope
-    rope(q, pos), rope(k, pos)                  // rotate-half, matches candle
+    rope(q, pos), rope(k, pos)                  // rotate-half, matches the reference computation
     kv cache append (post-rope keys)
     attention: GQA (q_heads/kv_heads groups), causal via cache length,
                4-accumulator softmax-weighted value sum
@@ -320,7 +321,7 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
   q/k norms are family-optional; tied-vs-untied embeddings likewise. This is
   what lets one runner serve llama (no bias, untied), qwen2 (bias, tied) and
   qwen3 (no bias, q/k norms, tie varies).
-- **`Qwen2Config::resolve`** implements the parameter chain (§4).
+- **`DecoderConfig::resolve`** implements the parameter chain (§4).
 - `forward` returns the final-position logits only (`Vec<f32>`), matching the
   backend-agnostic `ModelRuntime::forward(&[u32], usize)` boundary.
 
@@ -486,7 +487,7 @@ contained uninitialized tiers from realloc memory).
 
 The Vulkan substrate (`cheetah_vulkan.c`) is a separate C component (device
 init, VRAM allocator, matmul/rope/attention shaders) consumed by the
-independent Vulkan executor — see [REGISTRY.md](REGISTRY.md) §8 for the
+independent Vulkan executor — see [REGISTRY.md](REGISTRY.md) §4.4 for the
 feature build. `cheetah_vulkan.c` logs the selected device at startup
 (`cheetah-vulkan: device '...' (API ..., discrete=N)`); the executor requires
 a HOST_VISIBLE|HOST_COHERENT heap, so weights stay in host RAM and the GPU
@@ -497,17 +498,13 @@ runs compute shaders only (measured: GT 730M 0.3 tok/s vs 8 tok/s native CPU
 
 ## 9. Testing infrastructure
 
-- **Synthetic decoder generator** (`native/mod.rs::prepare_synthetic_decoder`):
-  builds a tiny model in-process (Rust `safetensors::serialize` — 2 layers,
-  hidden 64, GQA 4/2, head_dim 16, vocab 128, deterministic pseudo-random
-  weights), runs `cheetah init` over it, and compares **native vs candle**
-  logits. Parameters: `tie` (tied/untied lm_head) and `qk_norm` (qwen3 per-head
-  norms). Current harnesses: llama (no bias, untied) and qwen3 (q/k norms,
-  explicit head_dim).
-- **Real-model comparisons** (`native/qwen2.rs` tests): qwen-0.5b prepared
-  model, native vs the internal Candle loader (numerical oracle) — full-width
-  logits and a stage-wise layer-0 capture (`DebugCapture`: normed / q_raw /
-  q_rope / scores / attn_out) that pinpoints which stage diverges.
+- **Chat template / stop-marker tests** (`src/chat/models/mod.rs`,
+  `src/chat/mod.rs` tests): instruction prompts for llama / mistral / qwen
+  render correctly, stop markers resolve per architecture, and unsupported
+  architectures surface clear resolution errors.
+- **Backend capability tests** (`src/chat/models/registry.rs` tests): the
+  native/vulkan backend tables, backend lookup, and the no-native guidance
+  error.
 - **Kernel isolation tests** (`kernels.rs`): `dot_row_bf16_fused` vs
   dequant+dot on exact bf16 integers (8 and 896 lanes — the full-width test
   exercises AVX2 tail handling). These caught the acc[1]/acc[3] word-mapping
@@ -521,8 +518,8 @@ Lessons worth keeping:
    was invisible in end-to-end numbers until the exact-integer test.
 2. **Never measure performance from a stale binary** — two measurement rounds
    ran against failed builds; always confirm zero compile errors first.
-3. **Comparison against a second implementation is the oracle** — the
-   sin/cos swap bug was caught by the candle-reference test, not by review.
+3. **A reference computation is the oracle** — the sin/cos swap bug was caught
+   by the kernel reference tests, not by review.
 
 ---
 
@@ -556,18 +553,18 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 
 1. **Implement the forward differences** in the native runner (only the
    deltas: e.g. gemma's `(1 + weight)` norm multiply, mistral's sliding
-   window, mixtral's router/experts). Reuse everything else.
-2. **Extend `Qwen2Config::resolve`** if the family carries new config fields.
-3. **Write the registration file** `src/chat/models/registrations/<family>.rs`
-   — see [REGISTRY.md](REGISTRY.md) §8: `backends` gains the native loader,
-   `family` gains constants + profiles (`(hidden, vocab, q, kv, head_dim)` for
+   window, mixtral's router/experts). Reuse everything else. (mixtral now
+   ships the MoE router + top-k experts in the native forward.)
+2. **Extend `DecoderConfig::resolve`** if the family carries new config fields.
+3. **Wire the family into the native backend**: add the architecture to the
+   native backend capability table and to `family_for_architecture` (which
+   holds the constants + profiles — `(hidden, vocab, q, kv, head_dim)` for
    every published size; hidden alone is ambiguous within a family).
-4. **Extend the synthetic generator** (`prepare_synthetic_decoder`) for the
-   family's structural deltas and add the comparison test.
-5. **Run the comparison** — native vs candle logits must agree to <1e-3 before
-   the family is announced.
-6. Update the registration assertion test
-   (`backend_registration_is_explicit_per_architecture`) and this document.
+4. **Extend the native runner / forward tests** for the family's structural
+   deltas and add the forward tests.
+5. **Run the comparison** — native forward output must match the reference
+   before the family is announced.
+6. Update the backend capability tests and this document.
 
 ---
 

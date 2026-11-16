@@ -1,4 +1,4 @@
-//! Candle-backed chat inference over Safetensors checkpoints.
+//! Local chat inference over Safetensors checkpoints.
 
 mod engine;
 mod models;
@@ -45,12 +45,12 @@ pub(crate) fn model_metadata_for_init(
     let Some(architecture) = architecture else {
         return Ok(None);
     };
-    let Ok(registration) = models::registration_for_architecture(architecture) else {
+    let Some(template) = models::chat_template_for_architecture(architecture) else {
         return Ok(None);
     };
     Ok(Some(cheetah::native::ModelMetadata {
-        chat_template: registration.chat_template.id,
-        stop_markers: registration.stop_markers,
+        chat_template: template.id,
+        stop_markers: models::stop_markers_for_architecture(architecture),
     }))
 }
 
@@ -60,7 +60,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn init_metadata_comes_from_generated_model_registration() {
+    fn init_metadata_comes_from_generated_model_architectures() {
         let directory = std::env::temp_dir().join(format!(
             "cheetah-init-registry-{}-{}",
             std::process::id(),
@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn init_metadata_is_absent_for_unregistered_architecture() {
+    fn init_metadata_is_absent_for_unsupported_architecture() {
         let directory = std::env::temp_dir().join(format!(
             "cheetah-init-unregistered-{}-{}",
             std::process::id(),
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn init_metadata_comes_from_mistral_and_mixtral_registrations() {
+    fn init_metadata_comes_from_mistral_and_mixtral_architectures() {
         let directory = std::env::temp_dir().join(format!(
             "cheetah-init-registered-architectures-{}-{}",
             std::process::id(),
@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn init_metadata_comes_from_qwen3_registration() {
+    fn init_metadata_comes_from_qwen3_architecture() {
         let directory = std::env::temp_dir().join(format!(
             "cheetah-init-qwen3-{}-{}",
             std::process::id(),

@@ -15,7 +15,7 @@ Line numbers are approximate (they drift); function names are the anchors.
 ```
 cheetah/
 ├── Cargo.toml                  features: default={} | metal | cuda | vulkan
-├── build.rs                    shader/registration discovery + generated registries
+├── build.rs                    shader discovery + generated shader registry
 ├── cheetah_init.c/.h           native model preparation (init) + manifest/units writers
 ├── cheetah_memory.c/.h         Ant C manager: units index, tier bookkeeping (metadata)
 ├── cheetah_vulkan.c/.h         Vulkan substrate: device init, VRAM pool, matmul/rope/attention
@@ -29,20 +29,18 @@ cheetah/
 │   │   ├── engine.rs           ★ Engine: load pipeline, generation loop, Ant hooks, sampling
 │   │   ├── context.rs          conversation archive/store (persistence)
 │   │   └── models/
-│   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + registry include!
-│   │       ├── registry.rs     device backends (cpu/cuda/metal/vulkan) + load dispatch + policy
-│   │       ├── candle.rs       Candle bridge (VarBuilder, tied-embedding backend)
-│   │       ├── qwen2.rs        Candle wrapper: Qwen2 (+ load_vulkan)
-│   │       ├── llama.rs        Candle wrapper: Llama (+ Cache)
-│   │       ├── gemma/mistral/mixtral/phi.rs   Candle wrappers
-│   │       ├── qwen3.rs        Candle wrapper: Qwen3 (self-contained impl, 694 lines)
+│   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + architecture resolution
+│   │       ├── registry.rs     backend capability tables (native/vulkan) + family constants + load dispatch
+│   │       ├── qwen2.rs        family runtime wiring (native runner + Vulkan executor loader)
+│   │       ├── llama.rs        family runtime wiring
+│   │       ├── gemma/mistral/mixtral/phi.rs   family runtime wiring
+│   │       ├── qwen3.rs        family runtime wiring
 │   │       ├── templates.rs    chat template renderers
-│   │       ├── registrations/  ★ declarative registration files (one per family)
 │   │       └── native/         ★ the native mmap backend
 │   │           ├── store.rs    MmapWeightStore + madvise tier control
 │   │           ├── kernels.rs  gemv (AVX2 + portable), rmsnorm, rope, softmax, silu
-│   │           ├── qwen2.rs    decoder runner (Qwen2Native) + Qwen2Config::resolve
-│   │           └── mod.rs      NativeCpuRuntime + registry loader + synthetic tests
+│   │           ├── decoder.rs    decoder runner (DecoderNative) + DecoderConfig::resolve
+│   │           └── mod.rs      NativeCpuRuntime + native family loader + native tests
 │   ├── vulkan_transformer.rs   Vulkan model executors (transformer + Phi), Candle-free
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue)
@@ -71,16 +69,16 @@ main.rs::run (dispatch)                      src/main.rs
                   AntSettings resolve → units manifest → plan_residency (src/ant.rs)
                   ant_apply_budget → ant_evicted
                   layer_residency_summary + AntRuntimeState seed
-                  backend_loader_for_architecture(arch, "native")   ← registry lookup
+                  backend_loader_for_architecture(arch, backend)   ← architecture capability lookup
                       → native::native_family_loader   src/chat/models/native/mod.rs
                           MmapWeightStore::open        native/store.rs
-                          Qwen2Config::resolve         native/qwen2.rs (config→units→family)
+                          DecoderConfig::resolve         native/decoder.rs (config→units→family)
                           apply_tiers(plan)            madvise per unit
           → chat_loop                        engine.rs:1500 (REPL)
               → generate_inner               engine.rs:1188
                   apply_ant_request_overrides → prefetch → promote → enforce
                   model.forward(&tokens, offset)     ← backend-agnostic boundary
-                      (native: Qwen2Native::forward  native/qwen2.rs)
+                      (native: DecoderNative::forward  native/decoder.rs)
                   sample_token                   engine.rs:1527
 ```
 
@@ -136,11 +134,10 @@ run_init_command      src/main.rs:90
 | `dot_row_bf16_avx2` | kernels.rs | `cvtepu16_epi32 + slli_epi32(16)` widening + FMA |
 | `dot_row_bf16_fused(_portable)` | kernels.rs | fused bit-widening dot (portable fallback) |
 | `rmsnorm` / `rope_in_place` / `silu_multiply` / `softmax` | kernels.rs | elementwise/attention helpers |
-| `Qwen2Config::resolve` | qwen2.rs | the parameter chain (config → units → family) |
-| `Qwen2Native::forward` | qwen2.rs | the decoder forward (see ANT_MEMORY §7.2) |
-| `apply_tiers` / `page_in_unit` / `evict_unit` | qwen2.rs | Ant tier application on real pages |
-| `native_family_loader` | mod.rs | registry-facing loader (qwen2/llama/qwen3) |
-| `prepare_synthetic_decoder` | mod.rs (tests) | synthetic-model generator for comparisons |
+| `DecoderConfig::resolve` | decoder.rs | the parameter chain (config → units → family) |
+| `DecoderNative::forward` | decoder.rs | the decoder forward (see ANT_MEMORY §7.2) |
+| `apply_tiers` / `page_in_unit` / `evict_unit` | decoder.rs | Ant tier application on real pages |
+| `native_family_loader` | mod.rs | native family loader (llama / mixtral / qwen2 / qwen3) |
 
 ### `src/ant.rs` — the planner
 
@@ -153,16 +150,15 @@ run_init_command      src/main.rs:90
 | `ant_filter_known_units` | wizard unit-id validation |
 | `run_interactive_setup` | the `--setup` wizard |
 
-### `src/chat/models/` — registry & backends
+### `src/chat/models/` — runtime & backend resolution
 
 | Item | File | Role |
 |------|------|------|
-| `ModelRuntime` | mod.rs | backend-agnostic boundary: `forward(&[u32], usize) -> Vec<f32>` |
-| `BackendLoader` / `ModelRegistration` / `ModelFamily` | mod.rs | registry schema (see REGISTRY §3) |
-| `registration_for_architecture` etc. | mod.rs | lookups |
-| `BACKENDS` (device table) / `load_model` / `load_model_for_device` / `retired_cpu_candle_message` | registry.rs | device dispatch + Candle CPU retirement policy |
-| `candle::load_model` | candle.rs | VarBuilder bridge + tied-embedding backend (tests' numerical oracle) |
-| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan_transformer.rs | Candle-free Vulkan executors |
+| `ModelRuntime` / `AntTierControl` | mod.rs | backend-agnostic boundary: `forward(&[u32], usize) -> Vec<f32>` + Ant tier control |
+| `BackendLoader` / `ModelFamily` | mod.rs | backend enum + family constants |
+| `backend_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | architecture-driven lookups |
+| `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
+| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan_transformer.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
 
 ### CLI/serve
 
@@ -183,8 +179,8 @@ run_init_command      src/main.rs:90
 
 | Variable | Read by | Values | Effect |
 |----------|---------|--------|--------|
-| `CHEETAH_DEVICE` | registry.rs, engine.rs | `cpu` / `cuda` / `metal` / `vulkan` | backend selection. `cpu` (default) → native mmap backend for registered families (Qwen2, Llama, Qwen3); `cuda`/`metal` → Candle; `vulkan` → independent executor. |
-| `CHEETAH_NATIVE` | engine.rs | `0` / `1` | `0` skips native selection (surfaces the guidance error for unregistered families on CPU). Kept for policy testing. |
+| `CHEETAH_DEVICE` | registry.rs, engine.rs | `cpu` / `cuda` / `metal` / `vulkan` | backend selection. `cpu` (default) → native mmap backend for architecture-resolved families (Qwen2, Llama, Qwen3); `cuda`/`metal` → Candle; `vulkan` → independent executor. |
+| `CHEETAH_NATIVE` | engine.rs | `0` / `1` | `0` skips native selection (surfaces the guidance error for architectures without a native backend on CPU). Kept for policy testing. |
 | `CHEETAH_QUANT_Q8` | vulkan_transformer.rs (take_linear) | `1` / `true` | Quantizes all Linear projections to row-wise int8 (Q8) at load time. Halves weight footprint; norms/biases/embeddings stay in original precision. Vulkan only. |
 
 ### 4.2 Vulkan substrate
@@ -226,19 +222,15 @@ cargo build --release --features metal    # Candle Metal (macOS)
 
 cargo test                           # default feature tests (135)
 cargo test --features vulkan         # + Vulkan executor/shader tests (147)
-cargo test native_                   # all native-backend comparison tests
+cargo test native_                   # all native-backend tests
 cargo test -- --test-threads=4       # parallel (some tests are timing-sensitive)
 ```
 
 Tests that need local artifacts (auto-skip when absent):
 - `ant_lifecycle_against_real_prepared_model` — `/home/benny/models/qwen-0.5b-prepared`
-- `native_logits_match_candle` / `native_layer0_matches_candle_reference` — same model
-- `tiny_dense_and_moe_models_forward_and_reset_cache` (vulkan, `#[ignore]`) — a real Vulkan compute device; the serve smoke test is the practical verification
 
-Everything else — including the synthetic decoder comparisons
-(`native_llama_matches_candle_on_synthetic_model`,
-`native_qwen3_matches_candle_on_synthetic_model`) — is self-contained and
-runs anywhere.
+Everything else — including the native kernel / forward tests — is
+self-contained and runs anywhere.
 
 ---
 
@@ -246,17 +238,17 @@ runs anywhere.
 
 1. **The runtime boundary carries no backend types**:
    `ModelRuntime::forward(&[u32], usize) -> Result<Vec<f32>, String>`.
-2. **Registration files contain no runtime code**; implementation files
-   contain no `REGISTRATION`.
+2. **Architecture resolution contains no runtime code**; implementation files
+   resolve backends and chat metadata through the capability tables in
+   `src/chat/models/registry.rs` and `src/chat/models/mod.rs`.
 3. **`Disk`-tier means real released pages** on the native backend — any change
    that keeps disk-tier bytes resident breaks the Ant contract.
 4. **Every swap re-checks the budget before it executes** (`ant_swap_in_unit`,
    `ant_swap_fit`).
 5. **Bit-math changes require the isolation tests** (`dot_row_bf16_fused` vs
-   dequant+dot) AND a native-vs-candle comparison run.
+   dequant+dot) AND a native forward-parity run.
 6. **Performance numbers are only valid from a freshly built binary** (see
    ANT_MEMORY §9, lesson 2).
 7. **`f32::sin_cos` returns `(sin, cos)`** — the historical rope bug.
-8. Registration assertions
-   (`backend_registration_is_explicit_per_architecture`) must be updated when
+8. Backend capability assertions must be updated when
    a family gains/loses a backend.

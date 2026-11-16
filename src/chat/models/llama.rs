@@ -1,17 +1,9 @@
+#[cfg(feature = "vulkan")]
 use super::ModelRuntime;
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
-use candle_transformers::models::llama;
+#[cfg(feature = "vulkan")]
 use serde_json::Value;
 #[cfg(feature = "vulkan")]
 use std::path::PathBuf;
-
-#[derive(Clone)]
-struct Runtime {
-    model: llama::Llama,
-    cache: llama::Cache,
-    device: Device,
-}
 
 #[cfg(feature = "vulkan")]
 pub(super) fn load_vulkan(
@@ -59,54 +51,4 @@ pub(super) fn load_vulkan(
         &config,
         plan,
     )?))
-}
-
-impl ModelRuntime for Runtime {
-    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
-        // Bridge the backend-agnostic runtime boundary to the Candle model:
-        // tokens in, final-position logits out.
-        let input = candle_core::Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &self.device)
-            .map_err(|error| error.to_string())?;
-        let logits = self
-            .model
-            .forward(&input, offset, &mut self.cache)
-            .map_err(|error| error.to_string())?;
-        logits
-            .reshape((logits.elem_count(),))
-            .and_then(|logits| logits.to_vec1::<f32>())
-            .map_err(|error| error.to_string())
-    }
-
-    fn clear_cache(&mut self) {
-        // candle 0.4's llama Cache has no reset; the engine restarts every
-        // generation from offset 0 and the cache grows positionally.
-    }
-
-    fn device_name(&self) -> &'static str {
-        match &self.device {
-            Device::Cpu => "CPU",
-            Device::Cuda(_) => "CUDA",
-            Device::Metal(_) => "Metal",
-        }
-    }
-}
-
-pub(super) fn load(
-    config_bytes: &[u8],
-    _raw_config: Value,
-    builder: VarBuilder<'_>,
-    device: &Device,
-) -> Result<Box<dyn ModelRuntime>, String> {
-    let raw: llama::LlamaConfig = serde_json::from_slice(config_bytes)
-        .map_err(|error| format!("Invalid Llama configuration: {error}"))?;
-    let config = raw.into_config(false);
-    let model = llama::Llama::load(builder, &config)
-        .map_err(|error| format!("Failed to load Llama weights: {error}"))?;
-    let cache = llama::Cache::new(true, DType::F32, &config, device)
-        .map_err(|error| format!("Failed to initialize Llama KV cache: {error}"))?;
-    Ok(Box::new(Runtime {
-        model,
-        cache,
-        device: device.clone(),
-    }))
 }

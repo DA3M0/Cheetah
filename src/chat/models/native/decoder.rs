@@ -1,4 +1,4 @@
-//! Native Qwen2 forward pass over the mmap-backed weight store. Activations
+//! Native decoder forward pass over the mmap-backed weight store. Activations
 //! are f32; weight bytes are read in their stored dtype straight from the
 //! mapping (zero copies). Disk-tier units are dropped from the resident set at
 //! the end of every step so a generation holds only the planned resident bytes.
@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct Qwen2Config {
+pub struct DecoderConfig {
     pub hidden_size: usize,
     pub num_layers: usize,
     pub q_heads: usize,
@@ -21,34 +21,13 @@ pub struct Qwen2Config {
     pub rms_eps: f32,
     pub rope_theta: f32,
     pub tie_word_embeddings: bool,
+    /// Mixture-of-experts layout: number of experts (0 => dense feed-forward)
+    /// and experts routed per token (0 => dense).
+    pub num_local_experts: usize,
+    pub num_experts_per_tok: usize,
 }
 
-impl Qwen2Config {
-    pub fn from_config_json(raw: &Value) -> Result<Self, String> {
-        let field = |name: &str| -> Result<f64, String> {
-            raw.get(name)
-                .and_then(Value::as_f64)
-                .ok_or_else(|| format!("config.json is missing '{name}' for the native backend."))
-        };
-        let hidden_size = field("hidden_size")? as usize;
-        let q_heads = field("num_attention_heads")? as usize;
-        Ok(Self {
-            hidden_size,
-            num_layers: field("num_hidden_layers")? as usize,
-            q_heads,
-            kv_heads: field("num_key_value_heads")? as usize,
-            head_dim: hidden_size / q_heads,
-            intermediate_size: field("intermediate_size")? as usize,
-            vocab_size: field("vocab_size")? as usize,
-            rms_eps: field("rms_norm_eps")? as f32,
-            rope_theta: field("rope_theta")? as f32,
-            tie_word_embeddings: raw
-                .get("tie_word_embeddings")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        })
-    }
-
+impl DecoderConfig {
     /// Resolve the configuration through the parameter fallback chain:
     /// explicit config fields, then derivation from the units manifest's
     /// tensor shapes, then the registered family constants. This keeps the
@@ -102,6 +81,8 @@ impl Qwen2Config {
                 .map(|shape| shape[0])
                 .unwrap_or(0),
         );
+        let num_local_experts = field_u("num_local_experts").unwrap_or(0);
+        let num_experts_per_tok = field_u("num_experts_per_tok").unwrap_or(0);
 
         let (q_heads, kv_heads, head_dim) = match field_u("num_attention_heads") {
             Some(q_heads) => {
@@ -141,6 +122,8 @@ impl Qwen2Config {
             rope_theta: field_f("rope_theta").unwrap_or(family.rope_theta) as f32,
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
+            num_local_experts,
+            num_experts_per_tok,
         })
     }
 }
@@ -159,11 +142,12 @@ struct Scratch {
     gate: Vec<f32>,
     up: Vec<f32>,
     mlp_out: Vec<f32>,
+    router: Vec<f32>,
     logits: Vec<f32>,
 }
 
-pub struct Qwen2Native {
-    pub(super) cfg: Qwen2Config,
+pub struct DecoderNative {
+    pub(super) cfg: DecoderConfig,
     store: Arc<MmapWeightStore>,
     /// Per-layer KV cache, flattened as [position * kv_heads * head_dim + index].
     kv_k: Vec<Vec<f32>>,
@@ -182,7 +166,7 @@ pub struct Qwen2Native {
 
 /// Stage-wise debug capture of layer 0 at the last input position.
 /// Test instrumentation only; individual stages are consumed by the
-/// candle-reference comparison tests.
+/// native attention capture tests.
 #[allow(dead_code)]
 pub struct DebugCapture {
     /// Input layernorm output feeding q/k/v.
@@ -201,7 +185,7 @@ pub struct DebugCapture {
     pub attn_out: Vec<f32>,
 }
 
-impl Clone for Qwen2Native {
+impl Clone for DecoderNative {
     fn clone(&self) -> Self {
         // Weights are shared through the Arc'd store; only a fresh KV cache is
         // created (the engine clears the cache before every generation anyway).
@@ -209,13 +193,14 @@ impl Clone for Qwen2Native {
     }
 }
 
-impl Qwen2Native {
-    pub fn with_store(cfg: Qwen2Config, store: Arc<MmapWeightStore>) -> Self {
+impl DecoderNative {
+    pub fn with_store(cfg: DecoderConfig, store: Arc<MmapWeightStore>) -> Self {
         let kv_dim = cfg.kv_heads * cfg.head_dim;
         Self {
             kv_k: vec![Vec::new(); cfg.num_layers],
             kv_v: vec![Vec::new(); cfg.num_layers],
             scratch: Scratch {
+                router: Vec::new(),
                 hidden: Vec::with_capacity(cfg.hidden_size),
                 normed: Vec::with_capacity(cfg.hidden_size),
                 q: Vec::with_capacity(cfg.q_heads * cfg.head_dim),
@@ -533,6 +518,81 @@ impl Qwen2Native {
                 .slice(&format!("{prefix}post_attention_layernorm.weight"))?;
             kernels::rmsnorm(&mut self.scratch.normed, weight, dtype, cfg.rms_eps);
         }
+        if cfg.num_local_experts > 0 && cfg.num_experts_per_tok > 0 {
+            // --- Mixture-of-experts block ---
+            self.scratch.router.clear();
+            self.scratch.router.resize(cfg.num_local_experts, 0.0);
+            let (router_weight, router_dtype, _) = self
+                .store
+                .slice(&format!("{prefix}block_sparse_moe.gate"))?;
+            kernels::gemv(
+                router_weight,
+                router_dtype,
+                cfg.num_local_experts,
+                cfg.hidden_size,
+                &self.scratch.normed,
+                &mut self.scratch.router,
+            );
+            let mut order: Vec<usize> = (0..cfg.num_local_experts).collect();
+            order.sort_by(|&a, &b| {
+                let left = self.scratch.router.get(b).copied().unwrap_or(0.0);
+                let right = self.scratch.router.get(a).copied().unwrap_or(0.0);
+                right.partial_cmp(&left).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top_k = cfg.num_experts_per_tok.min(cfg.num_local_experts);
+            for expert in order.into_iter().take(top_k) {
+                let (gate_weight, gate_dtype, _) = self
+                    .store
+                    .slice(&format!("{prefix}block_sparse_moe.experts.{expert}.w1"))?;
+                let (up_weight, up_dtype, _) = self
+                    .store
+                    .slice(&format!("{prefix}block_sparse_moe.experts.{expert}.w3"))?;
+                let (down_weight, down_dtype, _) = self
+                    .store
+                    .slice(&format!("{prefix}block_sparse_moe.experts.{expert}.w2"))?;
+                self.scratch.gate.clear();
+                self.scratch.gate.resize(cfg.intermediate_size, 0.0);
+                kernels::gemv(
+                    gate_weight,
+                    gate_dtype,
+                    cfg.intermediate_size,
+                    cfg.hidden_size,
+                    &self.scratch.normed,
+                    &mut self.scratch.gate,
+                );
+                self.scratch.up.clear();
+                self.scratch.up.resize(cfg.intermediate_size, 0.0);
+                kernels::gemv(
+                    up_weight,
+                    up_dtype,
+                    cfg.intermediate_size,
+                    cfg.hidden_size,
+                    &self.scratch.normed,
+                    &mut self.scratch.up,
+                );
+                kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
+                self.scratch.mlp_out.clear();
+                self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
+                kernels::gemv(
+                    down_weight,
+                    down_dtype,
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    &self.scratch.gate,
+                    &mut self.scratch.mlp_out,
+                );
+                for (value, residual) in self
+                    .scratch
+                    .mlp_out
+                    .iter()
+                    .zip(self.scratch.hidden.iter_mut())
+                {
+                    *residual += *value;
+                }
+            }
+            return Ok(());
+        }
+
         self.scratch.gate.clear();
         self.scratch.gate.resize(cfg.intermediate_size, 0.0);
         kernels::gemv(
@@ -625,7 +685,7 @@ impl Qwen2Native {
     }
 
     /// Test helper: stage-wise layer-0 attention capture for the last input
-    /// position, used by the candle-reference comparison test.
+    /// position, used by the native attention capture test.
     #[allow(dead_code)]
     pub fn debug_attention_out(&mut self, tokens: &[u32]) -> Result<DebugCapture, String> {
         for (index, &token) in tokens.iter().enumerate().take(tokens.len() - 1) {
@@ -679,366 +739,3 @@ fn add_bias(values: &mut [f32], bias_bytes: &[u8], dtype: WeightDType) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn prepared_model_dir() -> Option<std::path::PathBuf> {
-        let dir = std::path::Path::new("/home/benny/models/qwen-0.5b-prepared");
-        let units = dir.join(crate::ant::CHEETAH_UNITS_FILENAME);
-        if dir.join("config.json").is_file() && units.is_file() {
-            Some(dir.to_path_buf())
-        } else {
-            None
-        }
-    }
-
-    fn shard_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join(".cheetah/weights"))
-            .expect("weights dir")
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
-                    .then_some(path)
-            })
-            .collect();
-        paths.sort();
-        paths
-    }
-
-    /// Cross-check the native logits against the candle path on the same
-    /// prepared model. Requires a locally prepared model; skips otherwise.
-    #[test]
-    fn native_logits_match_candle() {
-        let Some(model_dir) = prepared_model_dir() else {
-            eprintln!("skipping native/candle logits comparison: model not prepared");
-            return;
-        };
-        let config_bytes = std::fs::read(model_dir.join("config.json")).unwrap();
-        let raw: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
-        let cfg = Qwen2Config::from_config_json(&raw).unwrap();
-
-        let store = Arc::new(MmapWeightStore::open(&model_dir).unwrap());
-        let mut native = Qwen2Native::with_store(cfg.clone(), Arc::clone(&store));
-        // A multi-token prompt exercises the causal attention path; the single
-        // token case degenerates (softmax over one entry) and cannot catch
-        // attention bugs.
-        let tokens: Vec<u32> = vec![9707, 11, 2624, 358, 1457, 311, 358, 1614]; // "Hi! I want to know"
-        let native_logits = native.forward(&tokens, 0).unwrap();
-
-        let registration =
-            crate::chat::models::registration_for_architecture("Qwen2ForCausalLM").unwrap();
-        let mut candle_model = crate::chat::models::candle::load_model(
-            &shard_paths(&model_dir),
-            &config_bytes,
-            raw.clone(),
-            registration,
-            &candle_core::Device::Cpu,
-        )
-        .unwrap();
-        let candle_logits = candle_model.forward(&tokens, 0).unwrap();
-
-        let mut diffs: Vec<f32> = native_logits
-            .iter()
-            .zip(&candle_logits)
-            .map(|(a, b)| (a - b).abs())
-            .collect();
-        diffs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let max_diff = diffs[0];
-        let native_top = native_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
-        let candle_top = candle_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
-        eprintln!(
-            "native top={native_top} candle top={candle_top} max|diff|={max_diff:.4} mean|diff|={:.4}",
-            diffs.iter().sum::<f32>() / diffs.len() as f32
-        );
-        assert_eq!(native_top, candle_top, "argmax logits diverge");
-        assert!(
-            max_diff < 0.1,
-            "native/candle logits diverge by more than 0.1 (max {max_diff})"
-        );
-    }
-
-    /// Layer-0 reference computed with candle tensor ops (replicating
-    /// candle-transformers' qwen2 math exactly) compared against the native
-    /// kernels — isolates the attention/KV path on real weights.
-    #[test]
-    fn native_layer0_matches_candle_reference() {
-        use candle_core::{DType, Device, Tensor};
-        let Some(model_dir) = prepared_model_dir() else {
-            eprintln!("skipping layer0 comparison: model not prepared");
-            return;
-        };
-        let config_bytes = std::fs::read(model_dir.join("config.json")).unwrap();
-        let raw: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
-        let cfg = Qwen2Config::from_config_json(&raw).unwrap();
-        let device = Device::Cpu;
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(
-                &shard_paths(&model_dir),
-                DType::F32,
-                &device,
-            )
-            .unwrap()
-        };
-        use candle_nn::Module;
-        let prefix = "model.layers.0.";
-        let hidden = cfg.hidden_size;
-        let head_dim = cfg.head_dim;
-
-        // Two-token input hidden states after embedding.
-        let tokens: Vec<u32> = vec![9707, 11];
-        let embed = vb
-            .get((cfg.vocab_size, hidden), "model.embed_tokens.weight")
-            .unwrap();
-        let xs = embed
-            .index_select(
-                &Tensor::from_slice(&tokens, (tokens.len(),), &device).unwrap(),
-                0,
-            )
-            .unwrap(); // (2, hidden)
-
-        // input_layernorm
-        let normed = candle_nn::rms_norm(hidden, 1e-6, vb.pp(&format!("{prefix}input_layernorm")))
-            .unwrap()
-            .forward(&xs)
-            .unwrap();
-
-        // q/k/v projections (with bias)
-        let linear = |out: usize, name: &str, bias: bool| {
-            candle_nn::Linear::new(
-                vb.get((out, hidden), &format!("{prefix}{name}.weight"))
-                    .unwrap(),
-                if bias {
-                    Some(vb.get((out,), &format!("{prefix}{name}.bias")).unwrap())
-                } else {
-                    None
-                },
-            )
-        };
-        let q = linear(cfg.q_heads * head_dim, "self_attn.q_proj", true)
-            .forward(&normed)
-            .unwrap();
-        let k = linear(cfg.kv_heads * head_dim, "self_attn.k_proj", true)
-            .forward(&normed)
-            .unwrap();
-        let v = linear(cfg.kv_heads * head_dim, "self_attn.v_proj", true)
-            .forward(&normed)
-            .unwrap();
-
-        // rope (replicating candle qwen2: duplicated-frequency rotate-half)
-        let rotate = |xs: &Tensor| -> Tensor {
-            let d = xs.dim(2).unwrap();
-            let x1 = xs.narrow(2, 0, d / 2).unwrap();
-            let x2 = xs.narrow(2, d / 2, d - d / 2).unwrap();
-            Tensor::cat(&[&x2.neg().unwrap(), &x1], 2).unwrap()
-        };
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / (cfg.rope_theta.powf(i as f32 / head_dim as f32)) as f32)
-            .collect();
-        let rope_for = |states: &Tensor, heads: usize| -> Tensor {
-            // states: (2, heads * head_dim) -> (2, heads, head_dim); cos/sin are
-            // (2, 1, head_dim) with each frequency duplicated across both halves.
-            let states = states.reshape((2, heads, head_dim)).unwrap();
-            let mut cos_rows = Vec::new();
-            let mut sin_rows = Vec::new();
-            for pos in 0..2usize {
-                let mut cos_row = Vec::with_capacity(head_dim);
-                let mut sin_row = Vec::with_capacity(head_dim);
-                for _ in 0..2usize {
-                    for f in &inv_freq {
-                        cos_row.push((pos as f32 * f).cos());
-                        sin_row.push((pos as f32 * f).sin());
-                    }
-                }
-                cos_rows.push(cos_row);
-                sin_rows.push(sin_row);
-            }
-            let cos = Tensor::new(cos_rows, &device)
-                .unwrap()
-                .unsqueeze(1)
-                .unwrap();
-            let sin = Tensor::new(sin_rows, &device)
-                .unwrap()
-                .unsqueeze(1)
-                .unwrap();
-            (states.broadcast_mul(&cos).unwrap() + rotate(&states).broadcast_mul(&sin).unwrap())
-                .unwrap()
-        };
-        let q_rope = rope_for(&q, cfg.q_heads);
-        let k_rope = rope_for(&k, cfg.kv_heads);
-
-        // Attention for query position 1 (the last token), head h, over both keys.
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let q_vec = q_rope.get(1).unwrap(); // (q_heads, head_dim)
-        let mut attn_ref = vec![0f32; cfg.q_heads * head_dim];
-        let mut head0_ref = Vec::new();
-        for head in 0..cfg.q_heads {
-            let kv_head = head / (cfg.q_heads / cfg.kv_heads);
-            let scores: Vec<f32> = (0..2usize)
-                .map(|pos| {
-                    let k_head = k_rope.get(pos).unwrap().get(kv_head).unwrap(); // (head_dim,)
-                    let dot: f32 = (0..head_dim)
-                        .map(|i| {
-                            q_vec
-                                .get(head)
-                                .unwrap()
-                                .get(i)
-                                .unwrap()
-                                .to_scalar::<f32>()
-                                .unwrap()
-                                * k_head.get(i).unwrap().to_scalar::<f32>().unwrap()
-                        })
-                        .sum();
-                    dot * scale
-                })
-                .collect();
-            let mut weights = scores.clone();
-            let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0f32;
-            for w in weights.iter_mut() {
-                *w = (*w - max).exp();
-                sum += *w;
-            }
-            for w in weights.iter_mut() {
-                *w /= sum;
-            }
-            if head == 0 {
-                head0_ref = weights.clone();
-            }
-            for pos in 0..2usize {
-                let v_row = v.get(pos).unwrap();
-                let base = kv_head * head_dim;
-                for i in 0..head_dim {
-                    attn_ref[head * head_dim + i] +=
-                        weights[pos] * v_row.get(base + i).unwrap().to_scalar::<f32>().unwrap();
-                }
-            }
-        }
-
-        // o_proj reference for position 1.
-        let o = linear(cfg.hidden_size, "self_attn.o_proj", false)
-            .forward(&Tensor::from_vec(attn_ref.clone(), (1, attn_ref.len()), &device).unwrap())
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-
-        // Native stage-wise capture.
-        let store = Arc::new(MmapWeightStore::open(&model_dir).unwrap());
-        let mut native = Qwen2Native::with_store(cfg.clone(), Arc::clone(&store));
-        let cap = native.debug_attention_out(&tokens).unwrap();
-
-        let q_candle_row = q_rope.get(1).unwrap().to_vec2::<f32>().unwrap().concat();
-        let k_candle_row = k_rope.get(1).unwrap().to_vec2::<f32>().unwrap().concat();
-        let diff = |a: &[f32], b: &[f32]| {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0f32, f32::max)
-        };
-        eprintln!(
-            "normed max|diff|={:.5} q_raw max|diff|={:.5} k_raw max|diff|={:.5} q_rope max|diff|={:.5} k_rope max|diff|={:.5} head0 scores max|diff|={:.5} attn_out max|diff|={:.5} o max|diff|={:.5}",
-            diff(
-                &cap.normed,
-                &normed.get(1).unwrap().to_vec1::<f32>().unwrap()
-            ),
-            diff(&cap.q_raw, &q_candle_row),
-            diff(&cap.k_raw, &k_candle_row),
-            diff(&cap.q, &q_candle_row),
-            diff(&cap.k, &k_candle_row),
-            diff(&cap.scores, &head0_ref),
-            diff(&cap.attn_out, &attn_ref),
-            {
-                let o_native = linear(cfg.hidden_size, "self_attn.o_proj", false)
-                    .forward(
-                        &Tensor::from_vec(cap.attn_out.clone(), (1, cap.attn_out.len()), &device)
-                            .unwrap(),
-                    )
-                    .unwrap()
-                    .get(0)
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
-                diff(&o, &o_native)
-            }
-        );
-        eprintln!(
-            "q_raw native[32..40]={:?}\nq_pre-rope candle[32..40]={:?}\nq_post-rope native[32..40]={:?}\nq_post-rope candle[32..40]={:?}\nq_raw native[0..8]={:?}\nq_pre-rope candle[0..8]={:?}\nq_post-rope native[0..8]={:?}\nq_post-rope candle[0..8]={:?}",
-            &cap.q_raw[32..40],
-            &q.get(1).unwrap().to_vec1::<f32>().unwrap()[32..40],
-            &cap.q[32..40],
-            &q_candle_row[32..40],
-            &cap.q_raw[..8],
-            &q.get(1).unwrap().to_vec1::<f32>().unwrap()[..8],
-            &cap.q[..8],
-            &q_candle_row[..8],
-        );
-        eprintln!(
-            "k_raw native[0..8]={:?}\nk_pre-rope candle[0..8]={:?}",
-            &cap.k_raw[..8],
-            &k.get(1).unwrap().to_vec1::<f32>().unwrap()[..8]
-        );
-        assert!(
-            diff(&cap.attn_out, &attn_ref) < 1e-3,
-            "layer-0 attention output diverges from the candle reference"
-        );
-    }
-
-    /// Isolate the gemv path: naive sequential dot products over the store's
-    /// q_proj bytes must reproduce the runtime capture exactly.
-    #[test]
-    fn native_q_proj_gemv_matches_naive_reference() {
-        let Some(model_dir) = prepared_model_dir() else {
-            eprintln!("skipping gemv isolation: model not prepared");
-            return;
-        };
-        let config_bytes = std::fs::read(model_dir.join("config.json")).unwrap();
-        let raw: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
-        let cfg = Qwen2Config::from_config_json(&raw).unwrap();
-        let store = Arc::new(MmapWeightStore::open(&model_dir).unwrap());
-        let mut native = Qwen2Native::with_store(cfg.clone(), Arc::clone(&store));
-        let tokens: Vec<u32> = vec![9707, 11];
-        let cap = native.debug_attention_out(&tokens).unwrap();
-
-        let (w_bytes, w_dtype, w_shape) = store
-            .slice("model.layers.0.self_attn.q_proj.weight")
-            .unwrap();
-        let (b_bytes, b_dtype, _) = store.slice("model.layers.0.self_attn.q_proj.bias").unwrap();
-        assert_eq!(w_shape, &[896, 896]);
-        let rows = cfg.q_heads * cfg.head_dim;
-        let mut naive = vec![0f32; rows];
-        for (row, out) in naive.iter_mut().enumerate() {
-            let mut acc = 0f32;
-            for col in 0..cfg.hidden_size {
-                acc += kernels::scalar_at(w_bytes, row * cfg.hidden_size + col, w_dtype)
-                    * cap.normed[col];
-            }
-            *out = acc + kernels::scalar_at(b_bytes, row, b_dtype);
-        }
-        let max_diff = diff_fn(&naive, &cap.q_raw);
-        eprintln!("q_proj naive vs runtime gemv max|diff|={max_diff:.5}");
-        assert!(
-            max_diff < 1e-3,
-            "gemv diverges from naive reference ({max_diff})"
-        );
-    }
-
-    fn diff_fn(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max)
-    }
-}

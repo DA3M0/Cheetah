@@ -1,10 +1,8 @@
-use super::models::ModelRuntime;
+use super::models::{Device, ModelRuntime};
 use crate::ant::{Ant, AntLayerResidency, AntSettings, AntUnit, ant_swap_fit};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
 use crate::options::ChatOptions;
-use candle_core::Device;
-use candle_transformers::models::llama;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rand::SeedableRng;
 use rand::distributions::{Distribution, WeightedIndex};
@@ -17,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
+
+/// Llama-family maximum sequence length default.
+const LLAMA_DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -395,7 +396,8 @@ impl Engine {
             .map(String::as_str)
             .unwrap_or(config.model_type.as_str())
             .to_owned();
-        let registration = super::models::registration_for_architecture(&architecture)?;
+        let template = super::models::chat_template_for_architecture(&architecture)
+            .ok_or_else(|| format!("Unsupported model architecture '{architecture}'."))?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer_bytes = fs::read(&tokenizer_path).map_err(|error| {
@@ -412,7 +414,7 @@ impl Engine {
         })?;
         let (weight_paths, manifest_stop_markers) = resolve_model_files(path)?;
         let vocabulary = tokenizer.get_vocab(true);
-        let use_header_renderer = registration.chat_template.header_renderer.is_some()
+        let use_header_renderer = template.header_renderer.is_some()
             && (manifest_stop_markers
                 .as_ref()
                 .is_some_and(|markers| markers.iter().any(|marker| marker == "<|eot_id|>"))
@@ -420,12 +422,9 @@ impl Engine {
                     && vocabulary.contains_key("<|start_header_id|>")
                     && vocabulary.contains_key("<|eot_id|>"));
         let prompt_renderer = if use_header_renderer {
-            registration
-                .chat_template
-                .header_renderer
-                .unwrap_or(registration.chat_template.render)
+            template.header_renderer.unwrap_or(template.render)
         } else {
-            registration.chat_template.render
+            template.render
         };
         let device_is_accelerator =
             std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into()) != "cpu";
@@ -554,8 +553,7 @@ impl Engine {
             }
         }
         // Ant: prefer the native mmap-backed CPU backend for architectures that
-        // register a native loader — its tiers act on real pages.
-        // Set CHEETAH_NATIVE=0 to fall back to the Candle CPU path.
+        // support it — its tiers act on real pages.
         let native_enabled = std::env::var("CHEETAH_NATIVE")
             .map(|value| value != "0")
             .unwrap_or(true);
@@ -617,8 +615,7 @@ impl Engine {
             }
         }
         let stop_markers = manifest_stop_markers.unwrap_or_else(|| {
-            registration
-                .stop_markers
+            super::models::stop_markers_for_architecture(&architecture)
                 .iter()
                 .map(|marker| (*marker).to_owned())
                 .collect()
@@ -640,7 +637,7 @@ impl Engine {
             prompt_renderer,
             max_position_embeddings: config.max_position_embeddings.min(ctx_size).min(
                 if config.model_type == "llama" {
-                    llama::DEFAULT_MAX_SEQ_LEN
+                    LLAMA_DEFAULT_MAX_SEQ_LEN
                 } else {
                     usize::MAX
                 },
@@ -684,7 +681,7 @@ impl Engine {
     }
 
     /// Ant: push tier transitions into the model's real memory pages when the
-    /// backend owns mmap-backed weights (native CPU backend); candle-backed
+    /// backend owns mmap-backed weights (native CPU backend); host-resident
     /// models report no tier control and only keep the C-side bookkeeping.
     fn ant_apply_real_tier(&self, page_ins: &[(String, i32)], evictions: &[String]) {
         if page_ins.is_empty() && evictions.is_empty() {
@@ -1313,7 +1310,7 @@ fn resolve_model_files(path: &Path) -> Result<(Vec<PathBuf>, Option<Vec<String>>
 /// when the copied config.json is missing, so a prepared model directory
 /// stays loadable on its own (parameters were snapshotted at `cheetah init`).
 /// Family-specific extra fields (hidden_act / sliding_window / ...) required
-/// by the Candle transformers structs are merged from the registration.
+/// by the backend-native inference paths are merged from the family constants.
 fn synth_config_from_manifest(
     model_dir: &Path,
     read_error: &std::io::Error,
@@ -1811,9 +1808,8 @@ mod tests {
 
     #[test]
     fn renders_qwen_chatml_prompt_with_system_message() {
-        let template = super::super::models::registration_for_architecture("qwen2")
-            .unwrap()
-            .chat_template;
+        let template = super::super::models::chat_template_for_architecture("qwen2")
+            .expect("qwen2 chat template");
         let prompt = (template.render)(&[ChatMessage::new("user", "hello")], Some("Be brief."));
         assert!(prompt.starts_with("<|im_start|>system\nBe brief.<|im_end|>\n"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
@@ -1821,9 +1817,8 @@ mod tests {
 
     #[test]
     fn renders_llama_instruction_prompt() {
-        let template = super::super::models::registration_for_architecture("llama")
-            .unwrap()
-            .chat_template;
+        let template = super::super::models::chat_template_for_architecture("llama")
+            .expect("llama chat template");
         let prompt = (template.render)(&[ChatMessage::new("user", "hello")], Some("Be brief."));
         assert!(prompt.contains("<<SYS>>\nBe brief.\n<</SYS>>"));
         assert!(prompt.ends_with("hello [/INST]"));
@@ -1831,9 +1826,8 @@ mod tests {
 
     #[test]
     fn renders_mistral_instruction_prompt() {
-        let template = super::super::models::registration_for_architecture("MistralForCausalLM")
-            .unwrap()
-            .chat_template;
+        let template = super::super::models::chat_template_for_architecture("MistralForCausalLM")
+            .expect("mistral chat template");
         let prompt = (template.render)(
             &[
                 ChatMessage::new("user", "hello"),
@@ -1847,9 +1841,8 @@ mod tests {
 
     #[test]
     fn renders_llama3_header_prompt() {
-        let template = super::super::models::registration_for_architecture("llama")
-            .unwrap()
-            .chat_template;
+        let template = super::super::models::chat_template_for_architecture("llama")
+            .expect("llama chat template");
         let prompt = (template.header_renderer.unwrap())(
             &[ChatMessage::new("user", "hello")],
             Some("Be brief."),

@@ -1,10 +1,9 @@
-mod candle;
 pub(super) mod native;
 mod registry;
 mod templates;
 
-// Model runtime implementations. Their declarative registrations live in
-// src/chat/models/registrations/ and are wired into REGISTRY by build.rs.
+// Model runtime implementations. Backend capability is resolved from the
+// architecture at load time; there is no build-time model registration.
 mod gemma;
 mod llama;
 mod mistral;
@@ -13,10 +12,17 @@ mod phi;
 mod qwen2;
 mod qwen3;
 
-use candle_core::Device;
-use candle_nn::VarBuilder;
 use serde_json::Value;
 use std::path::PathBuf;
+
+/// Backend device descriptor for engine bookkeeping and backend dispatch.
+/// Host-resident backends (the native mmap backend, the Vulkan
+/// executor) run against the CPU device; real accelerator handles live inside
+/// backend executors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Device {
+    Cpu,
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct ChatTemplate {
@@ -29,13 +35,12 @@ pub(super) type PromptRenderer = fn(&[super::ChatMessage], Option<&str>) -> Stri
 
 pub(super) trait ModelRuntime: ModelRuntimeClone + Send {
     /// Run the model over `tokens` starting at absolute position `offset` and
-    /// return the logits of the final position. Backend-agnostic: no Candle
-    /// types cross this boundary.
+    /// return the logits of the final position. Backend-agnostic inference boundary.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String>;
     fn clear_cache(&mut self);
     fn device_name(&self) -> &'static str;
     /// Ant: real tier transitions on backends that own mmap-backed weights
-    /// (the native CPU backend); candle-backed models report None.
+    /// (the native CPU backend); host-resident backends report None.
     fn as_ant_tier_control(&mut self) -> Option<&mut dyn AntTierControl> {
         None
     }
@@ -66,15 +71,11 @@ impl Clone for Box<dyn ModelRuntime> {
     }
 }
 
-/// One inference backend registered for an architecture. Each variant carries
-/// the loader signature natural to that backend; selection happens by backend
-/// name through `ModelRegistration::loader_for`.
+/// One inference backend implementation per architecture. Backend capability
+/// is resolved by architecture name through the runtime backend tables in
+/// `registry`; selection happens by backend name.
 #[derive(Clone, Copy)]
 pub(super) enum BackendLoader {
-    /// Candle: builds tensors from mapped shards through a VarBuilder.
-    Candle(
-        for<'a> fn(&[u8], Value, VarBuilder<'a>, &Device) -> Result<Box<dyn ModelRuntime>, String>,
-    ),
     /// Vulkan compute path: receives the aligned shard paths.
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     Vulkan(
@@ -104,7 +105,6 @@ impl BackendLoader {
     #[cfg(test)]
     pub(super) fn name(&self) -> &'static str {
         match self {
-            BackendLoader::Candle(_) => "candle",
             BackendLoader::Vulkan(_) => "vulkan",
             BackendLoader::Native(_) => "native",
         }
@@ -125,7 +125,7 @@ pub(super) struct ModelFamily {
     /// derived from tensor shapes alone (and hidden size alone can be ambiguous
     /// within a family), so it is declared here.
     pub(super) profiles: &'static [(usize, usize, usize, usize, usize)],
-    /// Family-specific config.json fields the Candle transformers structs
+    /// Family-specific config.json fields
     /// require (e.g. hidden_act / sliding_window), merged into a synthesized
     /// config when the model directory has none. Empty JSON object or "" = none.
     pub(super) extra_config_json: &'static str,
@@ -144,74 +144,12 @@ impl ModelFamily {
     }
 }
 
-pub(super) struct ModelRegistration {
-    pub(super) architectures: &'static [&'static str],
-    pub(super) chat_template: ChatTemplate,
-    pub(super) stop_markers: &'static [&'static str],
-    /// Backends registered for this architecture, each as `(name, loader)`.
-    pub(super) backends: &'static [(&'static str, BackendLoader)],
-    /// Family constants for backends that need fallback parameters.
-    pub(super) family: Option<ModelFamily>,
-    pub(super) shaders: &'static [&'static str],
-}
-
-impl ModelRegistration {
-    /// The registered loader for one backend name (e.g. "candle", "vulkan",
-    /// "native"); None when the architecture does not register that backend.
-    pub(super) fn loader_for(&self, backend: &str) -> Option<BackendLoader> {
-        self.backends
-            .iter()
-            .find(|(name, _)| *name == backend)
-            .map(|(_, loader)| *loader)
-    }
-
-    /// Registered backend names, in declaration order.
-    pub(super) fn backend_names(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.backends.iter().map(|(name, _)| *name)
-    }
-}
-
 pub(crate) struct ShaderRegistration {
     name: &'static str,
     path: Option<&'static str>,
 }
 
-include!(concat!(env!("OUT_DIR"), "/model_registry.rs"));
 include!(concat!(env!("OUT_DIR"), "/shader_registry.rs"));
-
-pub(crate) fn registration_for_architecture(
-    architecture: &str,
-) -> Result<&'static ModelRegistration, String> {
-    REGISTRY
-        .iter()
-        .copied()
-        .find(|registration| registration.architectures.contains(&architecture))
-        .ok_or_else(|| format!("Unsupported model architecture '{architecture}'."))
-}
-
-/// The loader registered for one architecture/backend pair, if any.
-pub(crate) fn backend_loader_for_architecture(
-    architecture: &str,
-    backend: &str,
-) -> Option<BackendLoader> {
-    registration_for_architecture(architecture)
-        .ok()
-        .and_then(|registration| registration.loader_for(backend))
-}
-
-/// Backend names registered for an architecture (e.g. `["candle", "native"]`).
-pub(crate) fn registered_backend_names(architecture: &str) -> Vec<&'static str> {
-    registration_for_architecture(architecture)
-        .map(|registration| registration.backend_names().collect())
-        .unwrap_or_default()
-}
-
-/// Family constants registered for an architecture, if any.
-pub(crate) fn family_for_architecture(architecture: &str) -> Option<ModelFamily> {
-    registration_for_architecture(architecture)
-        .ok()
-        .and_then(|registration| registration.family)
-}
 
 pub(crate) fn shader_path(name: &str) -> Option<&'static str> {
     SHADERS
@@ -224,4 +162,59 @@ pub(super) fn shader_is_registered(name: &str) -> bool {
     shader_path(name).is_some() || SHADERS.iter().any(|shader| shader.name == name)
 }
 
-pub(super) use registry::{backend_device, load_model, load_model_for_device};
+/// Chat prompt renderer resolved from the architecture name (init-time
+/// metadata keys prompt families by architecture).
+pub(crate) fn chat_template_for_architecture(architecture: &str) -> Option<ChatTemplate> {
+    let template = match architecture {
+        "llama" | "LlamaForCausalLM" => ChatTemplate {
+            id: "llama",
+            render: templates::llama2,
+            header_renderer: Some(templates::llama3),
+        },
+        "qwen2" | "Qwen2ForCausalLM" | "qwen3" | "Qwen3ForCausalLM" => ChatTemplate {
+            id: "qwen",
+            render: templates::qwen,
+            header_renderer: None,
+        },
+        "gemma" | "GemmaForCausalLM" => ChatTemplate {
+            id: "gemma",
+            render: templates::gemma,
+            header_renderer: None,
+        },
+        "mistral" | "MistralForCausalLM" => ChatTemplate {
+            id: "mistral",
+            render: templates::mistral,
+            header_renderer: None,
+        },
+        "mixtral" | "MixtralForCausalLM" => ChatTemplate {
+            id: "mixtral",
+            render: templates::mixtral,
+            header_renderer: None,
+        },
+        "phi" | "PhiForCausalLM" => ChatTemplate {
+            id: "phi",
+            render: templates::phi,
+            header_renderer: None,
+        },
+        _ => return None,
+    };
+    Some(template)
+}
+
+/// Stop marker token names resolved from the architecture name.
+pub(crate) fn stop_markers_for_architecture(architecture: &str) -> &'static [&'static str] {
+    match architecture {
+        "llama" | "LlamaForCausalLM" => &["<|eot_id|>", "</s>"],
+        "qwen2" | "Qwen2ForCausalLM" | "qwen3" | "Qwen3ForCausalLM" => &["<|im_end|>"],
+        "gemma" | "GemmaForCausalLM" => &["<end_of_turn>"],
+        "mistral" | "MistralForCausalLM" => &["</s>"],
+        "mixtral" | "MixtralForCausalLM" => &["</s>"],
+        "phi" | "PhiForCausalLM" => &["</s>"],
+        _ => &[],
+    }
+}
+
+pub(crate) use registry::{
+    backend_device, backend_loader_for_architecture, family_for_architecture, load_model,
+    load_model_for_device, registered_backends as registered_backend_names,
+};

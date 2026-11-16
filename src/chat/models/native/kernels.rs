@@ -233,7 +233,7 @@ pub fn rmsnorm(x: &mut [f32], weight: &[u8], dtype: super::store::WeightDType, e
     }
 }
 
-/// Rotary embedding (GPT-NeoX rotate-half style, matching candle's rope):
+/// Rotary embedding (GPT-NeoX rotate-half style):
 /// for each head of dim d, split [x1 | x2] and pair angle i with both halves.
 pub fn rope_in_place(
     values: &mut [f32],
@@ -361,10 +361,10 @@ mod tests {
         assert!((scores[0] - shifted[0]).abs() < 1e-5);
     }
 
-    /// Replicate candle's qwen2 rope (duplicate-frequency rotate-half) with
+    /// Replicate the qwen2 rope (duplicate-frequency rotate-half) with
     /// plain tensor math and compare against the native kernel at positions > 0.
     #[test]
-    fn rope_matches_candle_rotate_half_at_positive_positions() {
+    fn rope_matches_reference_rotate_half() {
         let head_dim = 64usize;
         let theta = 1_000_000.0f32;
         let half = head_dim / 2;
@@ -375,7 +375,7 @@ mod tests {
         for position in 1..=8usize {
             let mut native = input.clone();
             rope_in_place(&mut native, 1, head_dim, position, theta);
-            // Candle reference: inv_freq[i] = 1 / theta^(2i/dim) for i in 0..half;
+            // Expected: inv_freq[i] = 1 / theta^(2i/dim) for i in 0..half;
             // cos/sin rows duplicate each frequency across both halves.
             let mut expected = vec![0f32; head_dim];
             for i in 0..half {

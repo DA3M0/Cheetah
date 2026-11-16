@@ -2264,7 +2264,7 @@ mod q8_tests {
         }
         // SAFETY: test-scoped process env mutation; single-threaded test.
         unsafe { std::env::set_var("CHEETAH_QUANT_Q8", "1") };
-        // Synthetic decoder generator lives in the native test module; rebuild
+        // Native forward tests live in the native module; rebuild
         // the tiny model here via the same helper through the native tests is
         // not reachable, so prepare a minimal directory directly.
         let base = std::env::temp_dir().join(format!(

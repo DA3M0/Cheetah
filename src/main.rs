@@ -1,4 +1,4 @@
-//! Cheetah's Candle/Safetensors command-line interface.
+//! Cheetah's local model command-line interface.
 
 mod ant;
 mod chat;
@@ -357,7 +357,7 @@ fn print_formats() {
     println!(
         "{}",
         color::stdout(
-            "Supported model formats:\n  .safetensors   Candle inference and model inspection\n  model directory  config.json, tokenizer.json, and Safetensors weights",
+            "Supported model formats:\n  .safetensors   Local inference and model inspection\n  model directory  config.json, tokenizer.json, and Safetensors weights",
             color::Color::Cyan
         )
     );
@@ -367,7 +367,7 @@ fn print_help() {
     println!(
         "{}",
         color::stdout(
-            "cheetah - Local Candle/Safetensors inference and gateway\n\
+            "cheetah - Local Safetensors inference and gateway\n\
 \n\
 Usage:\n\
   cheetah                                  Load the model in the current directory and chat\n\

@@ -1,13 +1,12 @@
-use super::{ModelRegistration, ModelRuntime, candle};
+use super::{BackendLoader, Device, ModelFamily, ModelRuntime};
 use crate::color::{self, Color};
-use candle_core::Device;
 use serde_json::Value;
 use std::path::PathBuf;
 
-type DeviceFactory = fn() -> Result<Device, String>;
-
 enum Backend {
-    Candle(DeviceFactory),
+    /// Native mmap + Ant tiering backend (host-resident weights, page tiers).
+    Native,
+    /// Vulkan compute path.
     Vulkan,
 }
 
@@ -19,15 +18,7 @@ struct BackendRegistration {
 const BACKENDS: &[BackendRegistration] = &[
     BackendRegistration {
         name: "cpu",
-        backend: Backend::Candle(cpu_device),
-    },
-    BackendRegistration {
-        name: "cuda",
-        backend: Backend::Candle(cuda_device),
-    },
-    BackendRegistration {
-        name: "metal",
-        backend: Backend::Candle(metal_device),
+        backend: Backend::Native,
     },
     BackendRegistration {
         name: "vulkan",
@@ -35,71 +26,186 @@ const BACKENDS: &[BackendRegistration] = &[
     },
 ];
 
-pub(in crate::chat) fn load_model(
+/// Architectures served by the native mmap + Ant tiering backend (llama /
+/// mixtral / qwen2 / qwen3 shapes; mixtral carries the mixture-of-experts
+/// feed-forward).
+pub(super) fn native_backends() -> &'static [&'static str] {
+    &["llama", "mixtral", "qwen2", "qwen3"]
+}
+
+/// Architectures served by the Vulkan compute path; families without a native
+/// implementation (gemma / mistral / mixtral / phi) are Vulkan-only.
+pub(super) fn vulkan_backends() -> &'static [&'static str] {
+    &[
+        "GemmaForCausalLM",
+        "gemma",
+        "MistralForCausalLM",
+        "mistral",
+        "MixtralForCausalLM",
+        "mixtral",
+        "PhiForCausalLM",
+        "phi",
+    ]
+}
+
+fn architecture_has_backend(architecture: &str, backend: &str) -> bool {
+    let normalized = normalize_architecture(architecture);
+    let names = if backend.eq_ignore_ascii_case("native") {
+        native_backends()
+    } else {
+        vulkan_backends()
+    };
+    names
+        .iter()
+        .any(|name| normalize_architecture(name) == normalized)
+}
+
+/// Lowercase and strip the `ForCausalLM` suffix so `Qwen2ForCausalLM` and
+/// `qwen2` resolve to the same architecture identity.
+fn normalize_architecture(architecture: &str) -> String {
+    let mut normalized = architecture.to_lowercase();
+    if let Some(stripped) = normalized.strip_suffix("forcausallm") {
+        normalized = stripped.to_string();
+    }
+    normalized
+}
+
+/// Backend names registered for an architecture: llama / mixtral / qwen2 /
+/// qwen3 serve `["native", "vulkan"]`; gemma / mistral / phi serve `["vulkan"]`.
+pub(crate) fn registered_backends(architecture: &str) -> Vec<&'static str> {
+    if architecture_has_backend(architecture, "native") {
+        return vec!["native", "vulkan"];
+    }
+    if architecture_has_backend(architecture, "vulkan") {
+        return vec!["vulkan"];
+    }
+    Vec::new()
+}
+
+pub(crate) fn backend_loader_for_architecture(
+    architecture: &str,
+    backend: &str,
+) -> Option<BackendLoader> {
+    if backend.eq_ignore_ascii_case("native") && architecture_has_backend(architecture, "native") {
+        return Some(BackendLoader::Native(super::native::native_family_loader));
+    }
+    None
+}
+
+/// Family constants for a native backend family (llama / mixtral / qwen2 /
+/// qwen3).
+pub(crate) fn family_for_architecture(architecture: &str) -> Option<ModelFamily> {
+    match architecture {
+        "llama" | "LlamaForCausalLM" => Some(llama_family()),
+        "mixtral" | "MixtralForCausalLM" => Some(mixtral_family()),
+        "qwen2" | "Qwen2ForCausalLM" => Some(qwen2_family()),
+        "qwen3" | "Qwen3ForCausalLM" => Some(qwen3_family()),
+        _ => None,
+    }
+}
+
+fn mixtral_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 8_000.0,
+        rms_norm_eps: 1e-5,
+        tie_word_embeddings: false,
+        profiles: &[
+            (4096, 32768, 32, 8, 128), // Mixtral-8x7B (GQA: 32 q heads / 8 kv heads)
+        ],
+        extra_config_json: "",
+    }
+}
+
+fn llama_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 10_000.0,
+        rms_norm_eps: 1e-5,
+        tie_word_embeddings: false,
+        profiles: &[
+            (2048, 128256, 32, 8, 64),  // Llama-3.2-1B (tied)
+            (3072, 128256, 24, 8, 128), // Llama-3.2-3B (tied)
+            (4096, 128256, 32, 8, 128), // Llama-3-8B / 3.1-8B
+            (4096, 32000, 32, 32, 128), // Llama-2-7B (MHA)
+        ],
+        extra_config_json: "",
+    }
+}
+
+fn qwen2_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 1_000_000.0,
+        rms_norm_eps: 1e-6,
+        tie_word_embeddings: true,
+        profiles: &[
+            (896, 151936, 14, 2, 64),   // Qwen2-0.5B
+            (1536, 151936, 12, 2, 128), // Qwen2-1.5B
+            (3584, 152064, 28, 4, 128), // Qwen2-7B
+        ],
+        extra_config_json:
+            "{\"hidden_act\":\"silu\",\"sliding_window\":4096,\"use_sliding_window\":false,\"max_window_layers\":21}",
+    }
+}
+
+fn qwen3_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 1_000_000.0,
+        rms_norm_eps: 1e-6,
+        tie_word_embeddings: true,
+        profiles: &[(8192, 32768, 64, 8, 128)],
+        extra_config_json: "",
+    }
+}
+
+pub(crate) fn load_model(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
     raw_config: Value,
     architecture: &str,
     plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
-    let model_registration = super::registration_for_architecture(architecture)?;
     let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
     let selected_lower = selected.to_lowercase();
     let registration = BACKENDS
         .iter()
         .find(|registration| registration.name == selected_lower)
         .ok_or_else(|| {
-            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, metal, or vulkan.")
+            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu or vulkan.")
         })?;
 
     match registration.backend {
-        Backend::Candle(create_device) => {
-            let device = create_device()?;
-            if matches!(device, Device::Cpu) {
-                return Err(retired_cpu_candle_message(architecture));
-            }
-            let model = candle::load_model(
-                weight_paths,
-                config_bytes,
-                raw_config,
-                model_registration,
-                &device,
-            )?;
-            Ok((device, model))
-        }
+        Backend::Native => Err(no_native_backend_message(architecture)),
         Backend::Vulkan => load_vulkan_or_fallback(
             weight_paths,
             config_bytes,
             raw_config,
             architecture,
-            model_registration,
             plan,
         ),
     }
 }
 
-/// The Candle CPU path is retired: CPU inference runs on the native mmap
-/// backend; Candle remains the CUDA/Metal device option.
-fn retired_cpu_candle_message(architecture: &str) -> String {
+/// Guidance error: the architecture has no native backend available in this
+/// build, and no CPU backend is registered for it.
+fn no_native_backend_message(architecture: &str) -> String {
     format!(
-        "Architecture '{architecture}' has no native CPU backend registered, and the Candle CPU path is retired. Use CHEETAH_DEVICE=cuda or metal for Candle inference, or run a model family with a registered native backend."
+        "Architecture '{architecture}' has no native CPU backend available. Use CHEETAH_DEVICE=vulkan, or run a model family with a registered native backend."
     )
 }
 
-pub(in crate::chat) fn backend_device(selected: &str) -> Result<Device, String> {
+pub(crate) fn backend_device(selected: &str) -> Result<Device, String> {
     let registration = BACKENDS
         .iter()
         .find(|registration| registration.name == selected.to_lowercase().as_str())
         .ok_or_else(|| {
-            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu, cuda, metal, or vulkan.")
+            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu or vulkan.")
         })?;
     match &registration.backend {
-        Backend::Candle(create_device) => create_device(),
+        Backend::Native => Ok(Device::Cpu),
         Backend::Vulkan => Ok(Device::Cpu),
     }
 }
 
-pub(in crate::chat) fn load_model_for_device(
+pub(crate) fn load_model_for_device(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
     raw_config: Value,
@@ -111,28 +217,10 @@ pub(in crate::chat) fn load_model_for_device(
         .unwrap_or_else(|_| "cpu".into())
         .eq_ignore_ascii_case("vulkan")
     {
-        let model_registration = super::registration_for_architecture(architecture)?;
-        return load_vulkan_or_fallback(
-            weight_paths,
-            config_bytes,
-            raw_config,
-            architecture,
-            model_registration,
-            plan,
-        );
+        return load_vulkan_or_fallback(weight_paths, config_bytes, raw_config, architecture, plan);
     }
-    let model_registration = super::registration_for_architecture(architecture)?;
-    if matches!(device, Device::Cpu) {
-        return Err(retired_cpu_candle_message(architecture));
-    }
-    let model = candle::load_model(
-        weight_paths,
-        config_bytes,
-        raw_config,
-        model_registration,
-        &device,
-    )?;
-    Ok((device, model))
+    let _ = device;
+    Err(no_native_backend_message(architecture))
 }
 
 #[cfg_attr(not(feature = "vulkan"), allow(unused_variables, unused_mut))]
@@ -140,58 +228,58 @@ fn load_vulkan_or_fallback(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
     raw_config: Value,
-    _architecture: &str,
-    model_registration: &'static ModelRegistration,
+    architecture: &str,
     plan: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Device, Box<dyn ModelRuntime>), String> {
     #[cfg(feature = "vulkan")]
-    match model_registration.loader_for("vulkan") {
-        Some(super::BackendLoader::Vulkan(loader)) => {
-            if model_registration
-                .shaders
-                .iter()
-                .any(|shader| !super::shader_is_registered(shader))
-            {
-                eprintln!(
-                    "{}",
-                    color::stderr(
-                        &format!(
-                            "cheetah: Vulkan model '{}' references an unregistered shader.",
-                            model_registration.chat_template.id
-                        ),
-                        Color::Yellow
-                    )
-                );
-            } else {
-                let vulkan_model =
-                    (|| loader(weight_paths, config_bytes, raw_config.clone(), plan))();
-                match vulkan_model {
-                    Ok(executor) => return Ok((Device::Cpu, executor)),
-                    Err(error) => {
-                        eprintln!(
-                            "{}",
-                            color::stderr(
-                                &format!(
-                                    "cheetah: Vulkan model '{}' unavailable ({error}).",
-                                    model_registration.chat_template.id
-                                ),
-                                Color::Yellow
-                            )
-                        );
-                    }
-                }
-            }
-        }
-        _ => {
+    {
+        if !architecture_has_backend(architecture, "vulkan") {
             eprintln!(
                 "{}",
                 color::stderr(
                     &format!(
-                        "cheetah: Vulkan inference is not registered for architecture '{_architecture}'; falling back to CPU."
+                        "cheetah: Vulkan inference is not registered for architecture '{architecture}'; falling back to CPU."
                     ),
                     Color::Yellow
                 )
             );
+            return Err(no_native_backend_message(architecture));
+        }
+        if !super::shader_is_registered("shared_ops") {
+            eprintln!(
+                "{}",
+                color::stderr(
+                    &format!("cheetah: Vulkan model references an unregistered shader."),
+                    Color::Yellow
+                )
+            );
+        }
+        let vulkan_model = (|| {
+            match architecture {
+                "llama" | "LlamaForCausalLM" => {
+                    super::llama::load_vulkan(weight_paths, config_bytes, raw_config.clone(), plan)
+                }
+                "qwen2" | "Qwen2ForCausalLM" => {
+                    super::qwen2::load_vulkan(weight_paths, config_bytes, raw_config.clone(), plan)
+                }
+                "qwen3" | "Qwen3ForCausalLM" => {
+                    super::qwen3::load_vulkan(weight_paths, config_bytes, raw_config.clone(), plan)
+                }
+                _ => Err(format!("Unsupported Vulkan architecture '{architecture}'.")),
+            }
+        })();
+        match vulkan_model {
+            Ok(executor) => Ok((Device::Cpu, executor)),
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    color::stderr(
+                        &format!("cheetah: Vulkan model unavailable ({error})."),
+                        Color::Yellow
+                    )
+                );
+                Err(no_native_backend_message(architecture))
+            }
         }
     }
     #[cfg(not(feature = "vulkan"))]
@@ -199,39 +287,15 @@ fn load_vulkan_or_fallback(
         eprintln!(
             "{}",
             color::stderr(
-                "cheetah: Vulkan support was not compiled. Rebuild with --features vulkan, or use CHEETAH_DEVICE=cuda/metal.",
+                &format!(
+                    "cheetah: Vulkan support was not compiled. Rebuild with --features vulkan, or use CHEETAH_DEVICE=cpu."
+                ),
                 Color::Yellow
             )
         );
     }
 
-    Err(retired_cpu_candle_message(_architecture))
-}
-
-fn cpu_device() -> Result<Device, String> {
-    Ok(Device::Cpu)
-}
-
-fn cuda_device() -> Result<Device, String> {
-    #[cfg(feature = "cuda")]
-    {
-        Device::new_cuda(0).map_err(|error| format!("Failed to initialize CUDA device: {error}"))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        Err("CUDA support was not compiled; rebuild with --features cuda.".into())
-    }
-}
-
-fn metal_device() -> Result<Device, String> {
-    #[cfg(feature = "metal")]
-    {
-        Device::new_metal(0).map_err(|error| format!("Failed to initialize Metal device: {error}"))
-    }
-    #[cfg(not(feature = "metal"))]
-    {
-        Err("Metal support was not compiled; rebuild with --features metal.".into())
-    }
+    Err(no_native_backend_message(architecture))
 }
 
 #[cfg(test)]
@@ -239,14 +303,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registers_candle_and_vulkan_backends() {
+    fn registers_cpu_and_vulkan_backends() {
         let names: Vec<_> = BACKENDS.iter().map(|backend| backend.name).collect();
-        assert_eq!(names, ["cpu", "cuda", "metal", "vulkan"]);
+        assert_eq!(names, ["cpu", "vulkan"]);
     }
 
     #[test]
     fn backend_device_rejects_unknown_backend() {
         assert!(backend_device("does_not_exist").is_err());
         assert!(backend_device("cpu").is_ok());
+        assert!(backend_device("vulkan").is_ok());
+    }
+
+    #[test]
+    fn native_backend_serves_llama_and_qwen_families() {
+        assert!(backend_loader_for_architecture("llama", "native").is_some());
+        assert!(backend_loader_for_architecture("Qwen2ForCausalLM", "native").is_some());
+        assert!(backend_loader_for_architecture("qwen3", "native").is_some());
+        assert!(backend_loader_for_architecture("gemma", "native").is_none());
+        assert!(backend_loader_for_architecture("gemma", "vulkan").is_none());
+    }
+
+    #[test]
+    fn native_backend_serves_mixtral_moe_family() {
+        assert!(backend_loader_for_architecture("mixtral", "native").is_some());
+        assert!(backend_loader_for_architecture("MixtralForCausalLM", "native").is_some());
+        assert!(backend_loader_for_architecture("gemma", "native").is_none());
+        assert!(backend_loader_for_architecture("gemma", "vulkan").is_none());
+    }
+
+    #[test]
+    fn mixtral_architectures_resolve_native_and_vulkan_backends() {
+        assert_eq!(registered_backends("mixtral"), vec!["native", "vulkan"]);
+        assert_eq!(registered_backends("MixtralForCausalLM"), vec!["native", "vulkan"]);
     }
 }
