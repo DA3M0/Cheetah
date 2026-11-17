@@ -233,6 +233,40 @@ pub fn rmsnorm(x: &mut [f32], weight: &[u8], dtype: super::store::WeightDType, e
     }
 }
 
+/// gemma-flavored RMSNorm: the affine weight is stored as `weight` but applied
+/// as `(1 + weight)` — `x / sqrt(mean(x²) + eps) · (1 + weight)`.
+pub fn rmsnorm_offset(x: &mut [f32], weight: &[u8], dtype: super::store::WeightDType, eps: f32) {
+    let mean_square = x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (mean_square + eps).sqrt();
+    for (value, index) in x.iter_mut().zip(0..) {
+        *value *= inv * (1.0 + scalar_at(weight, index, dtype));
+    }
+}
+
+/// LayerNorm with affine parameters (phi): `(x - mean) / sqrt(var + eps)`
+/// scaled by the weight and shifted by the bias, both stored-dtype reads. An
+/// empty bias slice skips the shift.
+pub fn layernorm(
+    x: &mut [f32],
+    weight: &[u8],
+    weight_dtype: super::store::WeightDType,
+    bias: &[u8],
+    bias_dtype: super::store::WeightDType,
+    eps: f32,
+) {
+    let mean = x.iter().sum::<f32>() / x.len() as f32;
+    let variance =
+        x.iter().map(|value| (value - mean) * (value - mean)).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (variance + eps).sqrt();
+    for (value, index) in x.iter_mut().zip(0..) {
+        let mut normalized = (*value - mean) * inv * scalar_at(weight, index, weight_dtype);
+        if !bias.is_empty() {
+            normalized += scalar_at(bias, index, bias_dtype);
+        }
+        *value = normalized;
+    }
+}
+
 /// Rotary embedding (GPT-NeoX rotate-half style):
 /// for each head of dim d, split [x1 | x2] and pair angle i with both halves.
 pub fn rope_in_place(
@@ -263,6 +297,26 @@ pub fn rope_in_place(
 pub fn silu_multiply(gate: &mut [f32], up: &[f32]) {
     for (g, &u) in gate.iter_mut().zip(up.iter()) {
         *g *= u / (1.0 + (-*g).exp());
+    }
+}
+
+/// GELU with the tanh approximation (`gelu_new` / `gelu_pytorch_tanh`),
+/// written in place:
+/// `0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 x³)))`.
+pub fn gelu(values: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    for value in values.iter_mut() {
+        let x = *value;
+        let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
+        *value = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
+/// GeGLU activation (gemma): gelu(gate) ⊙ up, written into `gate`.
+pub fn gelu_multiply(gate: &mut [f32], up: &[f32]) {
+    gelu(gate);
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        *g *= u;
     }
 }
 

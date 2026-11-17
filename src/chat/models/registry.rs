@@ -26,11 +26,13 @@ const BACKENDS: &[BackendRegistration] = &[
     },
 ];
 
-/// Architectures served by the native mmap + Ant tiering backend (llama /
-/// mixtral / qwen2 / qwen3 shapes; mixtral carries the mixture-of-experts
-/// feed-forward).
+/// Architectures served by the native mmap + Ant tiering backend. The dense
+/// set spans the llama-shaped families (llama / mixtral / qwen2 / qwen3;
+/// mixtral carries the mixture-of-experts feed-forward) and the delta
+/// families mistral (sliding window), gemma (offset norms + embedding scale +
+/// GeGLU) and phi (LayerNorm + parallel residual + fused projections).
 pub(super) fn native_backends() -> &'static [&'static str] {
-    &["llama", "mixtral", "qwen2", "qwen3"]
+    &["llama", "mixtral", "qwen2", "qwen3", "mistral", "gemma", "phi"]
 }
 
 /// Architectures served by the Vulkan compute path: every family with a Vulkan
@@ -78,8 +80,9 @@ fn normalize_architecture(architecture: &str) -> String {
     normalized
 }
 
-/// Backend names registered for an architecture: llama / mixtral / qwen2 /
-/// qwen3 serve `["native", "vulkan"]`; gemma / mistral / phi serve `["vulkan"]`.
+/// Backend names registered for an architecture: every native family (llama /
+/// mixtral / qwen2 / qwen3 / mistral / gemma / phi) serves
+/// `["native", "vulkan"]`.
 pub(crate) fn registered_backends(architecture: &str) -> Vec<&'static str> {
     if architecture_has_backend(architecture, "native") {
         return vec!["native", "vulkan"];
@@ -100,14 +103,18 @@ pub(crate) fn backend_loader_for_architecture(
     None
 }
 
-/// Family constants for a native backend family (llama / mixtral / qwen2 /
-/// qwen3).
+/// Family constants for a native backend family: the llama-shaped set (llama /
+/// mixtral / qwen2 / qwen3) plus the dense delta families mistral / gemma /
+/// phi.
 pub(crate) fn family_for_architecture(architecture: &str) -> Option<ModelFamily> {
     match architecture {
         "llama" | "LlamaForCausalLM" => Some(llama_family()),
         "mixtral" | "MixtralForCausalLM" => Some(mixtral_family()),
         "qwen2" | "Qwen2ForCausalLM" => Some(qwen2_family()),
         "qwen3" | "Qwen3ForCausalLM" => Some(qwen3_family()),
+        "mistral" | "MistralForCausalLM" => Some(mistral_family()),
+        "gemma" | "GemmaForCausalLM" => Some(gemma_family()),
+        "phi" | "PhiForCausalLM" => Some(phi_family()),
         _ => None,
     }
 }
@@ -123,6 +130,7 @@ fn mixtral_family() -> ModelFamily {
         extra_config_json: "",
         max_position_embeddings: None,
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::DenseFeatures::default(),
     }
 }
 
@@ -140,6 +148,7 @@ fn llama_family() -> ModelFamily {
         extra_config_json: "",
         max_position_embeddings: Some(4096),
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::DenseFeatures::default(),
     }
 }
 
@@ -157,6 +166,7 @@ fn qwen2_family() -> ModelFamily {
             "{\"hidden_act\":\"silu\",\"sliding_window\":4096,\"use_sliding_window\":false,\"max_window_layers\":21}",
         max_position_embeddings: None,
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::DenseFeatures::default(),
     }
 }
 
@@ -171,6 +181,64 @@ fn qwen3_family() -> ModelFamily {
         extra_config_json: "{\"hidden_act\":\"silu\"}",
         max_position_embeddings: None,
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::DenseFeatures::default(),
+    }
+}
+
+fn mistral_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 10_000.0,
+        rms_norm_eps: 1e-5,
+        tie_word_embeddings: false,
+        profiles: &[
+            (4096, 32000, 32, 8, 128), // Mistral-7B / 7B-Instruct-v0.2 (GQA)
+            (4096, 32768, 32, 8, 128), // Mistral-7B-v0.3 (extended vocab)
+        ],
+        // The HF Mistral modeling applies `sliding_window` during decoding
+        // (a query attends to the last `sliding_window` keys), which the
+        // native decoder implements as the uniform window.
+        extra_config_json: "{\"hidden_act\":\"silu\",\"sliding_window\":4096}",
+        max_position_embeddings: Some(32768),
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::DenseFeatures::default(),
+    }
+}
+
+fn gemma_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 10_000.0,
+        rms_norm_eps: 1e-6,
+        tie_word_embeddings: true,
+        profiles: &[
+            (2048, 256128, 8, 1, 256),  // gemma-2b / 2b-it
+            (2048, 256000, 8, 1, 256),  // gemma-2b mirrors with padded-down vocab
+            (3072, 256000, 16, 1, 256), // gemma-7b / 7b-it
+            (3072, 256128, 16, 1, 256), // gemma-1.1-7b
+        ],
+        // gemma-1 applies full attention on every layer (the config's
+        // `sliding_window` is not enforced by the HF Gemma modeling), so no
+        // window is declared here.
+        extra_config_json: "{\"hidden_act\":\"gelu_pytorch_tanh\"}",
+        max_position_embeddings: Some(8192),
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::GEMMA_FEATURES,
+    }
+}
+
+fn phi_family() -> ModelFamily {
+    super::ModelFamily {
+        rope_theta: 10_000.0,
+        rms_norm_eps: 1e-5,
+        tie_word_embeddings: false,
+        profiles: &[
+            (2048, 50257, 32, 32, 64),  // phi-1.5 (head_dim 2048/32)
+            (2048, 51200, 32, 32, 64),  // phi-1.5 padded vocab
+            (2560, 51200, 32, 32, 80),  // phi-2 (head_dim 2560/32)
+        ],
+        extra_config_json: "{\"hidden_act\":\"gelu_new\"}",
+        max_position_embeddings: Some(2048),
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
+        features: super::native::decoder::PHI_FEATURES,
     }
 }
 
@@ -343,7 +411,6 @@ mod tests {
         assert!(backend_loader_for_architecture("llama", "native").is_some());
         assert!(backend_loader_for_architecture("Qwen2ForCausalLM", "native").is_some());
         assert!(backend_loader_for_architecture("qwen3", "native").is_some());
-        assert!(backend_loader_for_architecture("gemma", "native").is_none());
         assert!(backend_loader_for_architecture("gemma", "vulkan").is_none());
     }
 
@@ -351,14 +418,22 @@ mod tests {
     fn native_backend_serves_mixtral_moe_family() {
         assert!(backend_loader_for_architecture("mixtral", "native").is_some());
         assert!(backend_loader_for_architecture("MixtralForCausalLM", "native").is_some());
-        assert!(backend_loader_for_architecture("gemma", "native").is_none());
         assert!(backend_loader_for_architecture("gemma", "vulkan").is_none());
     }
 
+    /// Dense coverage: the mistral / gemma / phi delta families resolve the
+    /// native backend (and, with it, the combined native+vulkan table).
     #[test]
-    fn mixtral_architectures_resolve_native_and_vulkan_backends() {
-        assert_eq!(registered_backends("mixtral"), vec!["native", "vulkan"]);
-        assert_eq!(registered_backends("MixtralForCausalLM"), vec!["native", "vulkan"]);
+    fn native_backend_serves_dense_delta_families() {
+        for architecture in ["mistral", "MistralForCausalLM", "gemma", "GemmaForCausalLM", "phi", "PhiForCausalLM"] {
+            assert!(
+                backend_loader_for_architecture(architecture, "native").is_some(),
+                "{architecture} must resolve the native backend"
+            );
+            assert_eq!(registered_backends(architecture), vec!["native", "vulkan"]);
+            assert!(family_for_architecture(architecture).is_some());
+        }
+        assert!(backend_loader_for_architecture("llama", "native").is_some());
     }
 
     /// The Vulkan capability table and the loader table must agree in both

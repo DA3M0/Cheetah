@@ -11,9 +11,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Registry-facing loader for the native decoder-family CPU backend (llama /
-/// mixtral / qwen2 / qwen3 shape: GQA attention, rotate-half rope, silu MLP; attention biases
-/// and tied embeddings are per-family). The backend capability tables expose
+/// Registry-facing loader for the native decoder-family CPU backend. The
+/// llama-shaped baseline (llama / mixtral / qwen2 / qwen3: GQA attention,
+/// rotate-half rope, silu MLP) plus the dense delta families mistral (sliding
+/// window), gemma (offset norms + embedding scale + GeGLU) and phi
+/// (LayerNorm + parallel residual + fused projections); attention biases and
+/// tied embeddings are per-family. The backend capability tables expose
 /// this as the native backend loader, so selecting the native backend goes
 /// through the same backend dispatch as the Vulkan loader.
 pub(super) fn native_family_loader(

@@ -128,6 +128,10 @@ pub(super) struct ModelFamily {
     /// defaults). Drives router + expert weight slicing so the native forward
     /// never hardcodes one architecture's naming.
     pub(super) moe_layout: native::decoder::MoEExpertLayout,
+    /// Dense-architecture deltas over the llama-shaped baseline (norm kind,
+    /// activation, projection naming, residual topology, partial rope) for the
+    /// native forward pass.
+    pub(super) features: native::decoder::DenseFeatures,
 }
 
 impl ModelFamily {
