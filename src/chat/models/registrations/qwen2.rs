@@ -30,7 +30,7 @@ const fn model_backends() -> &'static [(&'static str, BackendLoader)] {
     {
         &[
             ("native", BackendLoader::Native(super::native::native_family_loader)),
-            ("vulkan", BackendLoader::Vulkan(super::qwen2::load_vulkan)),
+            ("vulkan", BackendLoader::Vulkan(super::vulkan_executors::load)),
         ]
     }
     #[cfg(not(feature = "vulkan"))]

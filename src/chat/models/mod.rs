@@ -6,14 +6,9 @@ mod templates;
 // family's capability (architectures, chat template, stop markers, backends,
 // family constants); build.rs collects them into the generated `REGISTRY`
 // below, and the runtime lookups derive from it — adding a family is adding
-// a registration file, no table edits.
-mod gemma;
-mod llama;
-mod mistral;
-mod mixtral;
-mod phi;
-mod qwen2;
-mod qwen3;
+// a registration file, no table edits. The Vulkan side is one generic
+// loader: executor features derive from the model's own `model_type`.
+mod vulkan_executors;
 
 use serde_json::Value;
 use std::path::PathBuf;
