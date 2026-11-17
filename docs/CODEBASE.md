@@ -33,10 +33,7 @@ cheetah/
 │   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + ModelRegistration + REGISTRY include
 │   │       ├── registrations/  ★ declarative capability per family (build.rs → generated REGISTRY)
 │   │       ├── registry.rs     derived lookups (loader/family/backends) + device dispatch
-│   │       ├── qwen2.rs        family runtime wiring (native runner + Vulkan executor loader)
-│   │       ├── llama.rs        family runtime wiring
-│   │       ├── gemma/mistral/mixtral/phi.rs   family runtime wiring
-│   │       ├── qwen3.rs        family runtime wiring
+│   │       ├── vulkan_executors.rs  one generic Vulkan loader; features derive from config model_type
 │   │       ├── templates.rs    chat template renderers
 │   │       └── native/         ★ the native mmap backend
 │   │           ├── store.rs    MmapWeightStore + madvise tier control

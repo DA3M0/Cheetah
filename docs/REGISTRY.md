@@ -86,8 +86,9 @@ pub(crate) const REGISTRATION: ModelRegistration = ModelRegistration {
 - **`backends`** — `&[(&'static str, BackendLoader)]` in declared order; the
   order is what `registered_backends` reports and what the startup banner
   prints. `BackendLoader::Native(super::native::native_family_loader)` for the
-  native mmap backend; `BackendLoader::Vulkan(super::<family>::load_vulkan)`
-  behind `#[cfg(feature = "vulkan")]` for the Vulkan executor.
+  native mmap backend; `BackendLoader::Vulkan(super::vulkan_executors::load)`
+  behind `#[cfg(feature = "vulkan")]` — one generic loader, executor features
+  derived from the config's `model_type`.
 - **`family`** — `Option<ModelFamily>`: fallback inference constants
   (`rope_theta`, `rms_norm_eps`, `tie_word_embeddings`, size
   `profiles: (hidden, vocab, q_heads, kv_heads, head_dim)`,
@@ -124,9 +125,12 @@ The only static table left in `registry.rs` is the **device selection** table
 
 ### 4.1 A new architecture (the common case)
 
-1. Implement the runtime (`src/chat/models/<name>.rs` for the Vulkan executor
-   wiring; the native runner needs nothing new when `DenseFeatures` already
-   covers the deltas — see [ANT_MEMORY.md](ANT_MEMORY.md) §11).
+1. Implement the runtime — usually nothing: the native runner needs no new
+   code when `DenseFeatures` already covers the deltas
+   ([ANT_MEMORY.md](ANT_MEMORY.md) §11), and the Vulkan side needs no new
+   code when `vulkan_executors.rs` has a `model_type` arm with the right
+   executor features. Both sides only change when the family introduces a
+   structure no existing arm/flag covers.
 2. **Add `src/chat/models/registrations/<name>.rs`** with the architecture
    names, chat template, stop markers, backend loaders, and family constants
    — copy the closest existing file.
@@ -155,11 +159,12 @@ The only static table left in `registry.rs` is the **device selection** table
 ### 4.4 A Vulkan model executor
 
 The executor implementation (`vulkan_transformer.rs`) owns the actual compute
-graph and the Ant GPU-bucket residency; the registration file only points the
-family's `vulkan` backend name at it. Follow `VulkanTransformerExecutor`
-(transformer + Phi variants) and keep the executor Candle-free (the shared
-shader library lives in `*.comp` at the repo root; shaders are discovered from
-`src/chat/models/` at build time).
+graph and the Ant GPU-bucket residency; every registration points its
+`vulkan` backend name at the one generic loader (`super::vulkan_executors::load`),
+which selects executor features by the config's `model_type` and dispatches to
+`VulkanTransformerExecutor` (transformer + Phi variants). Keep the executors
+Candle-free (the shared shader library lives in `*.comp` at the repo root;
+shaders are discovered from `src/chat/models/` at build time).
 
 ## 5. Design decisions worth remembering
 
