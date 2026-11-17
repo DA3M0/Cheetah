@@ -577,9 +577,11 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   prefill currently walks positions sequentially, re-reading resident pages
   per position.
 - MoE routing-aware offload (per-expert residency) is implemented as of RC2-B:
-  the native runner tracks per-(layer, expert) residency from the router's
-  top-k selections, pages in freshly selected experts and evicts experts the
-  selection moved away from during a generation. The C-side
+  both backends now track per-(layer, expert) residency from the router's
+  top-k selections. The native runner pages in freshly selected experts and
+  evicts experts the selection moved away from during a generation; the
+  Vulkan executor performs the same transitions against its resident bucket
+  (GPU DEVICE_LOCAL upload / release) inside the MoE forward. The C-side
   `eviction_policy` (`lru|clock|clock2`) is metadata only; the native backend's
   effective policy is tier-driven. RC2-A (MoE expert-parameter generality:
   expert naming and routing driven by configuration instead of Mixtral-only

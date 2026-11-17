@@ -795,7 +795,14 @@ enum FeedForward {
 }
 
 impl FeedForward {
-    fn forward(&self, input: &[f32], rows: usize, hidden_size: usize) -> Result<Vec<f32>, String> {
+    fn forward(
+        &mut self,
+        input: &[f32],
+        rows: usize,
+        hidden_size: usize,
+        expert_residency: &mut HashMap<(usize, usize), bool>,
+        layer_index: usize,
+    ) -> Result<Vec<f32>, String> {
         match self {
             Self::Dense {
                 gate,
@@ -816,11 +823,48 @@ impl FeedForward {
             } => {
                 let router_logits = router.forward(input, rows)?;
                 let mut output = vec![0.0; rows * hidden_size];
-                let mut selected_by_expert = vec![Vec::new(); experts.len()];
+                let mut selected_by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts.len()];
                 for row in 0..rows {
                     let logits = &router_logits[row * experts.len()..(row + 1) * experts.len()];
                     for (expert_index, route_weight) in select_experts(logits, *top_k)? {
                         selected_by_expert[expert_index].push((row, route_weight));
+                    }
+                }
+                // RC2-B: routing-aware per-expert residency. Experts the current
+                // router selection no longer picks are evicted (release the
+                // resident GPU bucket); freshly picked experts are paged in
+                // (upload into the resident bucket). State is keyed per
+                // (layer, expert) so it holds across positions and generation steps.
+                for expert_index in 0..experts.len() {
+                    let selected_rows = &selected_by_expert[expert_index];
+                    let resident = !selected_rows.is_empty();
+                    let key = (layer_index, expert_index);
+                    let was_resident = expert_residency.get(&key).copied().unwrap_or(false);
+                    if was_resident != resident {
+                        if resident {
+                            let expert = &mut experts[expert_index];
+                            if expert.gate.slot.is_none() {
+                                expert.gate.slot = upload_slot(&expert.gate.name, &expert.gate.weight);
+                            }
+                            if expert.up.slot.is_none() {
+                                expert.up.slot = upload_slot(&expert.up.name, &expert.up.weight);
+                            }
+                            if expert.down.slot.is_none() {
+                                expert.down.slot = upload_slot(&expert.down.name, &expert.down.weight);
+                            }
+                        } else {
+                            let expert = &mut experts[expert_index];
+                            if let Some(slot) = expert.gate.slot.take() {
+                                cheetah::native::vulkan::weight_release(slot.handle);
+                            }
+                            if let Some(slot) = expert.up.slot.take() {
+                                cheetah::native::vulkan::weight_release(slot.handle);
+                            }
+                            if let Some(slot) = expert.down.slot.take() {
+                                cheetah::native::vulkan::weight_release(slot.handle);
+                            }
+                        }
+                        expert_residency.insert(key, resident);
                     }
                 }
                 for (expert, selected_rows) in experts.iter().zip(selected_by_expert) {
@@ -918,6 +962,10 @@ pub(crate) struct VulkanTransformerExecutor {
     layers: Vec<Layer>,
     final_norm: WeightData,
     lm_head: WeightData,
+    /// RC2-B: routing-aware per-expert residency, keyed by
+    /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
+    /// router's top-k selections while a generation walks the layers.
+    expert_residency: HashMap<(usize, usize), bool>,
 }
 
 impl super::models::ModelRuntime for VulkanTransformerExecutor {
@@ -1268,6 +1316,7 @@ impl VulkanTransformerExecutor {
             layers,
             final_norm,
             lm_head,
+            expert_residency: HashMap::new(),
         })
     }
 
@@ -1324,7 +1373,7 @@ impl VulkanTransformerExecutor {
             self.config.features.embedding_scale,
         )?;
 
-        for layer in &mut self.layers {
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             let residual = activations.clone();
             let normalized = layer.input_norm.rms_norm(
                 &activations,
@@ -1386,7 +1435,13 @@ impl VulkanTransformerExecutor {
                 hidden,
                 self.config.rms_norm_eps,
             )?;
-            let feed_forward = layer.feed_forward.forward(&normalized, sequence, hidden)?;
+            let feed_forward = layer.feed_forward.forward(
+                &normalized,
+                sequence,
+                hidden,
+                &mut self.expert_residency,
+                layer_index,
+            )?;
             activations = cheetah::native::vulkan::add(&residual, &feed_forward)?;
         }
 
@@ -2029,6 +2084,7 @@ mod tests {
             }],
             final_norm: WeightData::F32(vec![1.0, 1.0].into()),
             lm_head: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
+            expert_residency: HashMap::new(),
         }
     }
 
