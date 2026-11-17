@@ -576,11 +576,14 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 - Batched prefill (one weight pass over all prompt tokens) is pending —
   prefill currently walks positions sequentially, re-reading resident pages
   per position.
-- MoE routing-aware offload (per-expert residency) is the remaining item from
-  the original full-offload design; slated as the RC2 sparse-architecture
-  (MoE) milestone. RC2-A (MoE expert-parameter generality: expert naming and
-  routing driven by configuration instead of Mixtral-only hardcoding) is the
-  current RC2 work item.
+- MoE routing-aware offload (per-expert residency) is implemented as of RC2-B:
+  the native runner tracks per-(layer, expert) residency from the router's
+  top-k selections, pages in freshly selected experts and evicts experts the
+  selection moved away from during a generation. The C-side
+  `eviction_policy` (`lru|clock|clock2`) is metadata only; the native backend's
+  effective policy is tier-driven. RC2-A (MoE expert-parameter generality:
+  expert naming and routing driven by configuration instead of Mixtral-only
+  hardcoding) preceded it in the same RC2 sparse-architecture (MoE) milestone.
 - The C-side `eviction_policy` (`lru|clock|clock2`) is metadata only; the
   native backend's effective policy is tier-driven.
 - Q8 quantization changes the numerics (per-row int8 bounds the error to

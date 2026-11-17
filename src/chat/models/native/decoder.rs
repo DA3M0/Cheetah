@@ -7,6 +7,7 @@ use super::kernels;
 use super::store::{MmapWeightStore, Tier, WeightDType};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -191,6 +192,10 @@ pub struct DecoderNative {
     q_raw_capture: Vec<f32>,
     k_raw_capture: Vec<f32>,
     normed_capture: Vec<f32>,
+    /// RC2-B: routing-aware per-expert residency, keyed by
+    /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
+    /// router's top-k selections while a generation walks the layers.
+    expert_residency: HashMap<(usize, usize), bool>,
 }
 
 /// Stage-wise debug capture of layer 0 at the last input position.
@@ -251,6 +256,7 @@ impl DecoderNative {
             q_raw_capture: Vec::new(),
             k_raw_capture: Vec::new(),
             normed_capture: Vec::new(),
+            expert_residency: HashMap::new(),
         }
     }
 
@@ -569,7 +575,29 @@ impl DecoderNative {
                 right.partial_cmp(&left).unwrap_or(std::cmp::Ordering::Equal)
             });
             let top_k = cfg.num_experts_per_tok.min(cfg.num_local_experts);
-            for expert in order.into_iter().take(top_k) {
+            let selected: Vec<usize> = order.into_iter().take(top_k).collect();
+
+            // RC2-B: routing-aware per-expert residency. Experts the current
+            // router selection no longer picks for this layer are evicted;
+            // freshly picked experts are paged in. State is keyed per
+            // (layer, expert) so it holds across positions and generation steps.
+            for expert in 0..cfg.num_local_experts {
+                let key = (layer, expert);
+                let was_resident = self.expert_residency.get(&key).copied().unwrap_or(false);
+                if was_resident && !selected.contains(&expert) {
+                    self.set_expert_resident(layer, expert, false);
+                    self.expert_residency.insert(key, false);
+                }
+            }
+            for &expert in &selected {
+                let key = (layer, expert);
+                if !self.expert_residency.get(&key).copied().unwrap_or(false) {
+                    self.set_expert_resident(layer, expert, true);
+                    self.expert_residency.insert(key, true);
+                }
+            }
+
+            for expert in selected {
                 let (gate_weight, gate_dtype, _) = self
                     .store
                     .slice(&format!(
@@ -755,6 +783,34 @@ impl DecoderNative {
                 Some(_) | None => Tier::Resident,
             };
             self.store.set_tier(&unit_id, tier);
+        }
+    }
+
+    /// RC2-B: apply one expert's residency transition. The router-selected
+    /// expert's gate/up/down units move together between the resident and disk
+    /// tiers; unit ids the store does not know are ignored.
+    fn set_expert_resident(&self, layer: usize, expert: usize, resident: bool) {
+        let prefix = format!("model.layers.{layer}.");
+        let gate_unit = format!(
+            "{}{}.{}.{}",
+            prefix, self.cfg.moe_layout.experts_prefix, expert, self.cfg.moe_layout.gate
+        );
+        let up_unit = format!(
+            "{}{}.{}.{}",
+            prefix, self.cfg.moe_layout.experts_prefix, expert, self.cfg.moe_layout.up
+        );
+        let down_unit = format!(
+            "{}{}.{}.{}",
+            prefix, self.cfg.moe_layout.experts_prefix, expert, self.cfg.moe_layout.down
+        );
+        if resident {
+            self.store.set_tier(&gate_unit, Tier::Resident);
+            self.store.set_tier(&up_unit, Tier::Resident);
+            self.store.set_tier(&down_unit, Tier::Resident);
+        } else {
+            self.store.set_tier(&gate_unit, Tier::Disk);
+            self.store.set_tier(&up_unit, Tier::Disk);
+            self.store.set_tier(&down_unit, Tier::Disk);
         }
     }
 
