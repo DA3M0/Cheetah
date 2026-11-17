@@ -25,6 +25,34 @@ pub struct DecoderConfig {
     /// and experts routed per token (0 => dense).
     pub num_local_experts: usize,
     pub num_experts_per_tok: usize,
+    /// Sparse-MoE expert naming layout (Mixtral-compatible defaults). Drives
+    /// router + expert weight slicing so any architecture can declare a
+    /// sparse feed-forward without Mixtral-only hardcoding.
+    pub moe_layout: MoEExpertLayout,
+}
+
+/// Sparse-MoE expert naming layout. Mixtral-compatible defaults; other
+/// architectures supply their own expert naming via prepared configs.
+#[derive(Clone, Copy, Debug)]
+pub struct MoEExpertLayout {
+    /// Router weight tensor name suffix (Mixtral: `block_sparse_moe.gate`).
+    pub router: &'static str,
+    /// Expert weight name prefix (Mixtral: `block_sparse_moe.experts`).
+    pub experts_prefix: &'static str,
+    /// Expert gate/up/down file suffixes (Mixtral: `w1` / `w3` / `w2`).
+    pub gate: &'static str,
+    pub up: &'static str,
+    pub down: &'static str,
+}
+
+impl MoEExpertLayout {
+    pub const MIXTRAL: Self = Self {
+        router: "block_sparse_moe.gate",
+        experts_prefix: "block_sparse_moe.experts",
+        gate: "w1",
+        up: "w3",
+        down: "w2",
+    };
 }
 
 impl DecoderConfig {
@@ -124,6 +152,7 @@ impl DecoderConfig {
                 .unwrap_or(family.tie_word_embeddings),
             num_local_experts,
             num_experts_per_tok,
+            moe_layout: MoEExpertLayout::MIXTRAL,
         })
     }
 }
@@ -524,7 +553,7 @@ impl DecoderNative {
             self.scratch.router.resize(cfg.num_local_experts, 0.0);
             let (router_weight, router_dtype, _) = self
                 .store
-                .slice(&format!("{prefix}block_sparse_moe.gate"))?;
+                .slice(&format!("{}{}", prefix, cfg.moe_layout.router))?;
             kernels::gemv(
                 router_weight,
                 router_dtype,
@@ -543,13 +572,31 @@ impl DecoderNative {
             for expert in order.into_iter().take(top_k) {
                 let (gate_weight, gate_dtype, _) = self
                     .store
-                    .slice(&format!("{prefix}block_sparse_moe.experts.{expert}.w1"))?;
+                    .slice(&format!(
+                        "{}{}.{}.{}",
+                        prefix,
+                        cfg.moe_layout.experts_prefix,
+                        expert,
+                        cfg.moe_layout.gate
+                    ))?;
                 let (up_weight, up_dtype, _) = self
                     .store
-                    .slice(&format!("{prefix}block_sparse_moe.experts.{expert}.w3"))?;
+                    .slice(&format!(
+                        "{}{}.{}.{}",
+                        prefix,
+                        cfg.moe_layout.experts_prefix,
+                        expert,
+                        cfg.moe_layout.up
+                    ))?;
                 let (down_weight, down_dtype, _) = self
                     .store
-                    .slice(&format!("{prefix}block_sparse_moe.experts.{expert}.w2"))?;
+                    .slice(&format!(
+                        "{}{}.{}.{}",
+                        prefix,
+                        cfg.moe_layout.experts_prefix,
+                        expert,
+                        cfg.moe_layout.down
+                    ))?;
                 self.scratch.gate.clear();
                 self.scratch.gate.resize(cfg.intermediate_size, 0.0);
                 kernels::gemv(

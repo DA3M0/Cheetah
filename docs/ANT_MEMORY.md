@@ -578,7 +578,9 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   per position.
 - MoE routing-aware offload (per-expert residency) is the remaining item from
   the original full-offload design; slated as the RC2 sparse-architecture
-  (MoE) milestone.
+  (MoE) milestone. RC2-A (MoE expert-parameter generality: expert naming and
+  routing driven by configuration instead of Mixtral-only hardcoding) is the
+  current RC2 work item.
 - The C-side `eviction_policy` (`lru|clock|clock2`) is metadata only; the
   native backend's effective policy is tier-driven.
 - Q8 quantization changes the numerics (per-row int8 bounds the error to
