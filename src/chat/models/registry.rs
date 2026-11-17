@@ -26,53 +26,61 @@ const BACKENDS: &[BackendRegistration] = &[
     },
 ];
 
-/// Architectures served by the native mmap + Ant tiering backend. The dense
-/// set spans the llama-shaped families (llama / mixtral / qwen2 / qwen3;
-/// mixtral carries the mixture-of-experts feed-forward) and the delta
-/// families mistral (sliding window), gemma (offset norms + embedding scale +
-/// GeGLU) and phi (LayerNorm + parallel residual + fused projections).
-pub(super) fn native_backends() -> &'static [&'static str] {
-    &["llama", "mixtral", "qwen2", "qwen3", "mistral", "gemma", "phi"]
+/// Architectures served by the native mmap + Ant tiering backend, derived
+/// from the declarative registrations (every registration that carries a
+/// native loader). Test-support view: the load path consults the
+/// registration table directly.
+#[cfg(test)]
+pub(super) fn native_backends() -> Vec<&'static str> {
+    architectures_serving("native")
 }
 
-/// Architectures served by the Vulkan compute path: every family with a Vulkan
-/// executor. gemma / mistral / phi are Vulkan-only (no native backend); the
-/// native-capable families serve both. Kept in step with
-/// `vulkan_loader_for_architecture` (asserted by a test).
-pub(super) fn vulkan_backends() -> &'static [&'static str] {
-    &[
-        "llama",
-        "LlamaForCausalLM",
-        "qwen2",
-        "Qwen2ForCausalLM",
-        "qwen3",
-        "Qwen3ForCausalLM",
-        "gemma",
-        "GemmaForCausalLM",
-        "mistral",
-        "MistralForCausalLM",
-        "mixtral",
-        "MixtralForCausalLM",
-        "phi",
-        "PhiForCausalLM",
-    ]
+/// Architectures served by the Vulkan compute path, derived the same way —
+/// every registration that carries a Vulkan loader. Test-support view.
+#[cfg(test)]
+pub(super) fn vulkan_backends() -> Vec<&'static str> {
+    architectures_serving("vulkan")
 }
 
-fn architecture_has_backend(architecture: &str, backend: &str) -> bool {
-    let normalized = normalize_architecture(architecture);
-    let names = if backend.eq_ignore_ascii_case("native") {
-        native_backends()
-    } else {
-        vulkan_backends()
-    };
-    names
+#[cfg(test)]
+fn architectures_serving(backend: &str) -> Vec<&'static str> {
+    super::REGISTRY
         .iter()
-        .any(|name| normalize_architecture(name) == normalized)
+        .filter(|registration| registration.loader_for(backend).is_some())
+        .flat_map(|registration| registration.architectures.iter().copied())
+        .collect()
+}
+
+/// The declarative registration serving an architecture name (normalized:
+/// case-insensitive, `ForCausalLM` suffix stripped), or a listing error.
+pub(crate) fn registration_for_architecture(
+    architecture: &str,
+) -> Result<&'static super::ModelRegistration, String> {
+    super::REGISTRY
+        .iter()
+        .find(|registration| registration.serves(architecture))
+        .copied()
+        .ok_or_else(|| {
+            let registered: Vec<&str> = super::ALL_ARCHITECTURES
+                .iter()
+                .flat_map(|names| names.iter().copied())
+                .collect();
+            format!(
+                "Architecture '{architecture}' is not registered; registered families: {registered:?}."
+            )
+        })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn architecture_has_backend(architecture: &str, backend: &str) -> bool {
+    registration_for_architecture(architecture)
+        .map(|registration| registration.loader_for(backend).is_some())
+        .unwrap_or(false)
 }
 
 /// Lowercase and strip the `ForCausalLM` suffix so `Qwen2ForCausalLM` and
 /// `qwen2` resolve to the same architecture identity.
-fn normalize_architecture(architecture: &str) -> String {
+pub(super) fn normalize_architecture(architecture: &str) -> String {
     let mut normalized = architecture.to_lowercase();
     if let Some(stripped) = normalized.strip_suffix("forcausallm") {
         normalized = stripped.to_string();
@@ -80,166 +88,28 @@ fn normalize_architecture(architecture: &str) -> String {
     normalized
 }
 
-/// Backend names registered for an architecture: every native family (llama /
-/// mixtral / qwen2 / qwen3 / mistral / gemma / phi) serves
-/// `["native", "vulkan"]`.
+/// Backend names registered for an architecture, in the registration's
+/// declared order (e.g. `["native", "vulkan"]`).
 pub(crate) fn registered_backends(architecture: &str) -> Vec<&'static str> {
-    if architecture_has_backend(architecture, "native") {
-        return vec!["native", "vulkan"];
-    }
-    if architecture_has_backend(architecture, "vulkan") {
-        return vec!["vulkan"];
-    }
-    Vec::new()
+    registration_for_architecture(architecture)
+        .map(|registration| registration.backend_names().collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn backend_loader_for_architecture(
     architecture: &str,
     backend: &str,
 ) -> Option<BackendLoader> {
-    if backend.eq_ignore_ascii_case("native") && architecture_has_backend(architecture, "native") {
-        return Some(BackendLoader::Native(super::native::native_family_loader));
-    }
-    None
+    registration_for_architecture(architecture)
+        .ok()
+        .and_then(|registration| registration.loader_for(backend))
 }
 
-/// Family constants for a native backend family: the llama-shaped set (llama /
-/// mixtral / qwen2 / qwen3) plus the dense delta families mistral / gemma /
-/// phi.
+/// Family constants for a native backend family, from the registration file.
 pub(crate) fn family_for_architecture(architecture: &str) -> Option<ModelFamily> {
-    match architecture {
-        "llama" | "LlamaForCausalLM" => Some(llama_family()),
-        "mixtral" | "MixtralForCausalLM" => Some(mixtral_family()),
-        "qwen2" | "Qwen2ForCausalLM" => Some(qwen2_family()),
-        "qwen3" | "Qwen3ForCausalLM" => Some(qwen3_family()),
-        "mistral" | "MistralForCausalLM" => Some(mistral_family()),
-        "gemma" | "GemmaForCausalLM" => Some(gemma_family()),
-        "phi" | "PhiForCausalLM" => Some(phi_family()),
-        _ => None,
-    }
-}
-
-fn mixtral_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 8_000.0,
-        rms_norm_eps: 1e-5,
-        tie_word_embeddings: false,
-        profiles: &[
-            (4096, 32768, 32, 8, 128), // Mixtral-8x7B (GQA: 32 q heads / 8 kv heads)
-        ],
-        extra_config_json: "",
-        max_position_embeddings: None,
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::DenseFeatures::default(),
-    }
-}
-
-fn llama_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 10_000.0,
-        rms_norm_eps: 1e-5,
-        tie_word_embeddings: false,
-        profiles: &[
-            (2048, 128256, 32, 8, 64),  // Llama-3.2-1B (tied)
-            (3072, 128256, 24, 8, 128), // Llama-3.2-3B (tied)
-            (4096, 128256, 32, 8, 128), // Llama-3-8B / 3.1-8B
-            (4096, 32000, 32, 32, 128), // Llama-2-7B (MHA)
-        ],
-        extra_config_json: "",
-        max_position_embeddings: Some(4096),
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::DenseFeatures::default(),
-    }
-}
-
-fn qwen2_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 1_000_000.0,
-        rms_norm_eps: 1e-6,
-        tie_word_embeddings: true,
-        profiles: &[
-            (896, 151936, 14, 2, 64),   // Qwen2-0.5B
-            (1536, 151936, 12, 2, 128), // Qwen2-1.5B
-            (3584, 152064, 28, 4, 128), // Qwen2-7B
-        ],
-        extra_config_json:
-            "{\"hidden_act\":\"silu\",\"sliding_window\":4096,\"use_sliding_window\":false,\"max_window_layers\":21}",
-        max_position_embeddings: None,
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::DenseFeatures::default(),
-    }
-}
-
-fn qwen3_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 1_000_000.0,
-        rms_norm_eps: 1e-6,
-        tie_word_embeddings: true,
-        profiles: &[
-            (8192, 32768, 64, 8, 128), // Qwen3-32B GQA config
-        ],
-        extra_config_json: "{\"hidden_act\":\"silu\"}",
-        max_position_embeddings: None,
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::DenseFeatures::default(),
-    }
-}
-
-fn mistral_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 10_000.0,
-        rms_norm_eps: 1e-5,
-        tie_word_embeddings: false,
-        profiles: &[
-            (4096, 32000, 32, 8, 128), // Mistral-7B / 7B-Instruct-v0.2 (GQA)
-            (4096, 32768, 32, 8, 128), // Mistral-7B-v0.3 (extended vocab)
-        ],
-        // The HF Mistral modeling applies `sliding_window` during decoding
-        // (a query attends to the last `sliding_window` keys), which the
-        // native decoder implements as the uniform window.
-        extra_config_json: "{\"hidden_act\":\"silu\",\"sliding_window\":4096}",
-        max_position_embeddings: Some(32768),
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::DenseFeatures::default(),
-    }
-}
-
-fn gemma_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 10_000.0,
-        rms_norm_eps: 1e-6,
-        tie_word_embeddings: true,
-        profiles: &[
-            (2048, 256128, 8, 1, 256),  // gemma-2b / 2b-it
-            (2048, 256000, 8, 1, 256),  // gemma-2b mirrors with padded-down vocab
-            (3072, 256000, 16, 1, 256), // gemma-7b / 7b-it
-            (3072, 256128, 16, 1, 256), // gemma-1.1-7b
-        ],
-        // gemma-1 applies full attention on every layer (the config's
-        // `sliding_window` is not enforced by the HF Gemma modeling), so no
-        // window is declared here.
-        extra_config_json: "{\"hidden_act\":\"gelu_pytorch_tanh\"}",
-        max_position_embeddings: Some(8192),
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::GEMMA_FEATURES,
-    }
-}
-
-fn phi_family() -> ModelFamily {
-    super::ModelFamily {
-        rope_theta: 10_000.0,
-        rms_norm_eps: 1e-5,
-        tie_word_embeddings: false,
-        profiles: &[
-            (2048, 50257, 32, 32, 64),  // phi-1.5 (head_dim 2048/32)
-            (2048, 51200, 32, 32, 64),  // phi-1.5 padded vocab
-            (2560, 51200, 32, 32, 80),  // phi-2 (head_dim 2560/32)
-        ],
-        extra_config_json: "{\"hidden_act\":\"gelu_new\"}",
-        max_position_embeddings: Some(2048),
-        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
-        features: super::native::decoder::PHI_FEATURES,
-    }
+    registration_for_architecture(architecture)
+        .ok()
+        .and_then(|registration| registration.family)
 }
 
 pub(crate) fn load_model(
@@ -309,23 +179,13 @@ pub(crate) fn load_model_for_device(
     Err(no_native_backend_message(architecture))
 }
 
-/// Loader for one architecture's Vulkan executor. Every architecture the
-/// Vulkan capability table claims must resolve here — a registered
-/// architecture without a loader would fail at load time with
-/// "Unsupported Vulkan architecture".
+/// Loader for one architecture's Vulkan executor, resolved from the
+/// registration's backend table. Every architecture a registration claims
+/// for Vulkan must resolve here — the loader lives in the same table, so a
+/// miss is a registration-file bug, not a dispatch gap.
 #[cfg(feature = "vulkan")]
 pub(super) fn vulkan_loader_for_architecture(architecture: &str) -> Option<super::BackendLoader> {
-    let loader = match architecture {
-        "llama" | "LlamaForCausalLM" => super::llama::load_vulkan,
-        "qwen2" | "Qwen2ForCausalLM" => super::qwen2::load_vulkan,
-        "qwen3" | "Qwen3ForCausalLM" => super::qwen3::load_vulkan,
-        "gemma" | "GemmaForCausalLM" => super::gemma::load_vulkan,
-        "mistral" | "MistralForCausalLM" => super::mistral::load_vulkan,
-        "mixtral" | "MixtralForCausalLM" => super::mixtral::load_vulkan,
-        "phi" | "PhiForCausalLM" => super::phi::load_vulkan,
-        _ => return None,
-    };
-    Some(super::BackendLoader::Vulkan(loader))
+    backend_loader_for_architecture(architecture, "vulkan")
 }
 
 #[cfg_attr(not(feature = "vulkan"), allow(unused_variables, unused_mut))]
@@ -406,23 +266,47 @@ mod tests {
         assert!(backend_device("vulkan").is_ok());
     }
 
+    /// Registration identity: the short name and the `ForCausalLM` suffix
+    /// form resolve to the same registration on every lookup surface.
+    #[test]
+    fn registration_lookup_normalizes_architecture_names() {
+        for (short, full) in [
+            ("llama", "LlamaForCausalLM"),
+            ("qwen2", "Qwen2ForCausalLM"),
+            ("qwen3", "Qwen3ForCausalLM"),
+            ("mixtral", "MixtralForCausalLM"),
+            ("mistral", "MistralForCausalLM"),
+            ("gemma", "GemmaForCausalLM"),
+            ("phi", "PhiForCausalLM"),
+        ] {
+            let short_registration = registration_for_architecture(short).unwrap();
+            let full_registration = registration_for_architecture(full).unwrap();
+            assert!(
+                std::ptr::eq(short_registration, full_registration),
+                "{short} and {full} must resolve to the same registration"
+            );
+            assert!(family_for_architecture(short).is_some());
+            assert!(family_for_architecture(full).is_some());
+        }
+        assert!(registration_for_architecture("unknown").is_err());
+        assert!(family_for_architecture("unknown").is_none());
+    }
+
     #[test]
     fn native_backend_serves_llama_and_qwen_families() {
         assert!(backend_loader_for_architecture("llama", "native").is_some());
         assert!(backend_loader_for_architecture("Qwen2ForCausalLM", "native").is_some());
         assert!(backend_loader_for_architecture("qwen3", "native").is_some());
-        assert!(backend_loader_for_architecture("gemma", "vulkan").is_none());
     }
 
     #[test]
     fn native_backend_serves_mixtral_moe_family() {
         assert!(backend_loader_for_architecture("mixtral", "native").is_some());
         assert!(backend_loader_for_architecture("MixtralForCausalLM", "native").is_some());
-        assert!(backend_loader_for_architecture("gemma", "vulkan").is_none());
     }
 
     /// Dense coverage: the mistral / gemma / phi delta families resolve the
-    /// native backend (and, with it, the combined native+vulkan table).
+    /// native backend and carry their family constants.
     #[test]
     fn native_backend_serves_dense_delta_families() {
         for architecture in ["mistral", "MistralForCausalLM", "gemma", "GemmaForCausalLM", "phi", "PhiForCausalLM"] {
@@ -430,42 +314,74 @@ mod tests {
                 backend_loader_for_architecture(architecture, "native").is_some(),
                 "{architecture} must resolve the native backend"
             );
-            assert_eq!(registered_backends(architecture), vec!["native", "vulkan"]);
             assert!(family_for_architecture(architecture).is_some());
         }
         assert!(backend_loader_for_architecture("llama", "native").is_some());
     }
 
-    /// The Vulkan capability table and the loader table must agree in both
-    /// directions: a registered architecture with no loader fails at load time
-    /// with "Unsupported Vulkan architecture", and a loader hidden behind a
-    /// capability table miss is unreachable.
+    /// A native registration must carry family constants — the native loader's
+    /// parameter fallback chain reads them. A declarative file that flips on
+    /// the native backend without a family would resolve to a broken load.
+    #[test]
+    fn every_native_registration_carries_a_family() {
+        for registration in super::super::REGISTRY {
+            if registration.loader_for("native").is_some() {
+                assert!(
+                    registration.family.is_some(),
+                    "registration for {:?} serves native but declares no family",
+                    registration.architectures
+                );
+            }
+        }
+    }
+
+    /// Architecture names must be globally unique across the registration
+    /// files — a duplicated name would silently shadow one family's
+    /// template/backends with whichever registration sorts first.
+    #[test]
+    fn registrations_cover_disjoint_architectures() {
+        let mut seen = std::collections::HashSet::new();
+        for names in super::super::ALL_ARCHITECTURES {
+            for name in names.iter() {
+                assert!(
+                    seen.insert(*name),
+                    "architecture '{name}' is claimed by more than one registration"
+                );
+            }
+        }
+    }
+
+    /// Every registration that claims Vulkan must actually expose a Vulkan
+    /// loader (the same table is consulted at load time), and the derived
+    /// capability list must cover the published family set.
     #[cfg(feature = "vulkan")]
     #[test]
     fn vulkan_capability_table_and_loader_table_agree() {
-        for architecture in vulkan_backends() {
-            assert!(
-                architecture_has_backend(architecture, "vulkan"),
-                "{architecture} is missing from the Vulkan capability table"
-            );
-            assert!(
-                vulkan_loader_for_architecture(architecture).is_some(),
-                "{architecture} is registered for Vulkan but has no loader"
-            );
+        for registration in super::super::REGISTRY {
+            let claims_vulkan = registration.loader_for("vulkan").is_some();
+            for name in registration.architectures {
+                assert_eq!(
+                    architecture_has_backend(name, "vulkan"),
+                    claims_vulkan,
+                    "{name}: capability and loader table disagree"
+                );
+            }
         }
+        let serving = vulkan_backends();
         for architecture in [
             "llama", "qwen2", "qwen3", "gemma", "mistral", "mixtral", "phi",
         ] {
             assert!(
-                architecture_has_backend(architecture, "vulkan"),
+                serving.iter().any(|name| normalize_architecture(name)
+                    == normalize_architecture(architecture)),
                 "{architecture} must be reachable on the Vulkan load path"
             );
-            assert!(
-                vulkan_loader_for_architecture(architecture).is_some(),
-                "{architecture} is registered for Vulkan but has no loader"
-            );
         }
-        assert!(vulkan_loader_for_architecture("unknown").is_none());
+        assert!(vulkan_backends().iter().all(|name| {
+            super::super::ALL_ARCHITECTURES
+                .iter()
+                .any(|names| names.contains(name))
+        }));
         assert!(!architecture_has_backend("unknown", "vulkan"));
     }
 }

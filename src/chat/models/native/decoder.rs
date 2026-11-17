@@ -135,6 +135,21 @@ impl Default for DenseFeatures {
     }
 }
 
+/// The llama-shaped baseline: full rope, RMSNorm without offset, unscaled
+/// embeddings, SiLU gated MLP, sequential residuals, split projections. The
+/// constant form lets declarative registration files (const fns) reference
+/// the default feature set.
+pub const LLAMA_BASELINE: DenseFeatures = DenseFeatures {
+    norm_weight_offset: false,
+    embedding_scale: false,
+    mlp_gelu: false,
+    layer_norm: false,
+    parallel_residual: false,
+    fused_qkv: false,
+    fc_mlp: false,
+    partial_rotary_factor: 1.0,
+};
+
 /// gemma family deltas: llama tensor naming with offset RMSNorms, a
 /// sqrt(hidden)-scaled embedding, and GeGLU (tanh-GELU gated) feed-forward.
 pub const GEMMA_FEATURES: DenseFeatures = DenseFeatures {
