@@ -16,8 +16,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 
-/// Llama-family maximum sequence length default.
-const LLAMA_DEFAULT_MAX_SEQ_LEN: usize = 4096;
+/// Generic fallback context length when no architecture family declares one
+/// (unregistered architectures / missing family metadata).
+const DEFAULT_MAX_POSITION_EMBEDDINGS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -626,6 +627,9 @@ impl Engine {
                 eos_token_ids.insert(*id);
             }
         }
+        let family_context_cap = super::models::family_for_architecture(&architecture)
+            .and_then(|family| family.max_position_embeddings)
+            .unwrap_or(usize::MAX);
         Ok(Self {
             model: Mutex::new(LoadedModel { model, device }),
             tokenizer,
@@ -637,11 +641,7 @@ impl Engine {
             architecture: Some(architecture),
             prompt_renderer,
             max_position_embeddings: config.max_position_embeddings.min(ctx_size).min(
-                if config.model_type == "llama" {
-                    LLAMA_DEFAULT_MAX_SEQ_LEN
-                } else {
-                    usize::MAX
-                },
+                family_context_cap,
             ),
             eos_token_ids,
             stop_markers,
@@ -1354,8 +1354,14 @@ fn synth_config_from_manifest(
         "architectures".into(),
         serde_json::Value::Array(vec![serde_json::Value::String(model_type.clone())]),
     );
+    let default_max_position_embeddings = super::models::family_for_architecture(&model_type)
+        .and_then(|family| family.max_position_embeddings)
+        .unwrap_or(DEFAULT_MAX_POSITION_EMBEDDINGS);
     if !synthesized.contains_key("max_position_embeddings") {
-        synthesized.insert("max_position_embeddings".into(), serde_json::json!(4096));
+        synthesized.insert(
+            "max_position_embeddings".into(),
+            serde_json::json!(default_max_position_embeddings),
+        );
     }
     // Merge the family's fallback parameters and extra config fields, when
     // registered: family values fill any gap the manifest snapshot does not

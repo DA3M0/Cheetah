@@ -33,18 +33,26 @@ pub(super) fn native_backends() -> &'static [&'static str] {
     &["llama", "mixtral", "qwen2", "qwen3"]
 }
 
-/// Architectures served by the Vulkan compute path; families without a native
-/// implementation (gemma / mistral / mixtral / phi) are Vulkan-only.
+/// Architectures served by the Vulkan compute path: every family with a Vulkan
+/// executor. gemma / mistral / phi are Vulkan-only (no native backend); the
+/// native-capable families serve both. Kept in step with
+/// `vulkan_loader_for_architecture` (asserted by a test).
 pub(super) fn vulkan_backends() -> &'static [&'static str] {
     &[
-        "GemmaForCausalLM",
+        "llama",
+        "LlamaForCausalLM",
+        "qwen2",
+        "Qwen2ForCausalLM",
+        "qwen3",
+        "Qwen3ForCausalLM",
         "gemma",
-        "MistralForCausalLM",
+        "GemmaForCausalLM",
         "mistral",
-        "MixtralForCausalLM",
+        "MistralForCausalLM",
         "mixtral",
-        "PhiForCausalLM",
+        "MixtralForCausalLM",
         "phi",
+        "PhiForCausalLM",
     ]
 }
 
@@ -113,6 +121,8 @@ fn mixtral_family() -> ModelFamily {
             (4096, 32768, 32, 8, 128), // Mixtral-8x7B (GQA: 32 q heads / 8 kv heads)
         ],
         extra_config_json: "",
+        max_position_embeddings: None,
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
     }
 }
 
@@ -128,6 +138,8 @@ fn llama_family() -> ModelFamily {
             (4096, 32000, 32, 32, 128), // Llama-2-7B (MHA)
         ],
         extra_config_json: "",
+        max_position_embeddings: Some(4096),
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
     }
 }
 
@@ -143,6 +155,8 @@ fn qwen2_family() -> ModelFamily {
         ],
         extra_config_json:
             "{\"hidden_act\":\"silu\",\"sliding_window\":4096,\"use_sliding_window\":false,\"max_window_layers\":21}",
+        max_position_embeddings: None,
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
     }
 }
 
@@ -151,8 +165,12 @@ fn qwen3_family() -> ModelFamily {
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-6,
         tie_word_embeddings: true,
-        profiles: &[(8192, 32768, 64, 8, 128)],
-        extra_config_json: "",
+        profiles: &[
+            (8192, 32768, 64, 8, 128), // Qwen3-32B GQA config
+        ],
+        extra_config_json: "{\"hidden_act\":\"silu\"}",
+        max_position_embeddings: None,
+        moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
     }
 }
 
@@ -223,6 +241,25 @@ pub(crate) fn load_model_for_device(
     Err(no_native_backend_message(architecture))
 }
 
+/// Loader for one architecture's Vulkan executor. Every architecture the
+/// Vulkan capability table claims must resolve here — a registered
+/// architecture without a loader would fail at load time with
+/// "Unsupported Vulkan architecture".
+#[cfg(feature = "vulkan")]
+pub(super) fn vulkan_loader_for_architecture(architecture: &str) -> Option<super::BackendLoader> {
+    let loader = match architecture {
+        "llama" | "LlamaForCausalLM" => super::llama::load_vulkan,
+        "qwen2" | "Qwen2ForCausalLM" => super::qwen2::load_vulkan,
+        "qwen3" | "Qwen3ForCausalLM" => super::qwen3::load_vulkan,
+        "gemma" | "GemmaForCausalLM" => super::gemma::load_vulkan,
+        "mistral" | "MistralForCausalLM" => super::mistral::load_vulkan,
+        "mixtral" | "MixtralForCausalLM" => super::mixtral::load_vulkan,
+        "phi" | "PhiForCausalLM" => super::phi::load_vulkan,
+        _ => return None,
+    };
+    Some(super::BackendLoader::Vulkan(loader))
+}
+
 #[cfg_attr(not(feature = "vulkan"), allow(unused_variables, unused_mut))]
 fn load_vulkan_or_fallback(
     weight_paths: &[PathBuf],
@@ -245,20 +282,16 @@ fn load_vulkan_or_fallback(
             );
             return Err(no_native_backend_message(architecture));
         }
-        let vulkan_model = (|| {
-            match architecture {
-                "llama" | "LlamaForCausalLM" => {
-                    super::llama::load_vulkan(weight_paths, config_bytes, raw_config.clone(), plan)
-                }
-                "qwen2" | "Qwen2ForCausalLM" => {
-                    super::qwen2::load_vulkan(weight_paths, config_bytes, raw_config.clone(), plan)
-                }
-                "qwen3" | "Qwen3ForCausalLM" => {
-                    super::qwen3::load_vulkan(weight_paths, config_bytes, raw_config.clone(), plan)
-                }
-                _ => Err(format!("Unsupported Vulkan architecture '{architecture}'.")),
+        let vulkan_model = match vulkan_loader_for_architecture(architecture) {
+            Some(super::BackendLoader::Vulkan(load)) => {
+                load(weight_paths, config_bytes, raw_config.clone(), plan)
             }
-        })();
+            // The capability table and the loader table disagree, or the
+            // architecture carries no Vulkan executor at all.
+            Some(super::BackendLoader::Native(_)) | None => {
+                Err(format!("Unsupported Vulkan architecture '{architecture}'."))
+            }
+        };
         match vulkan_model {
             Ok(executor) => Ok((Device::Cpu, executor)),
             Err(error) => {
@@ -326,5 +359,38 @@ mod tests {
     fn mixtral_architectures_resolve_native_and_vulkan_backends() {
         assert_eq!(registered_backends("mixtral"), vec!["native", "vulkan"]);
         assert_eq!(registered_backends("MixtralForCausalLM"), vec!["native", "vulkan"]);
+    }
+
+    /// The Vulkan capability table and the loader table must agree in both
+    /// directions: a registered architecture with no loader fails at load time
+    /// with "Unsupported Vulkan architecture", and a loader hidden behind a
+    /// capability table miss is unreachable.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_capability_table_and_loader_table_agree() {
+        for architecture in vulkan_backends() {
+            assert!(
+                architecture_has_backend(architecture, "vulkan"),
+                "{architecture} is missing from the Vulkan capability table"
+            );
+            assert!(
+                vulkan_loader_for_architecture(architecture).is_some(),
+                "{architecture} is registered for Vulkan but has no loader"
+            );
+        }
+        for architecture in [
+            "llama", "qwen2", "qwen3", "gemma", "mistral", "mixtral", "phi",
+        ] {
+            assert!(
+                architecture_has_backend(architecture, "vulkan"),
+                "{architecture} must be reachable on the Vulkan load path"
+            );
+            assert!(
+                vulkan_loader_for_architecture(architecture).is_some(),
+                "{architecture} is registered for Vulkan but has no loader"
+            );
+        }
+        assert!(vulkan_loader_for_architecture("unknown").is_none());
+        assert!(!architecture_has_backend("unknown", "vulkan"));
     }
 }

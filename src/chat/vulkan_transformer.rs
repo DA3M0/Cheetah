@@ -1,3 +1,4 @@
+use crate::chat::moe::select_experts;
 use crate::color::{self, Color};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde_json::Value;
@@ -15,11 +16,11 @@ pub(crate) struct VulkanTransformerConfig {
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    head_dim: usize,
+    pub(crate) head_dim: usize,
     max_position_embeddings: usize,
     rms_norm_eps: f32,
     rope_theta: f32,
-    sliding_window: usize,
+    pub(crate) sliding_window: usize,
     activation: Activation,
     pub(crate) features: TransformerFeatures,
 }
@@ -177,6 +178,20 @@ impl VulkanTransformerConfig {
             .transpose()
             .map_err(|_| "sliding_window does not fit usize.".to_string())?
             .unwrap_or(max_position_embeddings);
+        // Sparse (sliding-window) attention is gated by `use_sliding_window`
+        // (default true, matching the Hugging Face configs). A disabled window
+        // resolves to 0, which the attention shader reads as "attend to every
+        // cached position" — the same full-attention path a missing
+        // `sliding_window` takes above.
+        let sliding_window = if raw
+            .get("use_sliding_window")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            sliding_window
+        } else {
+            0
+        };
         let activation = match raw.get("hidden_act").and_then(Value::as_str) {
             Some("silu") => Activation::Silu,
             Some("gelu") => Activation::Gelu,
@@ -187,6 +202,17 @@ impl VulkanTransformerConfig {
                 ));
             }
         };
+        // Rope scaling (linear / dynamic / llama3 / ...) is not implemented by
+        // the rotary operator: a checkpoint that requires it must fail loudly
+        // instead of rotating every position with the base theta.
+        if raw
+            .get("rope_scaling")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(format!(
+                "Vulkan {model_name} does not support RoPE scaling."
+            ));
+        }
         if let TransformerFeedForwardFeatures::MixtureOfExperts {
             num_local_experts, num_experts_per_tok, ..
         } = &features.feed_forward
@@ -911,39 +937,6 @@ fn apply_activation(activation: Activation, gate: &[f32], up: &[f32]) -> Result<
     }
 }
 
-fn select_experts(logits: &[f32], num_experts_per_tok: usize) -> Result<Vec<(usize, f32)>, String> {
-    if logits.is_empty() || num_experts_per_tok == 0 || num_experts_per_tok > logits.len() {
-        return Err("Invalid MoE router logits or expert count.".into());
-    }
-    if logits.iter().any(|logit| !logit.is_finite()) {
-        return Err("MoE router produced a non-finite score.".into());
-    }
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let probabilities = logits
-        .iter()
-        .map(|logit| (logit - max).exp())
-        .collect::<Vec<_>>();
-    let denominator: f32 = probabilities.iter().sum();
-    if !denominator.is_finite() || denominator <= 0.0 {
-        return Err("MoE router probability normalization failed.".into());
-    }
-    let mut order = (0..logits.len()).collect::<Vec<_>>();
-    order.sort_by(|left, right| logits[*right].total_cmp(&logits[*left]));
-    let mut selected = order
-        .into_iter()
-        .take(num_experts_per_tok)
-        .map(|index| (index, probabilities[index] / denominator))
-        .collect::<Vec<_>>();
-    let selected_sum: f32 = selected.iter().map(|(_, weight)| weight).sum();
-    if !selected_sum.is_finite() || selected_sum <= 0.0 {
-        return Err("MoE selected expert weights could not be normalized.".into());
-    }
-    for (_, weight) in &mut selected {
-        *weight /= selected_sum;
-    }
-    Ok(selected)
-}
-
 #[derive(Clone)]
 struct Layer {
     input_norm: WeightData,
@@ -1196,27 +1189,19 @@ impl VulkanTransformerExecutor {
                 post_attention_norm
             };
             let attention = format!("{prefix}.{}", layout.attention_prefix);
-            let q_norm = if config.features.qk_norm {
-                Some(
-                    take_weight(
-                        &mut weights,
-                        &format!("{attention}.{}.weight", layout.q_norm),
-                        &[head_dim],
-                    )?
-                    .data,
-                )
+            // Per-head QK norms: required when the family declares them, and
+            // otherwise picked up from the checkpoint whenever the tensors are
+            // present (Qwen3 ships q_norm/k_norm without every config flagging
+            // it — the native backend resolves the same way, by presence).
+            let q_norm_name = format!("{attention}.{}.weight", layout.q_norm);
+            let k_norm_name = format!("{attention}.{}.weight", layout.k_norm);
+            let q_norm = if config.features.qk_norm || weights.contains_key(&q_norm_name) {
+                Some(take_weight(&mut weights, &q_norm_name, &[head_dim])?.data)
             } else {
                 None
             };
-            let k_norm = if config.features.qk_norm {
-                Some(
-                    take_weight(
-                        &mut weights,
-                        &format!("{attention}.{}.weight", layout.k_norm),
-                        &[head_dim],
-                    )?
-                    .data,
-                )
+            let k_norm = if config.features.qk_norm || weights.contains_key(&k_norm_name) {
+                Some(take_weight(&mut weights, &k_norm_name, &[head_dim])?.data)
             } else {
                 None
             };
@@ -2090,26 +2075,6 @@ mod tests {
             lm_head: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
             expert_residency: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn moe_router_selects_top_experts_and_renormalizes_weights() {
-        let selected = select_experts(&[0.0, 1.0, 2.0, -3.0], 2).unwrap();
-        assert_eq!(
-            selected.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-            [2, 1]
-        );
-        let total: f32 = selected.iter().map(|(_, weight)| weight).sum();
-        assert!((total - 1.0).abs() < 1e-6);
-        assert!(selected[0].1 > selected[1].1);
-    }
-
-    #[test]
-    fn moe_router_rejects_invalid_scores_and_expert_count() {
-        assert!(select_experts(&[], 1).is_err());
-        assert!(select_experts(&[1.0], 0).is_err());
-        assert!(select_experts(&[1.0], 2).is_err());
-        assert!(select_experts(&[f32::NAN], 1).is_err());
     }
 
     #[test]

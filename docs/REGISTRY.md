@@ -41,8 +41,15 @@ Resolution order at load time:
    - native-capable architectures: `llama`, `mixtral`, `qwen2`, `qwen3` → native
      mmap backend (mixtral carries the mixture-of-experts feed-forward; the
      native forward implements the router + top-k experts)
-   - Vulkan-only families: `gemma`, `mistral`, `phi` → Vulkan executor (mixtral
-     is additionally Vulkan-capable with MoE routing)
+   - Vulkan-capable architectures: `vulkan_backends()` — llama / qwen2 / qwen3
+     / gemma / mistral / mixtral / phi. gemma, mistral and phi are
+     Vulkan-only (no native backend); mixtral carries MoE routing on both
+     backends.
+   - The Vulkan load path (`load_vulkan_or_fallback`) guards on
+     `architecture_has_backend(arch, "vulkan")` and then dispatches through
+     `vulkan_loader_for_architecture(arch) -> Option<BackendLoader>` — the
+     capability table and the loader table are asserted to agree by
+     `vulkan_capability_table_and_loader_table_agree`.
    - `backend_loader_for_architecture(arch, backend) -> Option<BackendLoader>`
    - `registered_backends(arch)` → e.g. `["native", "vulkan"]` / `["vulkan"]`
 4. Resolve family fallback constants via `family_for_architecture(arch)` for
@@ -56,6 +63,9 @@ Architectures are normalized (lowercase + `ForCausalLM` suffix stripped) so
 - `native_backends()` — architectures served by the native mmap + Ant tiering backend
   (`llama`, `mixtral`, `qwen2`, `qwen3`; mixtral carries the MoE feed-forward).
 - `vulkan_backends()` — architectures served by the Vulkan compute executor.
+- `vulkan_loader_for_architecture(architecture) -> Option<BackendLoader>` — the
+  Vulkan executor loader for one architecture (the dispatch half of the
+  Vulkan capability table; both halves are asserted to agree).
 - `registered_backends(architecture) -> Vec<&'static str>` — backend names served
   for one architecture.
 - `backend_loader_for_architecture(architecture, backend) -> Option<BackendLoader>`.
@@ -73,8 +83,11 @@ Architectures are normalized (lowercase + `ForCausalLM` suffix stripped) so
 
 1. Add the runtime implementation (`src/chat/models/<name>.rs` native runner or
    the Vulkan executor wiring in `src/chat/vulkan_transformer.rs`).
-2. Register backend capability: add to the native/vulkan backend tables and,
-   for native families, to the family constants + profile table.
+2. Register backend capability: add to the native/vulkan backend tables, add a
+   `vulkan_loader_for_architecture` arm when it has a Vulkan executor (the
+   `vulkan_capability_table_and_loader_table_agree` test keeps the two Vulkan
+   tables in step), and — for native families — add the family constants +
+   profile table.
 3. Add the chat template and stop markers to the resolution tables.
 4. Add backend capability tests in `src/chat/models/registry.rs` tests.
 

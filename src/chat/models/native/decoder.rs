@@ -22,6 +22,11 @@ pub struct DecoderConfig {
     pub rms_eps: f32,
     pub rope_theta: f32,
     pub tie_word_embeddings: bool,
+    /// Sparse (sliding-window) attention: keys older than this many positions
+    /// are masked out of the softmax. 0 disables the window (full attention),
+    /// which is what an absent `sliding_window` or a config that sets
+    /// `use_sliding_window: false` resolves to.
+    pub sliding_window: usize,
     /// Mixture-of-experts layout: number of experts (0 => dense feed-forward)
     /// and experts routed per token (0 => dense).
     pub num_local_experts: usize,
@@ -54,6 +59,22 @@ impl MoEExpertLayout {
         up: "w3",
         down: "w2",
     };
+
+    /// Router weight unit id for one layer. The units manifest stores full
+    /// tensor names, so the `.weight` suffix belongs to the unit id — the same
+    /// suffix the Vulkan loader appends to its layout strings.
+    pub fn router_unit(&self, prefix: &str) -> String {
+        format!("{prefix}{}.weight", self.router)
+    }
+
+    /// One expert projection's unit id for one layer (`projection` is `gate` /
+    /// `up` / `down` from this layout).
+    pub fn expert_unit(&self, prefix: &str, expert: usize, projection: &str) -> String {
+        format!(
+            "{prefix}{}.{}.{projection}.weight",
+            self.experts_prefix, expert
+        )
+    }
 }
 
 impl DecoderConfig {
@@ -62,7 +83,7 @@ impl DecoderConfig {
     /// tensor shapes, then the registered family constants. This keeps the
     /// native backend working when the model directory's config.json is
     /// missing or incomplete.
-    pub(super) fn resolve(
+    pub(crate) fn resolve(
         raw: Option<&Value>,
         store: &MmapWeightStore,
         family: Option<crate::chat::models::ModelFamily>,
@@ -86,6 +107,8 @@ impl DecoderConfig {
             tie_word_embeddings: false,
             profiles: &[],
             extra_config_json: "",
+            max_position_embeddings: None,
+            moe_layout: MoEExpertLayout::MIXTRAL,
         });
 
         let embed_shape = store
@@ -104,14 +127,43 @@ impl DecoderConfig {
         let k_out = store
             .unit_shape("model.layers.0.self_attn.k_proj.weight")
             .ok_or_else(|| "Native backend: units manifest has no k_proj tensor.".to_string())?[0];
-        let intermediate_size = field_u("intermediate_size").unwrap_or(
+        let moe_layout = family.moe_layout;
+        let expert_gate_unit = moe_layout.expert_unit("model.layers.0.", 0, moe_layout.gate);
+        let intermediate_size = field_u("intermediate_size").unwrap_or_else(|| {
             store
                 .unit_shape("model.layers.0.mlp.gate_proj.weight")
                 .map(|shape| shape[0])
-                .unwrap_or(0),
-        );
-        let num_local_experts = field_u("num_local_experts").unwrap_or(0);
+                // Sparse feed-forward: a sparse layer has no `mlp.*` units, so
+                // the first expert's gate row carries the intermediate size.
+                .or_else(|| store.unit_shape(&expert_gate_unit).map(|shape| shape[0]))
+                .unwrap_or(0)
+        });
+        if intermediate_size == 0 {
+            return Err(
+                "Native backend: cannot resolve the intermediate size from config.json or the units manifest."
+                    .into(),
+            );
+        }
+        // Expert counts: config first, then the layer-0 units manifest for the
+        // layer-wide count. Per-token `num_experts_per_tok` is config-only —
+        // tensor shapes cannot carry it — so a sparse manifest without it fails
+        // loudly instead of silently taking the dense feed-forward path.
+        let num_local_experts =
+            field_u("num_local_experts").unwrap_or_else(|| count_layer_experts(store, &moe_layout));
         let num_experts_per_tok = field_u("num_experts_per_tok").unwrap_or(0);
+        if num_local_experts > 0 && num_experts_per_tok == 0 {
+            return Err(format!(
+                "Native backend: the units manifest carries {num_local_experts} experts but num_experts_per_tok is not declared; keep config.json in the prepared directory so expert routing can be resolved."
+            ));
+        }
+        // Sparse attention: honor `use_sliding_window` (default true, the
+        // Hugging Face convention). A disabled window — or a family that never
+        // declares one — resolves to 0, i.e. attend to the whole cache.
+        let sliding_window = if field_b("use_sliding_window").unwrap_or(true) {
+            field_u("sliding_window").unwrap_or(0)
+        } else {
+            0
+        };
 
         let (q_heads, kv_heads, head_dim) = match field_u("num_attention_heads") {
             Some(q_heads) => {
@@ -151,11 +203,30 @@ impl DecoderConfig {
             rope_theta: field_f("rope_theta").unwrap_or(family.rope_theta) as f32,
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
+            sliding_window,
             num_local_experts,
             num_experts_per_tok,
-            moe_layout: MoEExpertLayout::MIXTRAL,
+            moe_layout,
         })
     }
+}
+
+/// Layer-0 expert count read back from the units manifest (sparse manifests
+/// name experts `<experts_prefix>.<index>.<projection>.weight`).
+fn count_layer_experts(store: &MmapWeightStore, layout: &MoEExpertLayout) -> usize {
+    let prefix = format!("model.layers.0.{}.", layout.experts_prefix);
+    let suffix = format!(".{}.weight", layout.gate);
+    store
+        .unit_ids()
+        .filter(|unit_id| unit_id.starts_with(&prefix) && unit_id.ends_with(&suffix))
+        .filter_map(|unit_id| {
+            unit_id[prefix.len()..unit_id.len() - suffix.len()]
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map(|highest| highest + 1)
+        .unwrap_or(0)
 }
 
 /// Slice borrows come from `store` (a field) while activations live in
@@ -363,11 +434,6 @@ impl DecoderNative {
         let (o_weight, o_dtype, _) = self
             .store
             .slice(&format!("{prefix}self_attn.o_proj.weight"))?;
-        let (gate_weight, gate_dtype, _) =
-            self.store.slice(&format!("{prefix}mlp.gate_proj.weight"))?;
-        let (up_weight, up_dtype, _) = self.store.slice(&format!("{prefix}mlp.up_proj.weight"))?;
-        let (down_weight, down_dtype, _) =
-            self.store.slice(&format!("{prefix}mlp.down_proj.weight"))?;
 
         self.scratch.q.clear();
         self.scratch.q.resize(cfg.q_heads * cfg.head_dim, 0.0);
@@ -479,13 +545,24 @@ impl DecoderNative {
             .attn_out
             .resize(cfg.q_heads * cfg.head_dim, 0.0);
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+        // Sparse (sliding-window) attention: the query at `position` only sees
+        // keys from `end - window` onward (`end` is one past this position),
+        // matching the Vulkan attention shader. window == 0 attends to the
+        // whole cache.
+        let window_start = if cfg.sliding_window == 0 {
+            0
+        } else {
+            (position + 1).saturating_sub(cfg.sliding_window)
+        };
+        // Never start past the cache: an all-masked softmax would be NaN.
+        let window_start = window_start.min(cache_len.saturating_sub(1));
         for head in 0..cfg.q_heads {
             let kv_head = head / head_group;
             let q_base = head * cfg.head_dim;
             let kv_base = kv_head * cfg.head_dim;
             self.scratch.scores.clear();
             self.scratch.scores.resize(cache_len, f32::NEG_INFINITY);
-            for pos in 0..cache_len {
+            for pos in window_start..cache_len {
                 let k_base = pos * kv_dim + kv_base;
                 let score: f32 = self.kv_k[layer][k_base..k_base + cfg.head_dim]
                     .iter()
@@ -498,7 +575,7 @@ impl DecoderNative {
             if head == 0 && self.debug_capture_layer0_attn {
                 self.head0_scores = self.scratch.scores.clone();
             }
-            for pos in 0..cache_len {
+            for pos in window_start..cache_len {
                 let weight = self.scratch.scores[pos];
                 if weight == 0.0 {
                     continue;
@@ -545,6 +622,7 @@ impl DecoderNative {
         }
 
         // --- MLP block ---
+        // Apply post-attention layernorm before feed-forward
         self.scratch.normed.clear();
         self.scratch.normed.extend_from_slice(&self.scratch.hidden);
         {
@@ -553,121 +631,140 @@ impl DecoderNative {
                 .slice(&format!("{prefix}post_attention_layernorm.weight"))?;
             kernels::rmsnorm(&mut self.scratch.normed, weight, dtype, cfg.rms_eps);
         }
+
+        // Dense vs MoE branch: detected by expert counts from config.
+        // This runtime check is negligible overhead and enables clean code paths
+        // for both architectures without compile-time specialization.
         if cfg.num_local_experts > 0 && cfg.num_experts_per_tok > 0 {
-            // --- Mixture-of-experts block ---
-            self.scratch.router.clear();
-            self.scratch.router.resize(cfg.num_local_experts, 0.0);
-            let (router_weight, router_dtype, _) = self
-                .store
-                .slice(&format!("{}{}", prefix, cfg.moe_layout.router))?;
-            kernels::gemv(
-                router_weight,
-                router_dtype,
-                cfg.num_local_experts,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.router,
-            );
-            let mut order: Vec<usize> = (0..cfg.num_local_experts).collect();
-            order.sort_by(|&a, &b| {
-                let left = self.scratch.router.get(b).copied().unwrap_or(0.0);
-                let right = self.scratch.router.get(a).copied().unwrap_or(0.0);
-                right.partial_cmp(&left).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let num_experts_per_tok = cfg.num_experts_per_tok.min(cfg.num_local_experts);
-            let selected: Vec<usize> = order.into_iter().take(num_experts_per_tok).collect();
-
-            // RC2-B: routing-aware per-expert residency. Experts the current
-            // router selection no longer picks for this layer are evicted;
-            // freshly picked experts are paged in. State is keyed per
-            // (layer, expert) so it holds across positions and generation steps.
-            for expert in 0..cfg.num_local_experts {
-                let key = (layer, expert);
-                let was_resident = self.expert_residency.get(&key).copied().unwrap_or(false);
-                if was_resident && !selected.contains(&expert) {
-                    self.set_expert_resident(layer, expert, false);
-                    self.expert_residency.insert(key, false);
-                }
-            }
-            for &expert in &selected {
-                let key = (layer, expert);
-                if !self.expert_residency.get(&key).copied().unwrap_or(false) {
-                    self.set_expert_resident(layer, expert, true);
-                    self.expert_residency.insert(key, true);
-                }
-            }
-
-            for expert in selected {
-                let (gate_weight, gate_dtype, _) = self
-                    .store
-                    .slice(&format!(
-                        "{}{}.{}.{}",
-                        prefix,
-                        cfg.moe_layout.experts_prefix,
-                        expert,
-                        cfg.moe_layout.gate
-                    ))?;
-                let (up_weight, up_dtype, _) = self
-                    .store
-                    .slice(&format!(
-                        "{}{}.{}.{}",
-                        prefix,
-                        cfg.moe_layout.experts_prefix,
-                        expert,
-                        cfg.moe_layout.up
-                    ))?;
-                let (down_weight, down_dtype, _) = self
-                    .store
-                    .slice(&format!(
-                        "{}{}.{}.{}",
-                        prefix,
-                        cfg.moe_layout.experts_prefix,
-                        expert,
-                        cfg.moe_layout.down
-                    ))?;
-                self.scratch.gate.clear();
-                self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-                kernels::gemv(
-                    gate_weight,
-                    gate_dtype,
-                    cfg.intermediate_size,
-                    cfg.hidden_size,
-                    &self.scratch.normed,
-                    &mut self.scratch.gate,
-                );
-                self.scratch.up.clear();
-                self.scratch.up.resize(cfg.intermediate_size, 0.0);
-                kernels::gemv(
-                    up_weight,
-                    up_dtype,
-                    cfg.intermediate_size,
-                    cfg.hidden_size,
-                    &self.scratch.normed,
-                    &mut self.scratch.up,
-                );
-                kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
-                self.scratch.mlp_out.clear();
-                self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-                kernels::gemv(
-                    down_weight,
-                    down_dtype,
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    &self.scratch.gate,
-                    &mut self.scratch.mlp_out,
-                );
-                for (value, residual) in self
-                    .scratch
-                    .mlp_out
-                    .iter()
-                    .zip(self.scratch.hidden.iter_mut())
-                {
-                    *residual += *value;
-                }
-            }
-            return Ok(());
+            // Mixture-of-experts path with gating and expert selection
+            self.forward_moe_block(&prefix, layer)?;
+        } else {
+            // Dense MLP path: standard gated feed-forward without expert routing
+            self.forward_dense_mlp(&prefix)?;
         }
 
+        Ok(())
+    }
+
+    /// Forward pass for MoE blocks: router selection + top-k expert computation,
+    /// each selected expert mixed into the residual stream by its route weight.
+    fn forward_moe_block(&mut self, prefix: &str, layer: usize) -> Result<(), String> {
+        let cfg = &self.cfg;
+
+        // Router: compute expert scores from normalized hidden states
+        self.scratch.router.clear();
+        self.scratch.router.resize(cfg.num_local_experts, 0.0);
+        let (router_weight, router_dtype, _) =
+            self.store.slice(&cfg.moe_layout.router_unit(prefix))?;
+        kernels::gemv(
+            router_weight,
+            router_dtype,
+            cfg.num_local_experts,
+            cfg.hidden_size,
+            &self.scratch.normed,
+            &mut self.scratch.router,
+        );
+
+        // Router selection: softmax over the router logits, top-k by score,
+        // selected weights renormalized to one — the shared routing rule every
+        // backend uses (`chat::moe::select_experts`).
+        let num_experts_per_tok = cfg.num_experts_per_tok.min(cfg.num_local_experts);
+        let selected = crate::chat::moe::select_experts(&self.scratch.router, num_experts_per_tok)?;
+        let picked: Vec<usize> = selected.iter().map(|(expert, _)| *expert).collect();
+
+        // RC2-B: routing-aware per-expert residency management. Evict unused experts,
+        // page in newly selected ones. State keyed by (layer, expert) persists across positions.
+        for expert in 0..cfg.num_local_experts {
+            let key = (layer, expert);
+            let was_resident = self.expert_residency.get(&key).copied().unwrap_or(false);
+            if was_resident && !picked.contains(&expert) {
+                self.set_expert_resident(layer, expert, false);
+                self.expert_residency.insert(key, false);
+            }
+        }
+        for &expert in &picked {
+            let key = (layer, expert);
+            if !self.expert_residency.get(&key).copied().unwrap_or(false) {
+                self.set_expert_resident(layer, expert, true);
+                self.expert_residency.insert(key, true);
+            }
+        }
+
+        // Compute selected experts: gate*up activation, then down projection,
+        // scaled by the router's mixing weight for this token.
+        for (expert, route_weight) in selected {
+            let gate_unit = cfg
+                .moe_layout
+                .expert_unit(prefix, expert, cfg.moe_layout.gate);
+            let up_unit = cfg
+                .moe_layout
+                .expert_unit(prefix, expert, cfg.moe_layout.up);
+            let down_unit = cfg
+                .moe_layout
+                .expert_unit(prefix, expert, cfg.moe_layout.down);
+
+            let (gate_weight, gate_dtype, _) = self.store.slice(&gate_unit)?;
+            let (up_weight, up_dtype, _) = self.store.slice(&up_unit)?;
+            let (down_weight, down_dtype, _) = self.store.slice(&down_unit)?;
+
+            self.scratch.gate.clear();
+            self.scratch.gate.resize(cfg.intermediate_size, 0.0);
+            kernels::gemv(
+                gate_weight,
+                gate_dtype,
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                &self.scratch.normed,
+                &mut self.scratch.gate,
+            );
+
+            self.scratch.up.clear();
+            self.scratch.up.resize(cfg.intermediate_size, 0.0);
+            kernels::gemv(
+                up_weight,
+                up_dtype,
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                &self.scratch.normed,
+                &mut self.scratch.up,
+            );
+
+            kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
+
+            self.scratch.mlp_out.clear();
+            self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
+            kernels::gemv(
+                down_weight,
+                down_dtype,
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                &self.scratch.gate,
+                &mut self.scratch.mlp_out,
+            );
+
+            // Mix this expert into the residual stream, weighted by the
+            // router's probability for the token.
+            for (value, residual) in self
+                .scratch
+                .mlp_out
+                .iter()
+                .zip(self.scratch.hidden.iter_mut())
+            {
+                *residual += *value * route_weight;
+            }
+        }
+        Ok(())
+    }
+
+    /// Forward pass for dense MLP blocks: standard gated feed-forward.
+    /// This path has no expert routing overhead and is optimized for
+    /// pure dense architectures like Qwen3.
+    fn forward_dense_mlp(&mut self, prefix: &str) -> Result<(), String> {
+        let cfg = &self.cfg;
+
+        // Gate projection
+        let (gate_weight, gate_dtype, _) =
+            self.store.slice(&format!("{prefix}mlp.gate_proj.weight"))?;
         self.scratch.gate.clear();
         self.scratch.gate.resize(cfg.intermediate_size, 0.0);
         kernels::gemv(
@@ -678,6 +775,9 @@ impl DecoderNative {
             &self.scratch.normed,
             &mut self.scratch.gate,
         );
+
+        // Up projection
+        let (up_weight, up_dtype, _) = self.store.slice(&format!("{prefix}mlp.up_proj.weight"))?;
         self.scratch.up.clear();
         self.scratch.up.resize(cfg.intermediate_size, 0.0);
         kernels::gemv(
@@ -688,7 +788,13 @@ impl DecoderNative {
             &self.scratch.normed,
             &mut self.scratch.up,
         );
+
+        // SwiGLU activation: silu(gate) * up
         kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
+
+        // Down projection
+        let (down_weight, down_dtype, _) =
+            self.store.slice(&format!("{prefix}mlp.down_proj.weight"))?;
         self.scratch.mlp_out.clear();
         self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
         kernels::gemv(
@@ -699,6 +805,8 @@ impl DecoderNative {
             &self.scratch.gate,
             &mut self.scratch.mlp_out,
         );
+
+        // Add to residual stream
         for (value, residual) in self
             .scratch
             .mlp_out
@@ -791,18 +899,10 @@ impl DecoderNative {
     /// tiers; unit ids the store does not know are ignored.
     fn set_expert_resident(&self, layer: usize, expert: usize, resident: bool) {
         let prefix = format!("model.layers.{layer}.");
-        let gate_unit = format!(
-            "{}{}.{}.{}",
-            prefix, self.cfg.moe_layout.experts_prefix, expert, self.cfg.moe_layout.gate
-        );
-        let up_unit = format!(
-            "{}{}.{}.{}",
-            prefix, self.cfg.moe_layout.experts_prefix, expert, self.cfg.moe_layout.up
-        );
-        let down_unit = format!(
-            "{}{}.{}.{}",
-            prefix, self.cfg.moe_layout.experts_prefix, expert, self.cfg.moe_layout.down
-        );
+        let layout = &self.cfg.moe_layout;
+        let gate_unit = layout.expert_unit(&prefix, expert, layout.gate);
+        let up_unit = layout.expert_unit(&prefix, expert, layout.up);
+        let down_unit = layout.expert_unit(&prefix, expert, layout.down);
         if resident {
             self.store.set_tier(&gate_unit, Tier::Resident);
             self.store.set_tier(&up_unit, Tier::Resident);
@@ -842,3 +942,623 @@ fn add_bias(values: &mut [f32], bias_bytes: &[u8], dtype: WeightDType) {
     }
 }
 
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use crate::ant::CHEETAH_UNITS_FILENAME;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Feed-forward flavor of the fixture model.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FeedForward {
+        Dense,
+        /// Sparse block feed-forward: router + per-expert gate/up/down, no `mlp.*`.
+        SparseMoE,
+    }
+
+    /// Deterministic value pattern (no RNG): every tensor — and every token
+    /// embedding row — differs, so attention scores actually vary between
+    /// positions. Constant fixtures make every position look identical, which
+    /// would hide both a masking bug and a routing bug.
+    fn pattern(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| (index as f32 * 1.7 + seed).sin() * 0.35)
+            .collect()
+    }
+
+    struct FixtureUnit {
+        unit_id: &'static str,
+        shape: Vec<usize>,
+    }
+
+    impl FixtureUnit {
+        fn new(unit_id: &'static str, shape: Vec<usize>) -> Self {
+            Self { unit_id, shape }
+        }
+    }
+
+    fn units(feed_forward: FeedForward) -> Vec<FixtureUnit> {
+        let mut units = vec![
+            FixtureUnit::new("model.embed_tokens.weight", vec![32, 8]),
+            FixtureUnit::new("model.norm.weight", vec![8]),
+            FixtureUnit::new("model.layers.0.input_layernorm.weight", vec![8]),
+            FixtureUnit::new("model.layers.0.post_attention_layernorm.weight", vec![8]),
+            FixtureUnit::new("model.layers.0.self_attn.q_proj.weight", vec![8, 8]),
+            FixtureUnit::new("model.layers.0.self_attn.k_proj.weight", vec![8, 8]),
+            FixtureUnit::new("model.layers.0.self_attn.v_proj.weight", vec![8, 8]),
+            FixtureUnit::new("model.layers.0.self_attn.o_proj.weight", vec![8, 8]),
+        ];
+        match feed_forward {
+            FeedForward::Dense => {
+                units.push(FixtureUnit::new(
+                    "model.layers.0.mlp.gate_proj.weight",
+                    vec![12, 8],
+                ));
+                units.push(FixtureUnit::new(
+                    "model.layers.0.mlp.up_proj.weight",
+                    vec![12, 8],
+                ));
+                units.push(FixtureUnit::new(
+                    "model.layers.0.mlp.down_proj.weight",
+                    vec![8, 12],
+                ));
+            }
+            FeedForward::SparseMoE => {
+                units.push(FixtureUnit::new(
+                    "model.layers.0.block_sparse_moe.gate.weight",
+                    vec![2, 8],
+                ));
+                for expert in 0..2 {
+                    units.push(FixtureUnit::new(MOE_EXPERT_UNITS[expert].0, vec![12, 8]));
+                    units.push(FixtureUnit::new(MOE_EXPERT_UNITS[expert].1, vec![12, 8]));
+                    units.push(FixtureUnit::new(MOE_EXPERT_UNITS[expert].2, vec![8, 12]));
+                }
+            }
+        }
+        units
+    }
+
+    /// `(w1, w3, w2)` unit ids for the two fixture experts.
+    const MOE_EXPERT_UNITS: [(&str, &str, &str); 2] = [
+        (
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w3.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+        ),
+        (
+            "model.layers.0.block_sparse_moe.experts.1.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.1.w3.weight",
+            "model.layers.0.block_sparse_moe.experts.1.w2.weight",
+        ),
+    ];
+
+    fn tensors(feed_forward: FeedForward, patterned: bool) -> Vec<(String, Vec<f32>, Vec<usize>)> {
+        let values = |len: usize, seed: f32, constant: f32| {
+            if patterned {
+                pattern(len, seed)
+            } else {
+                vec![constant; len]
+            }
+        };
+        let mut tensors: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
+        tensors.push((
+            "model.embed_tokens.weight".into(),
+            values(256, 0.5, 0.1),
+            vec![32, 8],
+        ));
+        tensors.push(("model.norm.weight".into(), vec![1.0; 8], vec![8]));
+        tensors.push((
+            "model.layers.0.input_layernorm.weight".into(),
+            vec![1.0; 8],
+            vec![8],
+        ));
+        tensors.push((
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![1.0; 8],
+            vec![8],
+        ));
+        for (index, name) in [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tensors.push((name.into(), values(64, 0.7 + index as f32, 0.2), vec![8, 8]));
+        }
+        match feed_forward {
+            FeedForward::Dense => {
+                for name in [
+                    "model.layers.0.mlp.gate_proj.weight",
+                    "model.layers.0.mlp.up_proj.weight",
+                ] {
+                    tensors.push((name.into(), values(96, 1.3, 0.2), vec![12, 8]));
+                }
+                tensors.push((
+                    "model.layers.0.mlp.down_proj.weight".into(),
+                    values(96, 1.9, 0.2),
+                    vec![8, 12],
+                ));
+            }
+            FeedForward::SparseMoE => {
+                tensors.push((
+                    "model.layers.0.block_sparse_moe.gate.weight".into(),
+                    values(16, 2.5, 0.4),
+                    vec![2, 8],
+                ));
+                for (expert, names) in MOE_EXPERT_UNITS.into_iter().enumerate() {
+                    let specs: [(&'static str, [usize; 2], f32); 3] = [
+                        (names.0, [12, 8], 3.1),
+                        (names.1, [12, 8], 3.7),
+                        (names.2, [8, 12], 4.3),
+                    ];
+                    for (projection, (name, shape, seed)) in specs.into_iter().enumerate() {
+                        let len = shape[0] * shape[1];
+                        tensors.push((
+                            name.into(),
+                            values(len, seed + expert as f32 + projection as f32, 0.3),
+                            shape.to_vec(),
+                        ));
+                    }
+                }
+            }
+        }
+        tensors
+    }
+
+    /// Prepared-directory fixture: aligned safetensors shard + units manifest.
+    /// Dropping it removes the directory (including on a failed assertion).
+    struct Fixture {
+        dir: std::path::PathBuf,
+        store: Arc<MmapWeightStore>,
+        unit_ids: Vec<&'static str>,
+    }
+
+    impl Fixture {
+        fn new(name: &str, feed_forward: FeedForward, patterned: bool) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "cheetah_{name}_{}_{}",
+                std::process::id(),
+                nonce
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let fixture_units = units(feed_forward);
+            let shard_name = write_shard(&dir, tensors(feed_forward, patterned));
+            write_manifest(&dir, &shard_name, &fixture_units);
+            let store = Arc::new(MmapWeightStore::open(&dir).unwrap());
+            Self {
+                unit_ids: fixture_units.iter().map(|unit| unit.unit_id).collect(),
+                dir,
+                store,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn write_shard(dir: &std::path::Path, tensors: Vec<(String, Vec<f32>, Vec<usize>)>) -> String {
+        let views: Vec<(String, safetensors::tensor::TensorView<'static>)> = tensors
+            .into_iter()
+            .map(|(name, data, shape)| {
+                let mut bytes = Vec::with_capacity(data.len() * 4);
+                for value in &data {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                (
+                    name,
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, leaked)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let shard_dir = dir.join(".cheetah/weights");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let shard_name = "model-00001-of-00002.safetensors";
+        std::fs::write(
+            shard_dir.join(shard_name),
+            safetensors::serialize(views, None).unwrap(),
+        )
+        .unwrap();
+        shard_name.to_string()
+    }
+
+    fn write_manifest(dir: &std::path::Path, shard_name: &str, units: &[FixtureUnit]) {
+        let units_json: Vec<serde_json::Value> = units
+            .iter()
+            .map(|unit| {
+                let bytes = unit.shape.iter().product::<usize>() * 4;
+                serde_json::json!({
+                    "unit_id": unit.unit_id,
+                    "name": "layers_0",
+                    "dtype": "F32",
+                    "shape": unit.shape,
+                    "bytes": bytes,
+                    "source_file": shard_name,
+                    "source_offset": 0,
+                    "shard": shard_name,
+                    "layer_id": 0,
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.join(CHEETAH_UNITS_FILENAME),
+            serde_json::to_string(&units_json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn dense_config(sliding_window: usize) -> DecoderConfig {
+        DecoderConfig {
+            hidden_size: 8,
+            num_layers: 1,
+            q_heads: 2,
+            kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 12,
+            vocab_size: 32,
+            rms_eps: 1e-5,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: true,
+            sliding_window,
+            num_local_experts: 0,
+            num_experts_per_tok: 0,
+            moe_layout: MoEExpertLayout::MIXTRAL,
+        }
+    }
+
+    fn moe_config(num_experts_per_tok: usize) -> DecoderConfig {
+        DecoderConfig {
+            sliding_window: 0,
+            num_local_experts: 2,
+            num_experts_per_tok,
+            ..dense_config(0)
+        }
+    }
+
+    fn logits_of(cfg: DecoderConfig, store: &Arc<MmapWeightStore>, tokens: &[u32]) -> Vec<f32> {
+        let mut decoder = DecoderNative::with_store(cfg, Arc::clone(store));
+        decoder.forward(tokens, 0).unwrap()
+    }
+
+    /// RC3 dense completion: the dense forward path must be parity-clean across
+    /// residency transitions — resident (fresh) -> evict to disk -> page back in
+    /// via the Ant tier control — and produce finite, deterministic logits.
+    #[test]
+    fn dense_forward_is_parity_clean_across_residency_transitions() {
+        let fixture = Fixture::new("dense_residency", FeedForward::Dense, false);
+        let mut decoder = DecoderNative::with_store(dense_config(0), Arc::clone(&fixture.store));
+        let tokens: Vec<u32> = vec![3];
+        let logits_first = decoder.forward(&tokens, 0).unwrap();
+        assert_eq!(logits_first.len(), 32);
+        assert!(logits_first.iter().all(|value| value.is_finite()));
+
+        for unit in &fixture.unit_ids {
+            decoder.evict_unit(unit);
+        }
+        decoder.clear_kv();
+        let logits_evicted = decoder.forward(&tokens, 0).unwrap();
+        assert_eq!(logits_first, logits_evicted);
+
+        for unit in &fixture.unit_ids {
+            decoder.page_in_unit(unit);
+        }
+        decoder.clear_kv();
+        let logits_paged_in = decoder.forward(&tokens, 0).unwrap();
+        assert_eq!(logits_first, logits_paged_in);
+    }
+
+    /// RC3 sparse/MoE completion: the router-selected experts follow the same
+    /// residency contract as the dense path — evict to disk, page back in —
+    /// with bit-identical logits before and after.
+    #[test]
+    fn moe_forward_is_parity_clean_across_residency_transitions() {
+        let fixture = Fixture::new("moe_residency_parity", FeedForward::SparseMoE, false);
+        let mut decoder = DecoderNative::with_store(moe_config(2), Arc::clone(&fixture.store));
+        let tokens: Vec<u32> = vec![3];
+        let logits_first = decoder.forward(&tokens, 0).unwrap();
+        assert_eq!(logits_first.len(), 32);
+        assert!(logits_first.iter().all(|value| value.is_finite()));
+        assert_eq!(decoder.expert_residency.get(&(0, 0)), Some(&true));
+        assert_eq!(decoder.expert_residency.get(&(0, 1)), Some(&true));
+
+        for unit in &fixture.unit_ids {
+            decoder.evict_unit(unit);
+        }
+        decoder.clear_kv();
+        assert_eq!(logits_first, decoder.forward(&tokens, 0).unwrap());
+
+        for unit in &fixture.unit_ids {
+            decoder.page_in_unit(unit);
+        }
+        decoder.clear_kv();
+        assert_eq!(logits_first, decoder.forward(&tokens, 0).unwrap());
+    }
+
+    /// The MoE block must mix the selected experts with the router's
+    /// probabilities: `residual + Σ softmax(router_logits)[top-k] * expert(x)`.
+    /// The reference below is written straight from the tensor math so a
+    /// missing or dropped route weight cannot agree with it.
+    #[test]
+    fn moe_block_mixes_selected_experts_by_router_weight() {
+        let fixture = Fixture::new("moe_block", FeedForward::SparseMoE, true);
+        let cfg = moe_config(2);
+        let mut decoder = DecoderNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let input: Vec<f32> = pattern(8, 3.25);
+        let base: Vec<f32> = pattern(8, -1.5);
+        decoder.scratch.normed.clear();
+        decoder.scratch.normed.extend_from_slice(&input);
+        decoder.scratch.hidden.clear();
+        decoder.scratch.hidden.extend_from_slice(&base);
+        decoder
+            .forward_moe_block("model.layers.0.", 0)
+            .expect("moe block forward");
+
+        let layout = &cfg.moe_layout;
+        let prefix = "model.layers.0.";
+        let (router, router_dtype, _) = fixture
+            .store
+            .slice(&layout.router_unit(prefix))
+            .expect("router weight");
+        let mut router_logits = vec![0.0f32; cfg.num_local_experts];
+        for expert in 0..cfg.num_local_experts {
+            for (column, value) in input.iter().enumerate() {
+                router_logits[expert] +=
+                    kernels::scalar_at(router, expert * 8 + column, router_dtype) * value;
+            }
+        }
+        let max = router_logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = router_logits
+            .iter()
+            .map(|logit| (logit - max).exp())
+            .collect();
+        let sum: f32 = exps.iter().sum();
+        let weights: Vec<f32> = exps.iter().map(|value| value / sum).collect();
+        assert!(
+            weights.iter().any(|weight| (weight - 1.0).abs() > 0.1),
+            "fixture router must not be one-hot or uniform; weights {weights:?} cannot prove weighting"
+        );
+
+        let mut expected = base.clone();
+        let mut expected_unweighted = base.clone();
+        for (expert, weight) in weights.iter().enumerate() {
+            let gate_bytes = fixture
+                .store
+                .slice(&layout.expert_unit(prefix, expert, layout.gate))
+                .unwrap()
+                .0;
+            let up_bytes = fixture
+                .store
+                .slice(&layout.expert_unit(prefix, expert, layout.up))
+                .unwrap()
+                .0;
+            let down_bytes = fixture
+                .store
+                .slice(&layout.expert_unit(prefix, expert, layout.down))
+                .unwrap()
+                .0;
+            let mut gate = vec![0.0f32; 12];
+            let mut up = vec![0.0f32; 12];
+            for row in 0..12 {
+                for (column, value) in input.iter().enumerate() {
+                    gate[row] += f32::from_le_bytes(
+                        gate_bytes[(row * 8 + column) * 4..][..4]
+                            .try_into()
+                            .unwrap(),
+                    ) * value;
+                    up[row] += f32::from_le_bytes(
+                        up_bytes[(row * 8 + column) * 4..][..4].try_into().unwrap(),
+                    ) * value;
+                }
+            }
+            let activated: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(gate, up)| gate * (up / (1.0 + (-gate).exp())))
+                .collect();
+            let mut expert_output = vec![0.0f32; 8];
+            for row in 0..8 {
+                for (column, value) in activated.iter().enumerate() {
+                    expert_output[row] += f32::from_le_bytes(
+                        down_bytes[(row * 12 + column) * 4..][..4]
+                            .try_into()
+                            .unwrap(),
+                    ) * value;
+                }
+            }
+            for (value, (weighted, plain)) in expert_output
+                .iter()
+                .zip(expected.iter_mut().zip(expected_unweighted.iter_mut()))
+            {
+                *weighted += value * weight;
+                *plain += value;
+            }
+        }
+
+        for (index, (actual, reference)) in decoder
+            .scratch
+            .hidden
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+        {
+            assert!(
+                (actual - reference).abs() < 1e-5,
+                "expert mix mismatch at {index}: {actual} vs {reference}"
+            );
+        }
+        let contribution = expected
+            .iter()
+            .zip(base.iter())
+            .map(|(value, residual)| (value - residual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            contribution > 1e-6,
+            "fixture experts must actually contribute to the residual"
+        );
+        let unweighted_delta = decoder
+            .scratch
+            .hidden
+            .iter()
+            .zip(expected_unweighted.iter())
+            .map(|(actual, reference)| (actual - reference).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            unweighted_delta > contribution * 0.1,
+            "route weights were not applied: delta {unweighted_delta} against contribution {contribution}"
+        );
+    }
+
+    /// RC2-B contract on the native backend: whoever the router picks becomes
+    /// resident, and the expert it moved away from is evicted to disk.
+    #[test]
+    fn moe_router_drives_per_expert_residency_transitions() {
+        let fixture = Fixture::new("moe_router_residency", FeedForward::SparseMoE, true);
+        let mut decoder = DecoderNative::with_store(moe_config(1), Arc::clone(&fixture.store));
+        let mut token_for_expert: [Option<u32>; 2] = [None, None];
+        for token in 0..fixture.unit_ids.len() as u32 {
+            decoder.clear_kv();
+            decoder.forward(&[token], 0).unwrap();
+            for expert in 0..2 {
+                if decoder.expert_residency.get(&(0, expert)) == Some(&true) {
+                    token_for_expert[expert] = Some(token);
+                }
+            }
+            if token_for_expert.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let token_expert0 = token_for_expert[0].expect("fixture router never selected expert 0");
+        let token_expert1 = token_for_expert[1].expect("fixture router never selected expert 1");
+
+        let layout = &decoder.cfg.moe_layout;
+        let expert0 = layout.expert_unit("model.layers.0.", 0, layout.gate);
+        let expert1 = layout.expert_unit("model.layers.0.", 1, layout.gate);
+
+        decoder.clear_kv();
+        decoder.forward(&[token_expert0], 0).unwrap();
+        assert_eq!(decoder.expert_residency.get(&(0, 0)), Some(&true));
+        assert_eq!(fixture.store.tier(&expert0), Tier::Resident);
+
+        decoder.clear_kv();
+        decoder.forward(&[token_expert1], 0).unwrap();
+        assert_eq!(
+            decoder.expert_residency.get(&(0, 0)),
+            Some(&false),
+            "expert 0 must be evicted once the router moves away from it"
+        );
+        assert_eq!(decoder.expert_residency.get(&(0, 1)), Some(&true));
+        assert_eq!(fixture.store.tier(&expert0), Tier::Disk);
+        assert_eq!(fixture.store.tier(&expert1), Tier::Resident);
+
+        // The evicted expert still computes: pages re-fault on read.
+        decoder.clear_kv();
+        let logits = decoder.forward(&[token_expert0], 0).unwrap();
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(decoder.expert_residency.get(&(0, 0)), Some(&true));
+    }
+
+    /// Sparse attention: a query only attends inside its window. At position 4
+    /// with window 4 the key at position 0 (distance 4) is masked out of the
+    /// softmax entirely; with the window disabled every key contributes.
+    #[test]
+    fn sparse_attention_masks_positions_outside_the_window() {
+        let fixture = Fixture::new("sparse_window", FeedForward::Dense, true);
+        let tokens: Vec<u32> = (0..5).collect();
+
+        let mut windowed = DecoderNative::with_store(dense_config(4), Arc::clone(&fixture.store));
+        let capture = windowed.debug_attention_out(&tokens).unwrap();
+        assert_eq!(capture.scores.len(), tokens.len());
+        assert_eq!(capture.scores[0], 0.0, "position 0 sits outside the window");
+        assert!(capture.scores[1..].iter().all(|score| *score > 0.0));
+        let total: f32 = capture.scores.iter().sum();
+        assert!((total - 1.0).abs() < 1e-5);
+
+        let mut full = DecoderNative::with_store(dense_config(0), fixture.store.clone());
+        let capture = full.debug_attention_out(&tokens).unwrap();
+        assert!(capture.scores[0] > 0.0, "no window means full attention");
+    }
+
+    /// A window at least as wide as the sequence is full attention; a narrower
+    /// window changes the emitted logits.
+    #[test]
+    fn sparse_window_changes_the_logits_only_when_it_cuts_the_cache() {
+        let fixture = Fixture::new("sparse_logits", FeedForward::Dense, true);
+        let tokens: Vec<u32> = (0..8).collect();
+        let full = logits_of(dense_config(0), &fixture.store, &tokens);
+        let wide = logits_of(dense_config(64), &fixture.store, &tokens);
+        let narrow = logits_of(dense_config(3), &fixture.store, &tokens);
+        assert!(full.iter().all(|value| value.is_finite()));
+        assert_eq!(full, wide, "a window beyond the sequence must not mask");
+        assert_ne!(full, narrow, "a 3-wide window must mask older keys");
+    }
+
+    /// Parameter chain for the sparse/MoE fields: config first, then the units
+    /// manifest, and a sparse manifest without `num_experts_per_tok` fails
+    /// loudly instead of silently taking the dense feed-forward path.
+    #[test]
+    fn decoder_config_resolves_sparse_window_and_moe_expert_fields() {
+        let fixture = Fixture::new("resolve_moe", FeedForward::SparseMoE, false);
+        let base = serde_json::json!({
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 12,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "sliding_window": 4096,
+            "use_sliding_window": false
+        });
+        let cfg = DecoderConfig::resolve(Some(&base), &fixture.store, None).unwrap();
+        assert_eq!(cfg.num_local_experts, 2);
+        assert_eq!(cfg.num_experts_per_tok, 1);
+        assert_eq!(cfg.intermediate_size, 12);
+        assert_eq!(cfg.head_dim, 4);
+        assert_eq!(
+            cfg.sliding_window, 0,
+            "use_sliding_window: false disables the sparse window"
+        );
+
+        let mut enabled = base.clone();
+        enabled["use_sliding_window"] = serde_json::json!(true);
+        enabled["sliding_window"] = serde_json::json!(4);
+        let cfg = DecoderConfig::resolve(Some(&enabled), &fixture.store, None).unwrap();
+        assert_eq!(cfg.sliding_window, 4);
+
+        // Top-k is config-only, so a sparse manifest without it must error.
+        let mut routed = base.clone();
+        routed
+            .as_object_mut()
+            .unwrap()
+            .remove("num_experts_per_tok");
+        let error = DecoderConfig::resolve(Some(&routed), &fixture.store, None)
+            .err()
+            .expect("sparse manifest without top-k must not resolve");
+        assert!(error.contains("num_experts_per_tok"), "{error}");
+
+        // Without any expert fields the layer-wide count comes from the units
+        // manifest (and the intermediate size from an expert's gate rows).
+        let mut derived = base.clone();
+        derived.as_object_mut().unwrap().remove("num_local_experts");
+        derived.as_object_mut().unwrap().remove("intermediate_size");
+        let cfg = DecoderConfig::resolve(Some(&derived), &fixture.store, None).unwrap();
+        assert_eq!(cfg.num_local_experts, 2);
+        assert_eq!(cfg.intermediate_size, 12);
+    }
+}

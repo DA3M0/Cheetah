@@ -76,7 +76,8 @@ impl Clone for Box<dyn ModelRuntime> {
 /// `registry`; selection happens by backend name.
 #[derive(Clone, Copy)]
 pub(super) enum BackendLoader {
-    /// Vulkan compute path: receives the aligned shard paths.
+    /// Vulkan compute path: receives the aligned shard paths. Only built when
+    /// the `vulkan` feature is compiled in (`vulkan_loader_for_architecture`).
     #[allow(dead_code)]
     Vulkan(
         fn(
@@ -119,6 +120,14 @@ pub(super) struct ModelFamily {
     /// require (e.g. hidden_act / sliding_window), merged into a synthesized
     /// config when the model directory has none. Empty JSON object or "" = none.
     pub(super) extra_config_json: &'static str,
+    /// Family-level default context length (`max_position_embeddings`). `None`
+    /// means the family declares no default; config.json / the units manifest
+    /// then govern (with a generic fallback in the engine).
+    pub(super) max_position_embeddings: Option<usize>,
+    /// Sparse-MoE expert naming layout for this family (Mixtral-compatible
+    /// defaults). Drives router + expert weight slicing so the native forward
+    /// never hardcodes one architecture's naming.
+    pub(super) moe_layout: native::decoder::MoEExpertLayout,
 }
 
 impl ModelFamily {

@@ -28,6 +28,7 @@ cheetah/
 │   │   ├── mod.rs              chat entry (chat()), model_metadata_for_init
 │   │   ├── engine.rs           ★ Engine: load pipeline, generation loop, Ant hooks, sampling
 │   │   ├── context.rs          conversation archive/store (persistence)
+│   │   ├── moe.rs              shared MoE routing (`select_experts`: softmax → top-k → renormalize)
 │   │   └── models/
 │   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + architecture resolution
 │   │       ├── registry.rs     backend capability tables (native/vulkan) + family constants + load dispatch
@@ -136,6 +137,8 @@ run_init_command      src/main.rs:90
 | `rmsnorm` / `rope_in_place` / `silu_multiply` / `softmax` | kernels.rs | elementwise/attention helpers |
 | `DecoderConfig::resolve` | decoder.rs | the parameter chain (config → units → family) |
 | `DecoderNative::forward` | decoder.rs | the decoder forward (see ANT_MEMORY §7.2) |
+| `forward_moe_block` / `forward_dense_mlp` | decoder.rs | sparse block: router → top-k experts mixed by route weight; dense gated MLP otherwise |
+| sliding-window attention (`window_start`) | decoder.rs | masks keys older than `sliding_window` (0 = full attention), same rule as `shared_ops.comp` |
 | `apply_tiers` / `page_in_unit` / `evict_unit` | decoder.rs | Ant tier application on real pages |
 | `native_family_loader` | mod.rs | native family loader (llama / mixtral / qwen2 / qwen3) |
 
@@ -156,7 +159,7 @@ run_init_command      src/main.rs:90
 |------|------|------|
 | `ModelRuntime` / `AntTierControl` | mod.rs | backend-agnostic boundary: `forward(&[u32], usize) -> Vec<f32>` + Ant tier control |
 | `BackendLoader` / `ModelFamily` | mod.rs | backend enum + family constants |
-| `backend_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | architecture-driven lookups |
+| `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | architecture-driven lookups |
 | `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
 | `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan_transformer.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
 
@@ -221,7 +224,7 @@ cargo build --release --features cuda     # Candle CUDA (needs CUDA toolkit)
 cargo build --release --features metal    # Candle Metal (macOS)
 
 cargo test                           # default feature tests (135)
-cargo test --features vulkan         # + Vulkan executor/shader tests (147)
+cargo test --features vulkan         # + Vulkan executor/shader tests (151 passed, 5 device-gated ignored)
 cargo test native_                   # all native-backend tests
 cargo test -- --test-threads=4       # parallel (some tests are timing-sensitive)
 ```
@@ -252,3 +255,25 @@ self-contained and runs anywhere.
 7. **`f32::sin_cos` returns `(sin, cos)`** — the historical rope bug.
 8. Backend capability assertions must be updated when
    a family gains/loses a backend.
+
+## Architecture support table
+
+| Architecture | Backends      | Type         | Notes                                          |
+|--------------|---------------|--------------|------------------------------------------------|
+| llama        | native+vulkan | Dense        | GQA, untied `lm_head`                          |
+| qwen2        | native+vulkan | Dense        | attention bias, tied embeddings                |
+| qwen3        | native+vulkan | Dense        | per-head q/k norm, GQA, tied embeddings        |
+| mixtral      | native+vulkan | MoE (num_experts_per_tok) | router + route-weighted expert mix, per-expert tiers |
+| gemma        | vulkan only   | Dense        | `(1 + weight)` norm multiply                   |
+| mistral      | vulkan only   | Dense        | sliding-window attention                       |
+| phi          | vulkan only   | Dense        | dedicated `VulkanPhiExecutor`                  |
+
+`native+vulkan` means both `backend_loader_for_architecture(arch, "native")` and
+the Vulkan load path (`vulkan_backends()` + `vulkan_loader_for_architecture`)
+resolve; the two Vulkan tables are asserted to agree by
+`vulkan_capability_table_and_loader_table_agree`.
+
+Sparse (sliding-window) attention and MoE routing are backend-agnostic: both
+runners resolve `use_sliding_window` / `sliding_window` the same way (`false`
+or `0` → attend to the whole cache) and route experts with
+`chat::moe::select_experts` (softmax → top-k → renormalize).

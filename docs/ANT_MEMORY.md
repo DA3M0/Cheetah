@@ -304,11 +304,14 @@ for each layer:
     [q_norm per head] [k_norm per head]         // qwen3-style, optional, pre-rope
     rope(q, pos), rope(k, pos)                  // rotate-half, matches the reference computation
     kv cache append (post-rope keys)
-    attention: GQA (q_heads/kv_heads groups), causal via cache length,
+    attention: GQA (q_heads/kv_heads groups), causal via cache length and the
+               sliding window (`window_start` masks keys outside the window),
                4-accumulator softmax-weighted value sum
     hidden += o_proj(attn_out)
     normed = rmsnorm(hidden, post_attention_layernorm)
-    hidden += down(silu(gate(normed)) ⊙ up(normed))
+    dense:   hidden += down(silu(gate(normed)) ⊙ up(normed))
+    MoE:     router logits → select_experts (softmax → top-k → renormalize)
+             hidden += Σ route_weight · down_e(silu(gate_e(normed)) ⊙ up_e(normed))
     drop_disk_units_of_layer(layer)             // Ant: release cold pages
 hidden = rmsnorm(hidden, model.norm)
 logits = lm_head(hidden)                        // tied → embed rows; untied → lm_head.weight
@@ -322,6 +325,19 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
   what lets one runner serve llama (no bias, untied), qwen2 (bias, tied) and
   qwen3 (no bias, q/k norms, tie varies).
 - **`DecoderConfig::resolve`** implements the parameter chain (§4).
+- **Sparse (sliding-window) attention**: `DecoderConfig.sliding_window`
+  resolves from `use_sliding_window` (default `true`) × `sliding_window`;
+  `window_start = position + 1 - window` (clamped so the softmax is never
+  all-masked) starts both the score and the accumulation loops, so keys older
+  than the window are never read. `window == 0` attends to the whole cache —
+  the same rule `shared_ops.comp` applies on Vulkan.
+- **MoE feed-forward**: `forward_moe_block` (vs `forward_dense_mlp`) — router
+  logits go through the shared `chat::moe::select_experts` rule (softmax over
+  all experts → top-k by logit → selected weights renormalized to 1), each
+  selected expert's down-projection joins the residual scaled by its route
+  weight, and per-(layer, expert) residency follows the selection. Unit ids
+  carry the full tensor name including the `.weight` suffix
+  (`MoEExpertLayout::router_unit` / `expert_unit`).
 - `forward` returns the final-position logits only (`Vec<f32>`), matching the
   backend-agnostic `ModelRuntime::forward(&[u32], usize)` boundary.
 
@@ -552,9 +568,13 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 ## 11. Adding a new family — checklist
 
 1. **Implement the forward differences** in the native runner (only the
-   deltas: e.g. gemma's `(1 + weight)` norm multiply, mistral's sliding
-   window, mixtral's router/experts). Reuse everything else. (mixtral now
-   ships the MoE router + per-token expert routing (`num_experts_per_tok`) in the native forward.)
+   deltas: e.g. gemma's `(1 + weight)` norm multiply). Reuse everything else.
+   Sliding-window attention and the MoE router/experts block are built into
+   the runner now — a sparse family only needs the config fields
+   (`use_sliding_window` / `sliding_window`, `num_local_experts`,
+   `num_experts_per_tok`) to resolve, and gets router + per-token expert
+   routing (`num_experts_per_tok`) plus route-weighted expert mixing for
+   free.
 2. **Extend `DecoderConfig::resolve`** if the family carries new config fields.
 3. **Wire the family into the native backend**: add the architecture to the
    native backend capability table and to `family_for_architecture` (which
@@ -586,8 +606,10 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   effective policy is tier-driven. RC2-A (MoE expert-parameter generality:
   expert naming and routing driven by configuration instead of Mixtral-only
   hardcoding) preceded it in the same RC2 sparse-architecture (MoE) milestone.
-- The C-side `eviction_policy` (`lru|clock|clock2`) is metadata only; the
-  native backend's effective policy is tier-driven.
+- Sparse attention window defaults differ by backend when the config omits
+  `sliding_window`: Vulkan falls back to `max_position_embeddings`, the native
+  runner resolves `0` (full attention). `use_sliding_window: false` resolves
+  to full attention on both backends.
 - Q8 quantization changes the numerics (per-row int8 bounds the error to
   ±max|w|/254 per weight). Outputs differ from BF16/F32 runs.
 - Vulkan resident bucket (DEVICE_LOCAL) requires the VRAM-tier bytes to fit

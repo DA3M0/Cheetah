@@ -2,6 +2,7 @@
 
 mod engine;
 mod models;
+pub(crate) mod moe;
 #[cfg(feature = "vulkan")]
 pub(crate) mod vulkan_transformer;
 
