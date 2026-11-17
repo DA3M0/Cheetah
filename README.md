@@ -225,7 +225,7 @@ On Windows, GPU builds under WSL2 additionally require the relevant GPU and driv
 
 The optional Vulkan feature uses native C compute operators for all registered architectures (Qwen2, Llama, Qwen3, Gemma, Mistral, Mixtral, Phi). See the beginner build guide above for the Vulkan build command and prerequisites. The compute shaders are compiled with `glslc`.
 
-**Supported weight precisions:** F32, F16, BF16, and **Q8** (row-wise int8 with per-row f32 scales, enabled by `CHEETAH_QUANT_Q8=1`). Q8 roughly halves the weight footprint compared to BF16. Mixtral uses the sparse-expert architecture with top-k routing. Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and stop with guidance (there is no silent CPU fallback). An error during active Vulkan inference is returned rather than silently switching devices.
+**Supported weight precisions:** F32, F16, BF16, and **Q8** (row-wise int8 with per-row f32 scales, enabled by `CHEETAH_QUANT_Q8=1`). Q8 roughly halves the weight footprint compared to BF16. Mixtral uses the sparse-expert architecture with per-token expert routing (`num_experts_per_tok`). Not every configuration is supported (for example, Vulkan Llama does not support RoPE scaling); unavailable devices or model initialization/loading errors report a diagnostic and stop with guidance (there is no silent CPU fallback). An error during active Vulkan inference is returned rather than silently switching devices.
 
 **Ant bucketed residency:** VRAM-tier weights are uploaded once into DEVICE_LOCAL memory (real VRAM); disk-tier weights stream through a HOST_COHERENT pool each step. Ant page-in/evict moves weights between the two buckets. On GPUs with small VRAM, oversized uploads automatically fall back to the streaming path per weight.
 
@@ -271,7 +271,7 @@ cheetah /path/to/model --system "You are a concise assistant."
 | `--ctx-size N` | 8192 | Context window size in tokens |
 | `--temperature F` | 0 | Sampling temperature; `0` uses deterministic greedy decoding |
 | `--top-p F` | 0.9 | Nucleus sampling threshold; used when temperature is greater than zero |
-| `--top-k N` | Disabled | Limit sampling to the top K candidates |
+| `--top-k N` | Disabled | Limit **sampling** to the top K candidates (0 disables; unrelated to MoE expert routing, which is model-configured) |
 | `--repeat-penalty F` | 1 (disabled) | Repetition penalty |
 | `--seed N` | Random | Seed for reproducible sampling |
 | `--system "..."` | Built-in concise assistant prompt | System prompt, injected at the beginning of the conversation |
@@ -428,7 +428,7 @@ The server loads one model at a time. Generation requests are queued in arrival 
 
 ## Supported models and limitations
 
-- **Inference:** Safetensors decoder models resolved for Qwen2, Llama, Qwen3 (native CPU backend, Ant-tiered), plus Mixtral (native CPU backend, Ant-tiered mixture-of-experts with top-k routing) and Gemma, Mistral, and Phi (independent Vulkan executor for all seven with F32, F16, BF16, or Q8 (row-wise int8) weights, subject to model configuration compatibility).
+- **Inference:** Safetensors decoder models resolved for Qwen2, Llama, Qwen3 (native CPU backend, Ant-tiered), plus Mixtral (native CPU backend, Ant-tiered mixture-of-experts with per-token expert routing via `num_experts_per_tok`) and Gemma, Mistral, and Phi (independent Vulkan executor for all seven with F32, F16, BF16, or Q8 (row-wise int8) weights, subject to model configuration compatibility).
 - **Inspection and preparation:** Safetensors model directories and weight files.
 - **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
 

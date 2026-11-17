@@ -574,8 +574,8 @@ impl DecoderNative {
                 let right = self.scratch.router.get(a).copied().unwrap_or(0.0);
                 right.partial_cmp(&left).unwrap_or(std::cmp::Ordering::Equal)
             });
-            let top_k = cfg.num_experts_per_tok.min(cfg.num_local_experts);
-            let selected: Vec<usize> = order.into_iter().take(top_k).collect();
+            let num_experts_per_tok = cfg.num_experts_per_tok.min(cfg.num_local_experts);
+            let selected: Vec<usize> = order.into_iter().take(num_experts_per_tok).collect();
 
             // RC2-B: routing-aware per-expert residency. Experts the current
             // router selection no longer picks for this layer are evicted;

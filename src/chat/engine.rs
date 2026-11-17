@@ -1547,6 +1547,7 @@ fn sample_token(
     }
     let mut order = (0..scores.len()).collect::<Vec<_>>();
     order.sort_unstable_by(|left, right| scores[*right].total_cmp(&scores[*left]));
+    // Generation sampling top-k over the full vocabulary (NOT MoE expert routing).
     if options.top_k > 0 && options.top_k < order.len() {
         order.truncate(options.top_k);
     }

@@ -107,8 +107,10 @@ pub(crate) enum TransformerFeedForwardFeatures {
     Dense,
     #[allow(dead_code)]
     MixtureOfExperts {
-        num_experts: usize,
-        top_k: usize,
+        /// Total experts in the layer (router output width).
+        num_local_experts: usize,
+        /// Experts routed per token (`num_experts_per_tok`; 0 disables routing).
+        num_experts_per_tok: usize,
         activation: Activation,
         router: &'static str,
         experts_prefix: &'static str,
@@ -186,9 +188,11 @@ impl VulkanTransformerConfig {
             }
         };
         if let TransformerFeedForwardFeatures::MixtureOfExperts {
-            num_experts, top_k, ..
+            num_local_experts, num_experts_per_tok, ..
         } = &features.feed_forward
-            && (*num_experts == 0 || *top_k == 0 || *top_k > *num_experts)
+            && (*num_local_experts == 0
+                || *num_experts_per_tok == 0
+                || *num_experts_per_tok > *num_local_experts)
         {
             return Err(format!(
                 "Vulkan {model_name} MoE expert counts are inconsistent."
@@ -789,7 +793,7 @@ enum FeedForward {
     MixtureOfExperts {
         router: Linear,
         experts: Vec<Expert>,
-        top_k: usize,
+        num_experts_per_tok: usize,
         activation: Activation,
     },
 }
@@ -818,7 +822,7 @@ impl FeedForward {
             Self::MixtureOfExperts {
                 router,
                 experts,
-                top_k,
+                num_experts_per_tok,
                 activation,
             } => {
                 let router_logits = router.forward(input, rows)?;
@@ -826,7 +830,7 @@ impl FeedForward {
                 let mut selected_by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts.len()];
                 for row in 0..rows {
                     let logits = &router_logits[row * experts.len()..(row + 1) * experts.len()];
-                    for (expert_index, route_weight) in select_experts(logits, *top_k)? {
+                    for (expert_index, route_weight) in select_experts(logits, *num_experts_per_tok)? {
                         selected_by_expert[expert_index].push((row, route_weight));
                     }
                 }
@@ -907,8 +911,8 @@ fn apply_activation(activation: Activation, gate: &[f32], up: &[f32]) -> Result<
     }
 }
 
-fn select_experts(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f32)>, String> {
-    if logits.is_empty() || top_k == 0 || top_k > logits.len() {
+fn select_experts(logits: &[f32], num_experts_per_tok: usize) -> Result<Vec<(usize, f32)>, String> {
+    if logits.is_empty() || num_experts_per_tok == 0 || num_experts_per_tok > logits.len() {
         return Err("Invalid MoE router logits or expert count.".into());
     }
     if logits.iter().any(|logit| !logit.is_finite()) {
@@ -927,7 +931,7 @@ fn select_experts(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f32)>, Str
     order.sort_by(|left, right| logits[*right].total_cmp(&logits[*left]));
     let mut selected = order
         .into_iter()
-        .take(top_k)
+        .take(num_experts_per_tok)
         .map(|index| (index, probabilities[index] / denominator))
         .collect::<Vec<_>>();
     let selected_sum: f32 = selected.iter().map(|(_, weight)| weight).sum();
@@ -964,7 +968,7 @@ pub(crate) struct VulkanTransformerExecutor {
     lm_head: WeightData,
     /// RC2-B: routing-aware per-expert residency, keyed by
     /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
-    /// router's top-k selections while a generation walks the layers.
+    /// router's expert selections while a generation walks the layers.
     expert_residency: HashMap<(usize, usize), bool>,
 }
 
@@ -1245,8 +1249,8 @@ impl VulkanTransformerExecutor {
                     activation: config.activation,
                 },
                 TransformerFeedForwardFeatures::MixtureOfExperts {
-                    num_experts,
-                    top_k,
+                    num_local_experts,
+                    num_experts_per_tok,
                     activation,
                     router,
                     experts_prefix,
@@ -1258,8 +1262,8 @@ impl VulkanTransformerExecutor {
                     plan,
                     &prefix,
                     config,
-                    *num_experts,
-                    *top_k,
+                    *num_local_experts,
+                    *num_experts_per_tok,
                     *activation,
                     router,
                     experts_prefix,
@@ -1461,8 +1465,8 @@ fn load_moe_feed_forward(
     plan: &BTreeMap<String, String>,
     prefix: &str,
     config: &VulkanTransformerConfig,
-    num_experts: usize,
-    top_k: usize,
+    num_local_experts: usize,
+    num_experts_per_tok: usize,
     activation: Activation,
     router_layout: &str,
     experts_layout: &str,
@@ -1475,11 +1479,11 @@ fn load_moe_feed_forward(
         plan,
         &format!("{prefix}.{router_layout}"),
         config.hidden_size,
-        num_experts,
+        num_local_experts,
         false,
     )?;
-    let mut experts = Vec::with_capacity(num_experts);
-    for index in 0..num_experts {
+    let mut experts = Vec::with_capacity(num_local_experts);
+    for index in 0..num_local_experts {
         let expert_prefix = format!("{prefix}.{experts_layout}.{index}");
         experts.push(Expert {
             gate: take_linear(
@@ -1511,7 +1515,7 @@ fn load_moe_feed_forward(
     Ok(FeedForward::MixtureOfExperts {
         router,
         experts,
-        top_k,
+        num_experts_per_tok,
         activation,
     })
 }
@@ -2042,27 +2046,27 @@ mod tests {
                 activation: Activation::Silu,
             },
             TransformerFeedForwardFeatures::MixtureOfExperts {
-                num_experts,
-                top_k,
+                num_local_experts,
+                num_experts_per_tok,
                 activation,
                 ..
             } => FeedForward::MixtureOfExperts {
                 router: Linear {
                     name: "router".into(),
                     input_size: 2,
-                    output_size: *num_experts,
+                    output_size: *num_local_experts,
                     weight: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
                     bias: None,
                     slot: None,
                 },
-                experts: (0..*num_experts)
+                experts: (0..*num_local_experts)
                     .map(|index| Expert {
                         gate: identity_linear(&format!("expert_{index}_gate"), 2),
                         up: identity_linear(&format!("expert_{index}_up"), 2),
                         down: identity_linear(&format!("expert_{index}_down"), 2),
                     })
                     .collect(),
-                top_k: *top_k,
+                num_experts_per_tok: *num_experts_per_tok,
                 activation: *activation,
             },
         };
@@ -2089,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn moe_router_selects_top_k_and_renormalizes_weights() {
+    fn moe_router_selects_top_experts_and_renormalizes_weights() {
         let selected = select_experts(&[0.0, 1.0, 2.0, -3.0], 2).unwrap();
         assert_eq!(
             selected.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
@@ -2101,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn moe_router_rejects_invalid_scores_and_k() {
+    fn moe_router_rejects_invalid_scores_and_expert_count() {
         assert!(select_experts(&[], 1).is_err());
         assert!(select_experts(&[1.0], 0).is_err());
         assert!(select_experts(&[1.0], 2).is_err());
@@ -2129,8 +2133,8 @@ mod tests {
 
         let mut features = TransformerFeatures::standard("Sparse");
         features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
-            num_experts: 8,
-            top_k: 2,
+            num_local_experts: 8,
+            num_experts_per_tok: 2,
             activation: Activation::Silu,
             router: "moe.router",
             experts_prefix: "moe.experts",
@@ -2142,15 +2146,15 @@ mod tests {
         assert!(matches!(
             config.features.feed_forward,
             TransformerFeedForwardFeatures::MixtureOfExperts {
-                num_experts: 8,
-                top_k: 2,
+                num_local_experts: 8,
+                num_experts_per_tok: 2,
                 ..
             }
         ));
 
         features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
-            num_experts: 2,
-            top_k: 3,
+            num_local_experts: 2,
+            num_experts_per_tok: 3,
             activation: Activation::Silu,
             router: "moe.router",
             experts_prefix: "moe.experts",
@@ -2201,8 +2205,8 @@ mod tests {
         });
         let mut features = TransformerFeatures::standard("Configured");
         features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
-            num_experts: 1,
-            top_k: 1,
+            num_local_experts: 1,
+            num_experts_per_tok: 1,
             activation: Activation::Silu,
             router: "router",
             experts_prefix: "experts",
@@ -2227,8 +2231,8 @@ mod tests {
             );
         }
         let TransformerFeedForwardFeatures::MixtureOfExperts {
-            num_experts,
-            top_k,
+            num_local_experts,
+            num_experts_per_tok,
             activation,
             router,
             experts_prefix,
@@ -2244,8 +2248,8 @@ mod tests {
             &BTreeMap::new(),
             "layers.0",
             &config,
-            *num_experts,
-            *top_k,
+            *num_local_experts,
+            *num_experts_per_tok,
             *activation,
             router,
             experts_prefix,
@@ -2260,7 +2264,7 @@ mod tests {
             FeedForward::MixtureOfExperts {
                 ref router,
                 ref experts,
-                top_k: 1,
+                num_experts_per_tok: 1,
                 ..
             } if router.name == "layers.0.router"
                 && experts[0].gate.name == "layers.0.experts.0.gate"
@@ -2291,8 +2295,8 @@ mod tests {
         let feed_forward_features = [
             TransformerFeedForwardFeatures::Dense,
             TransformerFeedForwardFeatures::MixtureOfExperts {
-                num_experts: 2,
-                top_k: 1,
+                num_local_experts: 2,
+                num_experts_per_tok: 1,
                 activation: Activation::Silu,
                 router: "moe.router",
                 experts_prefix: "moe.experts",

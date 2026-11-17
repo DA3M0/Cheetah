@@ -33,9 +33,9 @@ fn vulkan_config(
         required_usize,
     };
 
-    let num_experts = required_usize(raw_config, "num_local_experts")?;
-    let top_k = required_usize(raw_config, "num_experts_per_tok")?;
-    if top_k > num_experts {
+    let num_local_experts = required_usize(raw_config, "num_local_experts")?;
+    let num_experts_per_tok = required_usize(raw_config, "num_experts_per_tok")?;
+    if num_experts_per_tok > num_local_experts {
         return Err("Mixtral expert counts are inconsistent.".into());
     }
     let mut features = TransformerFeatures::standard("Mixtral");
@@ -44,8 +44,8 @@ fn vulkan_config(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
-        num_experts,
-        top_k,
+        num_local_experts,
+        num_experts_per_tok,
         activation: Activation::Silu,
         router: "block_sparse_moe.gate",
         experts_prefix: "block_sparse_moe.experts",
@@ -79,8 +79,8 @@ mod vulkan_tests {
         assert!(matches!(
             config.features.feed_forward,
             TransformerFeedForwardFeatures::MixtureOfExperts {
-                num_experts: 8,
-                top_k: 2,
+                num_local_experts: 8,
+                num_experts_per_tok: 2,
                 router: "block_sparse_moe.gate",
                 experts_prefix: "block_sparse_moe.experts",
                 ..

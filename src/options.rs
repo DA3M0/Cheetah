@@ -26,7 +26,8 @@ pub struct ChatOptions {
     pub temperature: f64,
     /// 核采样概率阈值;1 表示对完整分布采样。
     pub top_p: f64,
-    /// top-k 候选数;0 表示关闭。
+    /// 采样 top-k 候选数（仅对完整词表做截断）;0 表示关闭。
+    /// 注意：MoE 每 token 路由的专家数由模型配置中的 `num_experts_per_tok` 控制，与此字段无关。
     pub top_k: usize,
     /// 重复惩罚;1 表示关闭。
     pub repeat_penalty: f32,

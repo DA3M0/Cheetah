@@ -266,7 +266,7 @@ Files (all under `src/chat/models/native/`):
 | `store.rs` | `MmapWeightStore`: shard mapping + unit index + tier table + madvise control |
 | `kernels.rs` | compute kernels: gemv, rmsnorm, rope, softmax, silu, dequant |
 | `decoder.rs` | the decoder runner (`DecoderNative`; serves llama / mixtral / qwen2 / qwen3 shape, MoE for mixtral) + `DecoderConfig` resolution |
-| `mod.rs` | `NativeCpuRuntime` (ModelRuntime + AntTierControl bridge), native family loader, native forward tests (mixtral = mixture-of-experts with router + top-k experts) |
+| `mod.rs` | `NativeCpuRuntime` (ModelRuntime + AntTierControl bridge), native family loader, native forward tests (mixtral = mixture-of-experts with router + per-token expert routing via `num_experts_per_tok`) |
 
 ### 7.1 `MmapWeightStore`
 
@@ -554,7 +554,7 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 1. **Implement the forward differences** in the native runner (only the
    deltas: e.g. gemma's `(1 + weight)` norm multiply, mistral's sliding
    window, mixtral's router/experts). Reuse everything else. (mixtral now
-   ships the MoE router + top-k experts in the native forward.)
+   ships the MoE router + per-token expert routing (`num_experts_per_tok`) in the native forward.)
 2. **Extend `DecoderConfig::resolve`** if the family carries new config fields.
 3. **Wire the family into the native backend**: add the architecture to the
    native backend capability table and to `family_for_architecture` (which
@@ -578,7 +578,7 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   per position.
 - MoE routing-aware offload (per-expert residency) is implemented as of RC2-B:
   both backends now track per-(layer, expert) residency from the router's
-  top-k selections. The native runner pages in freshly selected experts and
+  expert selections. The native runner pages in freshly selected experts and
   evicts experts the selection moved away from during a generation; the
   Vulkan executor performs the same transitions against its resident bucket
   (GPU DEVICE_LOCAL upload / release) inside the MoE forward. The C-side
