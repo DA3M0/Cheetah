@@ -27,7 +27,7 @@ fn vulkan_config(
     raw_config: &Value,
 ) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
     use super::super::vulkan_transformer::{
-        Activation, TransformerFeatures, TransformerFeedForwardFeatures, VulkanTransformerConfig,
+        TransformerFeatures, TransformerFeedForwardFeatures, VulkanTransformerConfig,
         required_usize,
     };
 
@@ -44,12 +44,6 @@ fn vulkan_config(
     features.feed_forward = TransformerFeedForwardFeatures::MixtureOfExperts {
         num_local_experts,
         num_experts_per_tok,
-        activation: Activation::Silu,
-        router: "block_sparse_moe.gate",
-        experts_prefix: "block_sparse_moe.experts",
-        gate: "w1",
-        up: "w3",
-        down: "w2",
     };
     VulkanTransformerConfig::from_raw(raw_config, features)
 }
@@ -79,9 +73,6 @@ mod vulkan_tests {
             TransformerFeedForwardFeatures::MixtureOfExperts {
                 num_local_experts: 8,
                 num_experts_per_tok: 2,
-                router: "block_sparse_moe.gate",
-                experts_prefix: "block_sparse_moe.experts",
-                ..
             }
         ));
     }
