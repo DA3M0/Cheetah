@@ -38,13 +38,16 @@ Resolution order at load time:
 2. Resolve chat metadata via `chat_template_for_architecture(arch)` and stop
    markers via `stop_markers_for_architecture(arch)` (in `src/chat/models/mod.rs`).
 3. Resolve backend capability via the tables in `src/chat/models/registry.rs`:
-   - native-capable architectures: `llama`, `mixtral`, `qwen2`, `qwen3` → native
-     mmap backend (mixtral carries the mixture-of-experts feed-forward; the
-     native forward implements the router + top-k experts)
+   - native-capable architectures: `llama`, `mixtral`, `qwen2`, `qwen3`,
+     `mistral`, `gemma`, `phi` → native mmap backend (mixtral carries the
+     mixture-of-experts feed-forward; the native forward implements the
+     router + top-k experts; mistral / gemma / phi are dense delta families
+     driven by `DenseFeatures` — sliding window, offset norms + embedding
+     scale + GeGLU, and LayerNorm + parallel residual + fused projections
+     respectively)
    - Vulkan-capable architectures: `vulkan_backends()` — llama / qwen2 / qwen3
-     / gemma / mistral / mixtral / phi. gemma, mistral and phi are
-     Vulkan-only (no native backend); mixtral carries MoE routing on both
-     backends.
+     / gemma / mistral / mixtral / phi. Every native family also serves
+     Vulkan; mixtral carries MoE routing on both backends.
    - The Vulkan load path (`load_vulkan_or_fallback`) guards on
      `architecture_has_backend(arch, "vulkan")` and then dispatches through
      `vulkan_loader_for_architecture(arch) -> Option<BackendLoader>` — the
@@ -53,7 +56,8 @@ Resolution order at load time:
    - `backend_loader_for_architecture(arch, backend) -> Option<BackendLoader>`
    - `registered_backends(arch)` → e.g. `["native", "vulkan"]` / `["vulkan"]`
 4. Resolve family fallback constants via `family_for_architecture(arch)` for
-   native families that need them (llama / mixtral / qwen2 / qwen3).
+   native families that need them (llama / mixtral / qwen2 / qwen3 / mistral /
+   gemma / phi).
 
 Architectures are normalized (lowercase + `ForCausalLM` suffix stripped) so
 `Qwen2ForCausalLM` and `qwen2` resolve identically.

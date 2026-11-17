@@ -50,7 +50,7 @@ Candle's owned-tensor design cannot keep weights mmap-backed.
   inference constants (`ModelFamily`) and native backend support.
 - **Runner** — the native forward implementation
   (`DecoderNative` in `src/chat/models/native/decoder.rs`); it serves the whole
-  decoder family (llama / mixtral / qwen2 / qwen3 shape, with MoE routing for mixtral).
+  decoder family (llama / mixtral / qwen2 / qwen3 shape, with MoE routing for mixtral, plus the dense delta families mistral / gemma / phi via `DenseFeatures`).
 
 ---
 
@@ -264,8 +264,8 @@ Files (all under `src/chat/models/native/`):
 | File | Role |
 |------|------|
 | `store.rs` | `MmapWeightStore`: shard mapping + unit index + tier table + madvise control |
-| `kernels.rs` | compute kernels: gemv, rmsnorm, rope, softmax, silu, dequant |
-| `decoder.rs` | the decoder runner (`DecoderNative`; serves llama / mixtral / qwen2 / qwen3 shape, MoE for mixtral) + `DecoderConfig` resolution |
+| `kernels.rs` | compute kernels: gemv, rmsnorm (+ gemma offset), layernorm, rope, softmax, silu, gelu (tanh), dequant |
+| `decoder.rs` | the decoder runner (`DecoderNative`; serves llama / mixtral / qwen2 / qwen3 shape, MoE for mixtral, dense delta families mistral / gemma / phi via `DenseFeatures`) + `DecoderConfig` resolution |
 | `mod.rs` | `NativeCpuRuntime` (ModelRuntime + AntTierControl bridge), native family loader, native forward tests (mixtral = mixture-of-experts with router + per-token expert routing via `num_experts_per_tok`) |
 
 ### 7.1 `MmapWeightStore`
@@ -567,14 +567,21 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 
 ## 11. Adding a new family — checklist
 
-1. **Implement the forward differences** in the native runner (only the
-   deltas: e.g. gemma's `(1 + weight)` norm multiply). Reuse everything else.
-   Sliding-window attention and the MoE router/experts block are built into
-   the runner now — a sparse family only needs the config fields
+1. **Declare the deltas in `DenseFeatures`** (native/decoder.rs) if they are
+   new — the struct carries the dense-architecture deltas over the
+   llama-shaped baseline (norm kind, activation, projection naming, residual
+   topology, partial rope). Known deltas (offset norms, embedding scale,
+   GeGLU, LayerNorm, parallel residual, fused projections, partial rotary)
+   already branch in the runner; a family only flips flags. Sliding-window
+   attention and the MoE router/experts block are built into the runner now —
+   a sparse family only needs the config fields
    (`use_sliding_window` / `sliding_window`, `num_local_experts`,
    `num_experts_per_tok`) to resolve, and gets router + per-token expert
    routing (`num_experts_per_tok`) plus route-weighted expert mixing for
    free.
+1a. **Implement the forward differences** in the native runner only when no
+   existing `DenseFeatures` flag covers them (e.g. a brand-new residual
+   topology). Reuse everything else.
 2. **Extend `DecoderConfig::resolve`** if the family carries new config fields.
 3. **Wire the family into the native backend**: add the architecture to the
    native backend capability table and to `family_for_architecture` (which

@@ -327,7 +327,7 @@ Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `-
 
 | Device | Backend | Notes |
 |--------|---------|-------|
-| `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3, Mixtral MoE) | Ant-tiered, SIMD kernels; architectures without a native backend report guidance |
+| `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3, Mixtral MoE, Mistral, Gemma, Phi) | Ant-tiered, SIMD kernels; architectures without a native backend report guidance |
 | `CHEETAH_DEVICE=cuda` / `metal` | Candle | Candle's only remaining role |
 | `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; Ant bucketed residency (VRAM/streams); Q8 quantization; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
 
@@ -428,7 +428,7 @@ The server loads one model at a time. Generation requests are queued in arrival 
 
 ## Supported models and limitations
 
-- **Inference:** Safetensors decoder models resolved for Qwen2, Llama, Qwen3 (native CPU backend, Ant-tiered), plus Mixtral (native CPU backend, Ant-tiered mixture-of-experts with per-token expert routing via `num_experts_per_tok`) and Gemma, Mistral, and Phi (independent Vulkan executor for all seven with F32, F16, BF16, or Q8 (row-wise int8) weights, subject to model configuration compatibility).
+- **Inference:** Safetensors decoder models resolved for Qwen2, Llama, Qwen3, Mixtral (native CPU backend, Ant-tiered; Mixtral is the mixture-of-experts with per-token expert routing via `num_experts_per_tok`), plus the dense delta families Mistral (decoding-time sliding window), Gemma (offset norms, sqrt(hidden) embedding scale, GeGLU), and Phi (biased LayerNorms, parallel residual, fused projections, partial rotary). Every family also runs on the independent Vulkan executor with F32, F16, BF16, or Q8 (row-wise int8) weights, subject to model configuration compatibility.
 - **Inspection and preparation:** Safetensors model directories and weight files.
 - **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
 
@@ -438,7 +438,7 @@ Model inference requires enough system or GPU memory for the weights, context, a
 
 Contributions are welcome — the codebase is structured so the common tasks are mechanical:
 
-- **Add a native model family** (highest value): implement the forward deltas in the shared native runner, wire the family into the native backend capability/family tables, and extend the native forward-parity tests. Step-by-step: [docs/REGISTRY.md](docs/REGISTRY.md) §4 and [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11. Reference migrations: llama (optional bias, untied lm_head), qwen3 (per-head q/k RMSNorm).
+- **Add a native model family** (highest value): declare the family's deltas in `DenseFeatures` (offset norms, embedding scale, GeGLU, LayerNorm, parallel residual, fused projections, partial rotary — existing flags cover all published dense deltas), wire the family into the native backend capability/family tables, and extend the native forward-parity tests. Step-by-step: [docs/REGISTRY.md](docs/REGISTRY.md) §4 and [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11. Reference migrations: llama (optional bias, untied lm_head), qwen3 (per-head q/k RMSNorm), mistral (sliding window), gemma (offset norms + embedding scale + GeGLU), phi (LayerNorm + parallel residual + fused projections).
 - **Kernels / memory control**: the hot path is the fused BF16 gemv in `src/chat/models/native/kernels.rs` (AVX2 intrinsics with a portable fallback); Ant page control lives in `native/store.rs`. Isolation tests and the native forward-parity checks guard correctness.
 - **Server / CLI work**: `src/serve/` and `src/cli.rs` are self-contained.
 

@@ -137,10 +137,11 @@ run_init_command      src/main.rs:90
 | `rmsnorm` / `rope_in_place` / `silu_multiply` / `softmax` | kernels.rs | elementwise/attention helpers |
 | `DecoderConfig::resolve` | decoder.rs | the parameter chain (config → units → family) |
 | `DecoderNative::forward` | decoder.rs | the decoder forward (see ANT_MEMORY §7.2) |
-| `forward_moe_block` / `forward_dense_mlp` | decoder.rs | sparse block: router → top-k experts mixed by route weight; dense gated MLP otherwise |
+| `forward_moe_block` / `forward_dense_mlp` | decoder.rs | sparse block: router → top-k experts mixed by route weight; dense gated MLP (silu / gelu) or phi plain `fc1`/`fc2` otherwise |
+| `forward_attention` / `apply_norm_to` / `DenseFeatures` | decoder.rs | family deltas: fused `qkv_proj` + `dense` naming (phi), partial rotary, offset RMSNorm (gemma) vs LayerNorm (phi), output written pre-residual so phi can sum attention + MLP in one update |
 | sliding-window attention (`window_start`) | decoder.rs | masks keys older than `sliding_window` (0 = full attention), same rule as `shared_ops.comp` |
 | `apply_tiers` / `page_in_unit` / `evict_unit` | decoder.rs | Ant tier application on real pages |
-| `native_family_loader` | mod.rs | native family loader (llama / mixtral / qwen2 / qwen3) |
+| `native_family_loader` | mod.rs | native family loader (llama / mixtral / qwen2 / qwen3 / mistral / gemma / phi) |
 
 ### `src/ant.rs` — the planner
 
@@ -264,9 +265,9 @@ self-contained and runs anywhere.
 | qwen2        | native+vulkan | Dense        | attention bias, tied embeddings                |
 | qwen3        | native+vulkan | Dense        | per-head q/k norm, GQA, tied embeddings        |
 | mixtral      | native+vulkan | MoE (num_experts_per_tok) | router + route-weighted expert mix, per-expert tiers |
-| gemma        | vulkan only   | Dense        | `(1 + weight)` norm multiply                   |
-| mistral      | vulkan only   | Dense        | sliding-window attention                       |
-| phi          | vulkan only   | Dense        | dedicated `VulkanPhiExecutor`                  |
+| mistral      | native+vulkan | Dense        | decoding-time sliding-window attention         |
+| gemma        | native+vulkan | Dense        | `(1 + weight)` norm multiply, sqrt(hidden) embedding scale, GeGLU, tied embeddings |
+| phi          | native+vulkan | Dense        | biased LayerNorms, parallel residual, fused `qkv_proj`/`dense` + `fc1`/`fc2`, partial rotary (`VulkanPhiExecutor` on Vulkan) |
 
 `native+vulkan` means both `backend_loader_for_architecture(arch, "native")` and
 the Vulkan load path (`vulkan_backends()` + `vulkan_loader_for_architecture`)
