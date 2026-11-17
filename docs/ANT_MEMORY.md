@@ -601,6 +601,11 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 - llama3 rope-scaling is not implemented (llama2-style theta only).
 - Untied `lm_head` is supported; tied/untied is driven by
   `tie_word_embeddings`.
+- Vulkan inference of real Qwen2-0.5B weights fails at the first matmul
+  (`expected A/B lengths 29568/802816, received 29568/896`) — an executor
+  B-length derivation bug on that model's tied-embedding config, present
+  since before RC4 and unrelated to the registration layer. Synthetic-model
+  Vulkan runs and the native backend are unaffected.
 - Batched prefill (one weight pass over all prompt tokens) is pending —
   prefill currently walks positions sequentially, re-reading resident pages
   per position.

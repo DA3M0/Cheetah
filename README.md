@@ -6,7 +6,7 @@
 |---|---|
 | 🧠 **Ant tiered memory** | per-tensor VRAM/RAM/Disk residency acting on real pages — 123 MB steady RSS on a 0.5B model (vs 2.5 GB untiered) |
 | 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B |
-| 🧩 **architecture-driven resolution** | model architecture from `config.json` → chat template / backend capability / family constants; adding a family = capability + template entries |
+| 🧩 **declarative model registry** | one registration file per family — architecture, chat template, stop markers, both backends, family constants; build.rs generates the registry, lookups derive from it |
 | 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
 | 🛠️ **no GGUF** | Safetensors in, self-describing prepared directory out (`cheetah init`) |
 

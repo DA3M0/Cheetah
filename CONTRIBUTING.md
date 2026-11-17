@@ -58,20 +58,25 @@ Full checklist: [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11 and
 [docs/REGISTRY.md](docs/REGISTRY.md) §4.2. Short form:
 
 1. Implement the forward deltas in the shared native runner
-   (`src/chat/models/native/decoder.rs`) — optional units are detected via
-   `store.contains`, so families with missing pieces (biases, q/k norms,
-   separate lm_head) need no fork.
-2. Wire the family into the native backend: add the architecture to the
-   native backend capability table and to `family_for_architecture` (which
-   holds the constants + the published-size profile table).
-3. Extend the forward/native tests for the structural deltas and add
+   (`src/chat/models/native/decoder.rs`) — usually nothing: the
+   `DenseFeatures` flags cover all published dense deltas, and optional units
+   are detected via `store.contains`, so families with missing pieces
+   (biases, q/k norms, separate lm_head) need no fork.
+2. **Add the registration file** `src/chat/models/registrations/<family>.rs`
+   (copy the closest existing one): architectures, chat template, stop
+   markers, both backend loaders, family constants + the published-size
+   profile table. build.rs regenerates the registry — no table edits.
+3. Extend the forward/native tests for any structural deltas and add
    forward-parity tests.
-4. Update the backend capability tests.
+4. The backend capability tests read the generated registry — they only need
+   updating when the family introduces a new backend kind.
 5. Acceptance: forward output agrees with the reference before the family is
    announced, and a real prepared model (when available) loads end to end.
 
-Reference migrations to copy from: llama (optional bias, untied lm_head) and
-qwen3 (per-head q/k RMSNorm).
+Reference migrations to copy from: llama (optional bias, untied lm_head),
+qwen3 (per-head q/k RMSNorm), mistral (sliding window), gemma (offset norms +
+embedding scale + GeGLU), phi (LayerNorm + parallel residual + fused
+projections).
 
 ### 3.2 Touch the kernels or memory control
 
