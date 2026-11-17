@@ -583,10 +583,11 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
    existing `DenseFeatures` flag covers them (e.g. a brand-new residual
    topology). Reuse everything else.
 2. **Extend `DecoderConfig::resolve`** if the family carries new config fields.
-3. **Wire the family into the native backend**: add the architecture to the
-   native backend capability table and to `family_for_architecture` (which
-   holds the constants + profiles — `(hidden, vocab, q, kv, head_dim)` for
-   every published size; hidden alone is ambiguous within a family).
+3. **Add the declarative registration file** `src/chat/models/registrations/<family>.rs`
+   (build.rs picks it up and regenerates the registry; see
+   [REGISTRY.md](REGISTRY.md) §2). It carries the family constants + profiles
+   — `(hidden, vocab, q, kv, head_dim)` for every published size; hidden alone
+   is ambiguous within a family.
 4. **Extend the native runner / forward tests** for the family's structural
    deltas and add the forward tests.
 5. **Run the comparison** — native forward output must match the reference

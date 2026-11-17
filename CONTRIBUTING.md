@@ -99,7 +99,7 @@ The banner and logs answer most "which path am I on" questions:
 
 ```
 device:        native-cpu          ← backend actually selected
-backends:      native, vulkan      ← what the backend capability tables resolve for this architecture
+backends:      native, vulkan      ← what the registration declares for this architecture
 ant layers:    0 full-vram, 24 partial, 0 ram, 0 disk
 ant swap:      10 queued for VRAM promotion, 0 evicted at load
 cheetah-vulkan: device '...' (API ..., discrete=N)   ← vulkan builds only
@@ -138,8 +138,10 @@ cheetah-vulkan: device '...' (API ..., discrete=N)   ← vulkan builds only
 - **Errors are sentences**, not codes: `"Native backend: cannot determine ..."`,
   and retirement/guidance messages always name the alternative
   (`use CHEETAH_DEVICE=cuda or metal ...`).
-- **Capability tables are static**: backend capability tables and family
-  constants are `&'static` tables (fn pointers, `&'static` slices).
+- **Capability is declarative**: each family's capability lives in a
+  `src/chat/models/registrations/<family>.rs` file (`&'static` constants —
+  fn pointers, `&'static` slices); build.rs generates `REGISTRY` and every
+  runtime lookup derives from it.
 - **Tests**: any behavioral change ships with a test; numerics changes ship
   with a forward-parity test; backend capability changes update the capability
   tests.
@@ -162,7 +164,7 @@ Before opening a change, verify:
 - [ ] New native paths: comparison test added and passing (<1e-3)
 - [ ] Ant-touching changes: tier invariants hold
       ([docs/CODEBASE.md](docs/CODEBASE.md) §6)
-- [ ] Docs updated: REGISTRY.md §4 (backend capability tables), ANT_MEMORY.md
+- [ ] Docs updated: REGISTRY.md §4 (registration files), ANT_MEMORY.md
       §10 (performance history), CODEBASE.md §1/§3 (new files/items)
 - [ ] Banner-visible behavior changes are reflected in `print_model_info`
       tests or output examples

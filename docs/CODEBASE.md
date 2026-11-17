@@ -30,8 +30,9 @@ cheetah/
 │   │   ├── context.rs          conversation archive/store (persistence)
 │   │   ├── moe.rs              shared MoE routing (`select_experts`: softmax → top-k → renormalize)
 │   │   └── models/
-│   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + architecture resolution
-│   │       ├── registry.rs     backend capability tables (native/vulkan) + family constants + load dispatch
+│   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + ModelRegistration + REGISTRY include
+│   │       ├── registrations/  ★ declarative capability per family (build.rs → generated REGISTRY)
+│   │       ├── registry.rs     derived lookups (loader/family/backends) + device dispatch
 │   │       ├── qwen2.rs        family runtime wiring (native runner + Vulkan executor loader)
 │   │       ├── llama.rs        family runtime wiring
 │   │       ├── gemma/mistral/mixtral/phi.rs   family runtime wiring
@@ -39,7 +40,7 @@ cheetah/
 │   │       ├── templates.rs    chat template renderers
 │   │       └── native/         ★ the native mmap backend
 │   │           ├── store.rs    MmapWeightStore + madvise tier control
-│   │           ├── kernels.rs  gemv (AVX2 + portable), rmsnorm, rope, softmax, silu
+│   │           ├── kernels.rs  gemv (AVX2 + portable), rmsnorm, layernorm, rope, softmax, silu/gelu
 │   │           ├── decoder.rs    decoder runner (DecoderNative) + DecoderConfig::resolve
 │   │           └── mod.rs      NativeCpuRuntime + native family loader + native tests
 │   ├── vulkan_transformer.rs   Vulkan model executors (transformer + Phi), Candle-free
@@ -159,8 +160,9 @@ run_init_command      src/main.rs:90
 | Item | File | Role |
 |------|------|------|
 | `ModelRuntime` / `AntTierControl` | mod.rs | backend-agnostic boundary: `forward(&[u32], usize) -> Vec<f32>` + Ant tier control |
-| `BackendLoader` / `ModelFamily` | mod.rs | backend enum + family constants |
-| `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | architecture-driven lookups |
+| `BackendLoader` / `ModelFamily` / `ModelRegistration` | mod.rs | backend enum + family constants + declarative registration entry |
+| `registrations/<family>.rs` | registrations/ | declarative capability (architectures / template / stops / backends / family); build.rs → generated `REGISTRY` |
+| `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | lookups derived from the generated `REGISTRY` |
 | `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
 | `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan_transformer.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
 
@@ -242,9 +244,10 @@ self-contained and runs anywhere.
 
 1. **The runtime boundary carries no backend types**:
    `ModelRuntime::forward(&[u32], usize) -> Result<Vec<f32>, String>`.
-2. **Architecture resolution contains no runtime code**; implementation files
-   resolve backends and chat metadata through the capability tables in
-   `src/chat/models/registry.rs` and `src/chat/models/mod.rs`.
+2. **Architecture resolution contains no runtime code**; the declarative
+   registration files in `src/chat/models/registrations/` are the single
+   source of truth, build.rs generates `REGISTRY` from them, and every lookup
+   (backends, chat metadata, family constants) derives from that table.
 3. **`Disk`-tier means real released pages** on the native backend — any change
    that keeps disk-tier bytes resident breaks the Ant contract.
 4. **Every swap re-checks the budget before it executes** (`ant_swap_in_unit`,
