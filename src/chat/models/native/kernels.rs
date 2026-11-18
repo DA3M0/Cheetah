@@ -255,8 +255,11 @@ pub fn layernorm(
     eps: f32,
 ) {
     let mean = x.iter().sum::<f32>() / x.len() as f32;
-    let variance =
-        x.iter().map(|value| (value - mean) * (value - mean)).sum::<f32>() / x.len() as f32;
+    let variance = x
+        .iter()
+        .map(|value| (value - mean) * (value - mean))
+        .sum::<f32>()
+        / x.len() as f32;
     let inv = 1.0 / (variance + eps).sqrt();
     for (value, index) in x.iter_mut().zip(0..) {
         let mut normalized = (*value - mean) * inv * scalar_at(weight, index, weight_dtype);
@@ -336,8 +339,8 @@ pub fn softmax(scores: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::store::WeightDType;
+    use super::*;
 
     #[test]
     fn bf16_widening_matches_bit_shift() {

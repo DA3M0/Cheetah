@@ -207,7 +207,8 @@ impl VulkanTransformerConfig {
             ));
         }
         if let TransformerFeedForwardFeatures::MixtureOfExperts {
-            num_local_experts, num_experts_per_tok,
+            num_local_experts,
+            num_experts_per_tok,
         } = &features.feed_forward
             && (*num_local_experts == 0
                 || *num_experts_per_tok == 0
@@ -846,10 +847,13 @@ impl FeedForward {
             } => {
                 let router_logits = router.forward(input, rows)?;
                 let mut output = vec![0.0; rows * hidden_size];
-                let mut selected_by_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts.len()];
+                let mut selected_by_expert: Vec<Vec<(usize, f32)>> =
+                    vec![Vec::new(); experts.len()];
                 for row in 0..rows {
                     let logits = &router_logits[row * experts.len()..(row + 1) * experts.len()];
-                    for (expert_index, route_weight) in select_experts(logits, *num_experts_per_tok)? {
+                    for (expert_index, route_weight) in
+                        select_experts(logits, *num_experts_per_tok)?
+                    {
                         selected_by_expert[expert_index].push((row, route_weight));
                     }
                 }
@@ -867,13 +871,15 @@ impl FeedForward {
                         if resident {
                             let expert = &mut experts[expert_index];
                             if expert.gate.slot.is_none() {
-                                expert.gate.slot = upload_slot(&expert.gate.name, &expert.gate.weight);
+                                expert.gate.slot =
+                                    upload_slot(&expert.gate.name, &expert.gate.weight);
                             }
                             if expert.up.slot.is_none() {
                                 expert.up.slot = upload_slot(&expert.up.name, &expert.up.weight);
                             }
                             if expert.down.slot.is_none() {
-                                expert.down.slot = upload_slot(&expert.down.name, &expert.down.weight);
+                                expert.down.slot =
+                                    upload_slot(&expert.down.name, &expert.down.weight);
                             }
                         } else {
                             let expert = &mut experts[expert_index];
@@ -2143,10 +2149,26 @@ mod tests {
         let config = VulkanTransformerConfig::from_raw(&raw, features).unwrap();
         let mut weights = HashMap::new();
         for (name, shape, values) in [
-            ("layers.0.block_sparse_moe.gate.weight", vec![1, 2], vec![1.0, 0.0]),
-            ("layers.0.block_sparse_moe.experts.0.w1.weight", vec![2, 2], vec![1.0; 4]),
-            ("layers.0.block_sparse_moe.experts.0.w3.weight", vec![2, 2], vec![1.0; 4]),
-            ("layers.0.block_sparse_moe.experts.0.w2.weight", vec![2, 2], vec![1.0; 4]),
+            (
+                "layers.0.block_sparse_moe.gate.weight",
+                vec![1, 2],
+                vec![1.0, 0.0],
+            ),
+            (
+                "layers.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                vec![1.0; 4],
+            ),
+            (
+                "layers.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                vec![1.0; 4],
+            ),
+            (
+                "layers.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                vec![1.0; 4],
+            ),
         ] {
             weights.insert(
                 name.to_owned(),

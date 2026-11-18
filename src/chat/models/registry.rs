@@ -124,19 +124,13 @@ pub(crate) fn load_model(
     let registration = BACKENDS
         .iter()
         .find(|registration| registration.name == selected_lower)
-        .ok_or_else(|| {
-            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu or vulkan.")
-        })?;
+        .ok_or_else(|| format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu or vulkan."))?;
 
     match registration.backend {
         Backend::Native => Err(no_native_backend_message(architecture)),
-        Backend::Vulkan => load_vulkan_or_fallback(
-            weight_paths,
-            config_bytes,
-            raw_config,
-            architecture,
-            plan,
-        ),
+        Backend::Vulkan => {
+            load_vulkan_or_fallback(weight_paths, config_bytes, raw_config, architecture, plan)
+        }
     }
 }
 
@@ -152,9 +146,7 @@ pub(crate) fn backend_device(selected: &str) -> Result<Device, String> {
     let registration = BACKENDS
         .iter()
         .find(|registration| registration.name == selected.to_lowercase().as_str())
-        .ok_or_else(|| {
-            format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu or vulkan.")
-        })?;
+        .ok_or_else(|| format!("Unsupported CHEETAH_DEVICE '{selected}'; choose cpu or vulkan."))?;
     match &registration.backend {
         Backend::Native => Ok(Device::Cpu),
         Backend::Vulkan => Ok(Device::Cpu),
@@ -309,7 +301,14 @@ mod tests {
     /// native backend and carry their family constants.
     #[test]
     fn native_backend_serves_dense_delta_families() {
-        for architecture in ["mistral", "MistralForCausalLM", "gemma", "GemmaForCausalLM", "phi", "PhiForCausalLM"] {
+        for architecture in [
+            "mistral",
+            "MistralForCausalLM",
+            "gemma",
+            "GemmaForCausalLM",
+            "phi",
+            "PhiForCausalLM",
+        ] {
             assert!(
                 backend_loader_for_architecture(architecture, "native").is_some(),
                 "{architecture} must resolve the native backend"
@@ -372,8 +371,9 @@ mod tests {
             "llama", "qwen2", "qwen3", "gemma", "mistral", "mixtral", "phi",
         ] {
             assert!(
-                serving.iter().any(|name| normalize_architecture(name)
-                    == normalize_architecture(architecture)),
+                serving.iter().any(
+                    |name| normalize_architecture(name) == normalize_architecture(architecture)
+                ),
                 "{architecture} must be reachable on the Vulkan load path"
             );
         }

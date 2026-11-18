@@ -27,7 +27,8 @@ pub(super) fn load(
         .get("model_type")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            "Vulkan executor: the model config carries no 'model_type' to select executor features.".to_string()
+            "Vulkan executor: the model config carries no 'model_type' to select executor features."
+                .to_string()
         })?;
     match model_type {
         "llama" => transformer(weight_paths, plan, llama_config(&raw_config)?),
@@ -40,8 +41,7 @@ pub(super) fn load(
         // LayerNorms, parallel residual, fused projections), so it does not
         // share the transformer config builder.
         "phi" => {
-            let config =
-                super::super::vulkan_transformer::VulkanPhiConfig::parse(&raw_config)?;
+            let config = super::super::vulkan_transformer::VulkanPhiConfig::parse(&raw_config)?;
             Ok(Box::new(
                 super::super::vulkan_transformer::VulkanPhiExecutor::load(weight_paths, &config)?,
             ))
@@ -170,9 +170,7 @@ fn qwen3_config(
 fn mistral_config(
     raw_config: &Value,
 ) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{
-        TransformerFeatures, VulkanTransformerConfig,
-    };
+    use super::super::vulkan_transformer::{TransformerFeatures, VulkanTransformerConfig};
 
     if raw_config
         .get("num_local_experts")
@@ -204,9 +202,7 @@ fn mistral_config(
 fn gemma_config(
     raw_config: &Value,
 ) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{
-        TransformerFeatures, VulkanTransformerConfig,
-    };
+    use super::super::vulkan_transformer::{TransformerFeatures, VulkanTransformerConfig};
 
     if raw_config
         .get("num_local_experts")
@@ -278,9 +274,7 @@ mod tests {
     fn load_dispatches_by_model_type() {
         // Each family's config fn must be reachable through its model_type —
         // a registration file references only `load`.
-        for model_type in [
-            "llama", "qwen2", "qwen3", "mistral", "gemma", "mixtral",
-        ] {
+        for model_type in ["llama", "qwen2", "qwen3", "mistral", "gemma", "mixtral"] {
             let raw = serde_json::json!({ "model_type": model_type });
             let error = load_error(raw);
             // The load fails on weight paths, never on feature selection.

@@ -99,7 +99,6 @@ pub(super) enum BackendLoader {
     ),
 }
 
-
 /// Family-level inference constants for a model family: used as fallbacks when
 /// the model directory does not carry them (missing or incomplete
 /// config.json), keeping the native backend independent of directory

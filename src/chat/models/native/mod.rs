@@ -2,8 +2,8 @@
 //! the prepared Ant shards and every Ant tier acts on real pages via madvise,
 //! so the resident set only holds what the plan keeps resident.
 
-pub(super) mod kernels;
 pub(super) mod decoder;
+pub(super) mod kernels;
 pub(super) mod store;
 
 use super::{AntTierControl, ModelRuntime};
@@ -72,4 +72,3 @@ impl AntTierControl for NativeCpuRuntime {
         self.decoder.evict_unit(unit_id)
     }
 }
-

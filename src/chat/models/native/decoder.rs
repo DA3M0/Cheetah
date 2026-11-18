@@ -239,7 +239,8 @@ impl DecoderConfig {
         } else {
             store
                 .unit_shape("model.layers.0.self_attn.k_proj.weight")
-                .ok_or_else(|| "Native backend: units manifest has no k_proj tensor.".to_string())?[0]
+                .ok_or_else(|| "Native backend: units manifest has no k_proj tensor.".to_string())?
+                [0]
         };
         let moe_layout = family.moe_layout;
         let expert_gate_unit = moe_layout.expert_unit("model.layers.0.", 0, moe_layout.gate);
@@ -249,7 +250,11 @@ impl DecoderConfig {
                 .map(|shape| shape[0])
                 // phi names its MLP projections fc1/fc2; fc1's rows carry the
                 // intermediate size.
-                .or_else(|| store.unit_shape("model.layers.0.mlp.fc1.weight").map(|shape| shape[0]))
+                .or_else(|| {
+                    store
+                        .unit_shape("model.layers.0.mlp.fc1.weight")
+                        .map(|shape| shape[0])
+                })
                 // Sparse feed-forward: a sparse layer has no `mlp.*` units, so
                 // the first expert's gate row carries the intermediate size.
                 .or_else(|| store.unit_shape(&expert_gate_unit).map(|shape| shape[0]))
@@ -327,8 +332,7 @@ impl DecoderConfig {
         // wins over the family constant; the resolved rotary dim rounds to the
         // nearest head-dim share. 1.0 (or an absent factor) = full rope.
         let rotary_factor = field_f("partial_rotary_factor")
-            .unwrap_or(features.partial_rotary_factor as f64)
-            as f32;
+            .unwrap_or(features.partial_rotary_factor as f64) as f32;
         let rotary_dim = if rotary_factor >= 1.0 {
             head_dim
         } else {
@@ -338,7 +342,9 @@ impl DecoderConfig {
         // Feed-forward activation: the config's `hidden_act` wins over the
         // family delta (`gelu` / `gelu_new` / `gelu_pytorch_tanh` are the tanh
         // approximation; `silu` is the llama-shaped baseline).
-        let mlp_gelu = match raw.and_then(|value| value.get("hidden_act")).and_then(Value::as_str)
+        let mlp_gelu = match raw
+            .and_then(|value| value.get("hidden_act"))
+            .and_then(Value::as_str)
         {
             Some("gelu") | Some("gelu_new") | Some("gelu_pytorch_tanh") => true,
             Some("silu") => false,
@@ -589,9 +595,10 @@ impl DecoderNative {
         let (weight, dtype, _) = store.slice(&format!("{unit}.weight"))?;
         match (features.layer_norm, features.norm_weight_offset) {
             (true, _) => {
-                let (bias, bias_dtype, _) = store
-                    .slice(&format!("{unit}.bias"))
-                    .unwrap_or((&[], dtype, &[]));
+                let (bias, bias_dtype, _) =
+                    store
+                        .slice(&format!("{unit}.bias"))
+                        .unwrap_or((&[], dtype, &[]));
                 kernels::layernorm(target, weight, dtype, bias, bias_dtype, eps);
             }
             (false, true) => kernels::rmsnorm_offset(target, weight, dtype, eps),
@@ -671,7 +678,12 @@ impl DecoderNative {
     /// `scratch.attn_projected` (the caller owns the residual add). Handles
     /// the family deltas: fused `qkv_proj` + `dense` output naming (phi),
     /// partial rotary (phi), and family-optional q/k/v/o biases.
-    fn forward_attention(&mut self, prefix: &str, layer: usize, position: usize) -> Result<(), String> {
+    fn forward_attention(
+        &mut self,
+        prefix: &str,
+        layer: usize,
+        position: usize,
+    ) -> Result<(), String> {
         let cfg = &self.cfg;
 
         if cfg.features.fused_qkv {
@@ -995,9 +1007,7 @@ impl DecoderNative {
         // accumulator starts at zero every call (it swaps into `mlp_out` at
         // the end).
         self.scratch.mlp_out_weighted.clear();
-        self.scratch
-            .mlp_out_weighted
-            .resize(cfg.hidden_size, 0.0);
+        self.scratch.mlp_out_weighted.resize(cfg.hidden_size, 0.0);
         for (expert, route_weight) in selected {
             let gate_unit = cfg
                 .moe_layout
@@ -1059,7 +1069,10 @@ impl DecoderNative {
                 *out += value * route_weight;
             }
         }
-        std::mem::swap(&mut self.scratch.mlp_out, &mut self.scratch.mlp_out_weighted);
+        std::mem::swap(
+            &mut self.scratch.mlp_out,
+            &mut self.scratch.mlp_out_weighted,
+        );
         Ok(())
     }
 
@@ -1765,21 +1778,15 @@ mod forward_tests {
             .zip(base.iter())
             .map(|(value, residual)| value - residual)
             .collect::<Vec<_>>();
-        for (index, (actual, reference)) in decoder
-            .scratch
-            .mlp_out
-            .iter()
-            .zip(mix.iter())
-            .enumerate()
+        for (index, (actual, reference)) in
+            decoder.scratch.mlp_out.iter().zip(mix.iter()).enumerate()
         {
             assert!(
                 (actual - reference).abs() < 1e-5,
                 "expert mix mismatch at {index}: {actual} vs {reference}"
             );
         }
-        let contribution = mix
-            .iter()
-            .fold(0.0f32, |acc, value| acc.max(value.abs()));
+        let contribution = mix.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
         assert!(
             contribution > 1e-6,
             "fixture experts must actually contribute to the residual"
@@ -1981,11 +1988,7 @@ mod forward_tests {
                 values(256, 0.5, 0.1),
                 vec![32, 8],
             ),
-            (
-                "model.final_layernorm.weight".into(),
-                vec![1.0; 8],
-                vec![8],
-            ),
+            ("model.final_layernorm.weight".into(), vec![1.0; 8], vec![8]),
             (
                 "model.final_layernorm.bias".into(),
                 values(8, 6.1, 0.05),
@@ -2091,9 +2094,7 @@ mod forward_tests {
     fn ref_vec(store: &MmapWeightStore, unit: &str, len: usize) -> Vec<f32> {
         let (bytes, _, _) = store.slice(unit).expect(unit);
         (0..len)
-            .map(|index| {
-                f32::from_le_bytes(bytes[index * 4..][..4].try_into().unwrap())
-            })
+            .map(|index| f32::from_le_bytes(bytes[index * 4..][..4].try_into().unwrap()))
             .collect()
     }
 
@@ -2146,8 +2147,7 @@ mod forward_tests {
     /// Reference LayerNorm with affine parameters.
     fn ref_layernorm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
         let mean = x.iter().sum::<f32>() / x.len() as f32;
-        let variance =
-            x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / x.len() as f32;
+        let variance = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / x.len() as f32;
         let inv = 1.0 / (variance + eps).sqrt();
         for (index, value) in x.iter_mut().enumerate() {
             *value = (*value - mean) * inv * weight[index] + bias[index];

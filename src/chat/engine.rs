@@ -640,9 +640,10 @@ impl Engine {
                 .to_owned(),
             architecture: Some(architecture),
             prompt_renderer,
-            max_position_embeddings: config.max_position_embeddings.min(ctx_size).min(
-                family_context_cap,
-            ),
+            max_position_embeddings: config
+                .max_position_embeddings
+                .min(ctx_size)
+                .min(family_context_cap),
             eos_token_ids,
             stop_markers,
             ant_plan,
