@@ -1,6 +1,6 @@
 # Cheetah
 
-**Cheetah** is a local language-model CLI and OpenAI-compatible API gateway, written in Rust and C. It runs Safetensors decoder models with a self-describing prepared-model format and **Ant tiered memory** — real page-level VRAM/RAM/Disk control — across three independent backends.
+**Cheetah** is a local language-model CLI and OpenAI-compatible API gateway, written in Rust and C. It runs Safetensors decoder models with a self-describing prepared-model format and **Ant tiered memory** — real page-level VRAM/RAM/Disk control — across two independent backends.
 
 | | |
 |---|---|
@@ -15,10 +15,10 @@
   CLI / OpenAI ──▶ Engine (chat/serve) ──▶ ModelRuntime boundary ──▶ ┐
                  └─────────────────────────────────────────────┘      │
                                                                       ▼
-        ┌──────────────────┬──────────────────────┬──────────────────────────┐
-        │ native (CPU)     │ Vulkan executor      │ Candle (CUDA/Metal only) │
-        │ mmap + Ant tiers │ Candle-free executor │ classic bridge           │
-        └──────────────────┴──────────────────────┴──────────────────────────┘
+                    ┌──────────────────────┬──────────────────────────┐
+                    │ native (CPU)         │ Vulkan executor           │
+                    │ mmap + Ant tiers     │ Candle-free, Ant buckets │
+                    └──────────────────────┴──────────────────────────┘
 ```
 
 **Newcomer paths**
@@ -67,20 +67,22 @@ The first build compiles dependencies and may take a while. When it finishes, th
 
 ### 3. Get a model
 
-Cheetah runs Safetensors decoder models. Point it at a Hugging Face model directory containing `config.json`, `tokenizer.json`, and `model.safetensors` (optionally with `model.safetensors.index.json` for sharded weights), or a single Safetensors file. To fetch one, use any HF client — for example a small Qwen2 model (~1 GB):
+Cheetah runs Safetensors decoder models. The native CPU backend (the default) requires a **prepared model directory** — run `cheetah init` to convert a Hugging Face model into the mmap-friendly format:
 
 ```sh
+# Download a small Qwen2 model (~1 GB)
 huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir /tmp/qwen-0.5b
-cheetah /tmp/qwen-0.5b
+
+# Prepare it for the native backend
+cheetah init /tmp/qwen-0.5b /tmp/qwen-0.5b-prepared
+
+# Chat with the prepared model
+cheetah /tmp/qwen-0.5b-prepared
 ```
 
-(No `huggingface-cli`? Download the files directly from the model page, or point Cheetah at any directory you already have with `config.json`, `tokenizer.json`, and Safetensors weights.)
+(No `huggingface-cli`? Download the files directly from the model page.)
 
-You can also prepare a model directory for mmap-friendly loading and Ant memory optimization:
-
-```sh
-cheetah init /path/to/hf-model /path/to/prepared-model
-```
+The Vulkan backend can also read raw Hugging Face directories directly (set `CHEETAH_DEVICE=vulkan`), but the native backend — which is the default and the fastest CPU path — requires the prepared layout with `.cheetah/weights/` shards and `cheetah_manifest.json`.
 
 GGUF files are not supported; use a Safetensors conversion of the model instead.
 
@@ -103,26 +105,26 @@ Key variables (full list in [docs/CODEBASE.md](docs/CODEBASE.md) §4):
 
 | Variable | Values | Default |
 |----------|--------|---------|
-| `CHEETAH_DEVICE` | `cpu` / `cuda` / `metal` / `vulkan` | `cpu` (native backend) |
-| `CHEETAH_QUANT_Q8` | `1` / `0` | `0` (full precision) |
-| `CHEETAH_VRAM_POOL_SIZE` | bytes | `838860800` (800 MiB) |
+| `CHEETAH_DEVICE` | `cpu` / `vulkan` | `cpu` (native backend) |
+| `CHEETAH_QUANT_Q8` | `1` / `0` | `0` (full precision; Vulkan only) |
+| `CHEETAH_VRAM_POOL_SIZE` | bytes | `838860800` (800 MiB; Vulkan C substrate pool) |
 
 ### 5. Run a chat
 
 ```sh
-cheetah /path/to/model
+cheetah /path/to/prepared-model
 ```
 
 Then type a message at the `> ` prompt and press Enter. Use `/exit` to quit, `/clear` to reset the conversation, `/save <name>` to save it, and `/help` to list chat commands. Start with a small model and a small context for quick feedback:
 
 ```sh
-cheetah /path/to/small-model --ctx-size 1024 --max-tokens 128
+cheetah /path/to/prepared-model --ctx-size 1024 --max-tokens 128
 ```
 
 ### 6. Try the OpenAI-compatible server
 
 ```sh
-cheetah serve /path/to/model --port 8080
+cheetah serve /path/to/prepared-model --port 8080
 ```
 
 Then send chat completion requests to the local endpoint.
@@ -177,41 +179,26 @@ The first build downloads and compiles Rust dependencies and may take a while. W
 ./target/release/cheetah help
 ```
 
-To start chatting, you also need a supported model directory or Safetensors file:
+To start chatting, you also need a prepared model directory:
 
 ```sh
-./target/release/cheetah /path/to/model
+./target/release/cheetah init /path/to/hf-model /path/to/prepared-model
+./target/release/cheetah /path/to/prepared-model
 ```
 
-Without `CHEETAH_DEVICE`, Cheetah uses CPU.
+Without `CHEETAH_DEVICE`, Cheetah uses the native CPU backend.
 
-#### Optional: build with a GPU backend
+#### Optional: build with the Vulkan backend
 
-GPU support must be compiled in and selected at runtime. Build only the backend you intend to use; each option has additional platform-specific requirements.
-
-**NVIDIA CUDA (Linux):** install a compatible NVIDIA driver and CUDA Toolkit first. Check that `nvidia-smi` and `nvcc --version` work, then build and run:
-
-```sh
-cargo build --release --features cuda
-CHEETAH_DEVICE=cuda ./target/release/cheetah /path/to/model   # inline = one-shot
-```
-
-**Apple Metal (macOS):** install Xcode command-line tools, then build and run:
-
-```sh
-cargo build --release --features metal
-CHEETAH_DEVICE=metal ./target/release/cheetah /path/to/model   # inline = one-shot
-```
-
-**Vulkan:** install a Vulkan development environment with headers, the loader/runtime, a C compiler, and `glslc`. On Ubuntu or Debian, the development packages are:
+The Vulkan backend is the only GPU option. It requires a Vulkan development environment with headers, the loader/runtime, a C compiler, and `glslc`. On Ubuntu or Debian:
 
 ```sh
 sudo apt install -y build-essential libvulkan-dev glslc
 cargo build --release --features vulkan
-CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/qwen2-model   # inline = one-shot
+CHEETAH_DEVICE=vulkan ./target/release/cheetah /path/to/model   # inline = one-shot
 ```
 
-You also need a Vulkan-capable device and its driver. If `glslc` is not on `PATH`, set `GLSLC` to its executable path before building. Vulkan inference is available for Qwen2, Gemma, Llama, Phi, Mistral, and Mixtral when built with `--features vulkan`; support still depends on compatible model configuration and weights. Vulkan builds on platforms other than Linux require a compatible Vulkan SDK and loader and are not covered by the package commands above.
+You also need a Vulkan-capable device and its driver. If `glslc` is not on `PATH`, set `GLSLC` to its executable path before building. Vulkan inference is available for Qwen2, Qwen3, Gemma, Llama, Phi, Mistral, and Mixtral when built with `--features vulkan`; support depends on compatible model configuration and weights. Vulkan builds on platforms other than Linux require a compatible Vulkan SDK and loader.
 
 On Windows, GPU builds under WSL2 additionally require the relevant GPU and driver support to be available inside WSL; the Linux commands alone do not install or configure that support.
 
@@ -219,7 +206,7 @@ On Windows, GPU builds under WSL2 additionally require the relevant GPU and driv
 
 - If `cargo` or `rustc` is not found, install Rust with rustup and reopen the terminal so its `PATH` changes take effect.
 - If the build reports that a C compiler is missing, install the native build tools listed above.
-- If a GPU build fails, check that its platform-specific toolkit, headers, libraries, and runtime/driver are installed. For Vulkan, also verify that `glslc` is available or set `GLSLC`.
+- If the Vulkan build fails, check that the Vulkan SDK, headers, libraries, and runtime/driver are installed. Verify that `glslc` is available or set `GLSLC`.
 
 ### Vulkan
 
@@ -229,7 +216,7 @@ The optional Vulkan feature uses native C compute operators for all registered a
 
 **Ant bucketed residency:** VRAM-tier weights are uploaded once into DEVICE_LOCAL memory (real VRAM); disk-tier weights stream through a HOST_COHERENT pool each step. Ant page-in/evict moves weights between the two buckets. On GPUs with small VRAM, oversized uploads automatically fall back to the streaming path per weight.
 
-**Operator library** (`shared_ops.comp`, 10 ops): rms_norm, elementwise add, silu_mul, rotary, attention, gelu_mul (exact + tanh), layer_norm, embedding_gather, bias_add. Dedicated matmul pipelines for f32, bf16, f16, and q8.
+**Operator library** (`shared_ops.comp`, 10 ops): rms_norm (op 0), elementwise add/sub (ops 1–2), rotary (op 3), attention (op 4), silu_mul (op 5), gelu_mul — exact + tanh (op 6), layer_norm (op 7), embedding_gather (op 8), bias_add (op 9). Dedicated matmul pipelines for f32, bf16, f16, and q8.
 
 Compiled shader paths can be overridden per operator:
 
@@ -250,18 +237,16 @@ cargo test --features vulkan qwen_operators_match_cpu_reference -- --ignored --n
 ## Chat
 
 ```sh
-# Interactive chat from the current model directory
-cd /path/to/model && cheetah
+# Interactive chat with a prepared model directory
+cheetah /path/to/prepared-model
 
-# Chat using a model directory or a Safetensors file
-cheetah /path/to/model
-cheetah chat /path/to/model
-cheetah /path/to/model/model.safetensors
+# Chat using a Safetensors file (Vulkan backend only)
+CHEETAH_DEVICE=vulkan cheetah /path/to/model/model.safetensors
 
 # Configure generation
-cheetah /path/to/model --threads 8 --max-tokens 128
-cheetah /path/to/model --temperature 0.7 --top-k 50 --seed 42
-cheetah /path/to/model --system "You are a concise assistant."
+cheetah /path/to/prepared-model --threads 8 --max-tokens 128
+cheetah /path/to/prepared-model --temperature 0.7 --top-k 50 --seed 42
+cheetah /path/to/prepared-model --system "You are a concise assistant."
 ```
 
 | Option | Default | Description |
@@ -287,12 +272,12 @@ At the chat prompt, use `/exit` or `/quit` to leave, `/clear` to reset the conve
 Restore a saved conversation by passing the same model and context name:
 
 ```sh
-cheetah /path/to/model --context work
+cheetah /path/to/prepared-model --context work
 cheetah context list
 cheetah context delete work
 ```
 
-Contexts preserve the conversation and inference settings. The model path and explicitly supplied settings must be compatible with the saved context. `--context-dir <path>` can be used with chat and context-management commands to choose a different storage directory.
+Contexts preserve the conversation and inference settings. The model path and explicitly supplied settings must be compatible with the saved context. `--context-dir <path>` can be used with chat and context-management commands to choose a different storage directory. The default location is platform-specific: `$XDG_DATA_HOME/cheetah/contexts` (or `~/.local/share/cheetah/contexts`) on Linux, `~/Library/Application Support/cheetah/contexts` on macOS, and `%LOCALAPPDATA%\cheetah\contexts` on Windows.
 
 ## Model initialization
 
@@ -313,11 +298,11 @@ Ant is Cheetah's fine-grained model memory optimization for local inference. Aft
 - **RAM (tier 1):** resident — pages stay faulted in.
 - **Disk (tier 2):** cold — pages dropped with `madvise(DONTNEED)` and streamed back in per step.
 
-Set `export CHEETAH_QUANT_Q8=1` (or inline `CHEETAH_QUANT_Q8=1 cheetah ...`) to quantize linear projections to row-wise int8 (halves the weight footprint for the native CPU and Vulkan backends; norms, biases and embeddings stay in original precision).
+Set `export CHEETAH_QUANT_Q8=1` (or inline `CHEETAH_QUANT_Q8=1 cheetah ...`) to quantize linear projections to row-wise int8 on the Vulkan backend (halves the weight footprint; norms, biases and embeddings stay in original precision). The native CPU backend currently loads weights in their original F32/F16/BF16 precision.
 
 On the default CPU path (the native backend), tiers act on **real memory pages**: a disk-tier unit contributes ~0 resident bytes, and the OS page cache absorbs re-reads. Measured on qwen-0.5b with a 16 MB/32 MB budget: steady RSS **123 MB** (vs 2,497 MB for the retired Candle CPU path) with identical output.
 
-Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, `--ant-allow-vram-swap <bool>`.
+Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, `--ant-allow-vram-swap <bool>`. Default budgets: VRAM pool 8 GiB, RAM budget 16 GiB.
 
 ### Interactive Ant preset
 
@@ -327,8 +312,7 @@ Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `-
 
 | Device | Backend | Notes |
 |--------|---------|-------|
-| `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3, Mixtral MoE, Mistral, Gemma, Phi) | Ant-tiered, SIMD kernels; architectures without a native backend report guidance |
-| `CHEETAH_DEVICE=cuda` / `metal` | Candle | Candle's only remaining role |
+| `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3, Mixtral MoE, Mistral, Gemma, Phi) | Ant-tiered, SIMD kernels; requires a prepared model directory (`cheetah init`); architectures without a native backend report guidance |
 | `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; Ant bucketed residency (VRAM/streams); Q8 quantization; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
 
 The startup banner prints the backend capability list per architecture (`backends: native, vulkan`) and the resolved device (`device: native-cpu` / `device: Vulkan`). If the device does not match your expectation, check that `CHEETAH_DEVICE` is exported — an unexported variable silently falls back to the default. The OpenAI-compatible server accepts the same device/`--ant*` settings as chat; generation requests may additionally pass a `resident_units` override list.
@@ -353,10 +337,10 @@ cheetah inspect /path/to/model/model.safetensors --json --output report.json
 
 ## OpenAI-compatible API server
 
-Start a server with a model path, or resolve a model by name under `--model-dir`:
+Start a server with a prepared model path, or resolve a model by name under `--model-dir`:
 
 ```sh
-cheetah serve /path/to/model --host 127.0.0.1 --port 8080
+cheetah serve /path/to/prepared-model --host 127.0.0.1 --port 8080
 
 # Resolve "qwen" in ./models and generate an API key
 cheetah serve qwen --model-dir ./models --port 8080 --generate-key
@@ -447,10 +431,10 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) (workflows, debugging toolbox, err
 ## FAQ
 
 **Which backend runs on my machine?**
-`cpu` (default) → the native backend for architecture-resolved families (Qwen2, Llama, Qwen3); `cuda`/`metal` → Candle; `vulkan` → the independent executor. The startup banner prints `backends: ...` for the loaded architecture.
+`cpu` (default) → the native backend for architecture-resolved families (Qwen2, Llama, Qwen3, Mixtral, Mistral, Gemma, Phi); `vulkan` → the independent executor (requires `--features vulkan` build). The startup banner prints `backends: ...` for the loaded architecture.
 
 **Why did I get "no native CPU backend available"?**
-That architecture has no native implementation yet and the Candle CPU path is retired. Use `CHEETAH_DEVICE=cuda/metal` (Candle) or `CHEETAH_DEVICE=vulkan` (independent executor), or contribute the family — see §3.1 above.
+That architecture has no native implementation yet. Use `CHEETAH_DEVICE=vulkan` (independent executor), or contribute the family — see §3.1 above.
 
 **Why is the model directory missing `config.json` after `cheetah init`?**
 It is not required: init snapshots the model parameters into `cheetah_manifest.json`, and loading falls back to that snapshot (plus registered family defaults) when the file is absent.
@@ -459,10 +443,10 @@ It is not required: init snapshots the model parameters into `cheetah_manifest.j
 Run the native backend tests (`cargo test native_`) — if the backend tests pass but your model misbehaves, the issue is likely a config/manifest mismatch rather than the kernels; check the manifest's `*_source` annotations.
 
 **Do I need a GPU?**
-No — the native CPU path is the primary backend and needs no GPU. Discrete GPUs currently accelerate less than the native CPU path on this codebase (the Vulkan executor keeps weights in host memory; small-VRAM CUDA is impractical for F32 weights).
+No — the native CPU path is the primary backend and needs no GPU. The Vulkan backend can use a GPU but keeps weights in host memory (HOST_COHERENT design); on small models the native CPU path is often faster.
 
 **How do I enable Q8 quantization?**
-Set `CHEETAH_QUANT_Q8=1` before starting. Linear projections are quantized to row-wise int8 (roughly half the weight footprint). Norms, biases and embeddings stay in full precision. Vulkan only for now.
+Set `CHEETAH_QUANT_Q8=1` before starting. Linear projections are quantized to row-wise int8 (roughly half the weight footprint). Norms, biases and embeddings stay in full precision. Vulkan only — the native CPU backend loads weights in their original F32/F16/BF16 precision.
 
 **Why does CHEETAH_DEVICE=VULKAN (uppercase) fail?**
 Older builds used case-sensitive device lookup. This was fixed — all casing now works (`vulkan`, `VULKAN`, `Vulkan`). If you still see `Unsupported CHEETAH_DEVICE`, rebuild from the latest code.
