@@ -1,12 +1,20 @@
+//! The generic transformer executor (llama / qwen2 / qwen3 / mistral /
+//! gemma / mixtral): the decoder graph (attention + dense/MoE feed-forward),
+//! the executor's Ant GPU-bucket residency, and the config surface the
+//! loader (`super`) builds per model_type. Weight loading and the operator
+//! dispatch live in `super::weights` (the precision registry).
+
 use crate::chat::moe::select_experts;
 use crate::color::{self, Color};
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::fs::File;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+
+use super::required_usize;
+use super::weights::{
+    Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight, upload_slot,
+    validate_shape,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct VulkanTransformerConfig {
@@ -255,546 +263,6 @@ impl VulkanTransformerConfig {
     }
 }
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct VulkanPhiConfig {
-    vocab_size: usize,
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-    max_position_embeddings: usize,
-    layer_norm_eps: f32,
-    rope_theta: f32,
-    qk_layernorm: bool,
-    tie_word_embeddings: bool,
-    activation: Activation,
-}
-
-impl VulkanPhiConfig {
-    #[allow(dead_code)]
-    pub(crate) fn parse(raw: &Value) -> Result<Self, String> {
-        let vocab_size = required_usize(raw, "vocab_size")?;
-        let hidden_size = required_usize(raw, "hidden_size")?;
-        let intermediate_size = required_usize(raw, "intermediate_size")?;
-        let num_hidden_layers = required_usize(raw, "num_hidden_layers")?;
-        let num_attention_heads = required_usize(raw, "num_attention_heads")?;
-        let num_key_value_heads = raw
-            .get("num_key_value_heads")
-            .and_then(Value::as_u64)
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| "num_key_value_heads does not fit usize.".to_string())?
-            .unwrap_or(num_attention_heads);
-        let max_position_embeddings = required_usize(raw, "max_position_embeddings")?;
-        let layer_norm_eps = raw
-            .get("layer_norm_eps")
-            .and_then(Value::as_f64)
-            .unwrap_or(1e-5) as f32;
-        let rope_theta = raw
-            .get("rope_theta")
-            .and_then(Value::as_f64)
-            .unwrap_or(10_000.0) as f32;
-        let partial_rotary_factor = raw
-            .get("partial_rotary_factor")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.5);
-        let activation = match raw.get("hidden_act").and_then(Value::as_str) {
-            Some("gelu") => Activation::Gelu,
-            Some("gelu_new") => Activation::NewGelu,
-            Some("silu") => Activation::Silu,
-            _ => return Err("Vulkan Phi does not support the configured activation.".into()),
-        };
-        let head_dim = if num_attention_heads == 0 {
-            0
-        } else {
-            hidden_size / num_attention_heads
-        };
-        let rotary_dim = (partial_rotary_factor * head_dim as f64) as usize;
-        if vocab_size == 0
-            || hidden_size == 0
-            || intermediate_size == 0
-            || num_hidden_layers == 0
-            || num_attention_heads == 0
-            || num_key_value_heads == 0
-            || hidden_size % num_attention_heads.max(1) != 0
-            || num_attention_heads % num_key_value_heads.max(1) != 0
-            || head_dim == 0
-            || rotary_dim == 0
-            || rotary_dim > head_dim
-            || rotary_dim % 2 != 0
-            || max_position_embeddings == 0
-            || !partial_rotary_factor.is_finite()
-            || !layer_norm_eps.is_finite()
-            || layer_norm_eps <= 0.0
-            || !rope_theta.is_finite()
-            || rope_theta <= 0.0
-            || raw
-                .get("rope_scaling")
-                .is_some_and(|value| !value.is_null())
-        {
-            return Err("Vulkan Phi model dimensions or RoPE settings are inconsistent.".into());
-        }
-        Ok(Self {
-            vocab_size,
-            hidden_size,
-            intermediate_size,
-            num_hidden_layers,
-            num_attention_heads,
-            num_key_value_heads,
-            head_dim,
-            rotary_dim,
-            max_position_embeddings,
-            layer_norm_eps,
-            rope_theta,
-            qk_layernorm: raw
-                .get("qk_layernorm")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            tie_word_embeddings: raw
-                .get("tie_word_embeddings")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            activation,
-        })
-    }
-}
-
-pub(crate) fn required_usize(config: &Value, name: &str) -> Result<usize, String> {
-    config
-        .get(name)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("Model config is missing a valid {name}."))
-        .and_then(|value| usize::try_from(value).map_err(|_| format!("{name} does not fit usize.")))
-}
-
-/// Row-wise symmetric int8 quantization of one Linear weight matrix
-/// `[rows, cols]`: one f32 scale per output row + one i8 per weight
-/// (byte-packed). ~0.25 bytes of scale overhead per weight on top of the
-/// int8 payload — roughly half the footprint of BF16.
-#[derive(Clone)]
-struct Q8Matrix {
-    rows: usize,
-    cols: usize,
-    /// Single GPU-facing buffer: a head of `rows` f32 scales (as raw bytes)
-    /// followed by the row-major int8 payloads, each row padded to a
-    /// multiple of four bytes so the shader unpacks four lanes per u32 word.
-    buffer: Arc<[u8]>,
-}
-
-impl Q8Matrix {
-    fn head_bytes(&self) -> usize {
-        self.rows * 4
-    }
-
-    fn row_bytes(&self) -> usize {
-        (self.cols + 3) / 4 * 4
-    }
-
-    fn scale(&self, row: usize) -> f32 {
-        let base = row * 4;
-        f32::from_le_bytes([
-            self.buffer[base],
-            self.buffer[base + 1],
-            self.buffer[base + 2],
-            self.buffer[base + 3],
-        ])
-    }
-
-    fn dequant_value(&self, row: usize, col: usize) -> f32 {
-        let raw = self.buffer[self.head_bytes() + row * self.row_bytes() + col] as i8 as f32;
-        self.scale(row) * raw
-    }
-
-    fn buffer_bytes(&self) -> usize {
-        self.head_bytes() + self.rows * self.row_bytes()
-    }
-}
-
-#[derive(Clone)]
-enum WeightData {
-    F32(Arc<[f32]>),
-    F16(Arc<[u16]>),
-    BF16(Arc<[u16]>),
-    Q8(Arc<Q8Matrix>),
-}
-
-impl WeightData {
-    fn from_view(name: &str, view: &TensorView<'_>) -> Result<Self, String> {
-        let bytes = view.data();
-        match view.dtype() {
-            Dtype::F32 => {
-                if bytes.len() % 4 != 0 {
-                    return Err(format!("Tensor '{name}' has an invalid F32 byte length."));
-                }
-                Ok(Self::F32(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
-                        .collect::<Vec<_>>()
-                        .into(),
-                ))
-            }
-            Dtype::F16 | Dtype::BF16 => {
-                if bytes.len() % 2 != 0 {
-                    return Err(format!(
-                        "Tensor '{name}' has an invalid 16-bit byte length."
-                    ));
-                }
-                let values: Arc<[u16]> = bytes
-                    .chunks_exact(2)
-                    .map(|value| u16::from_le_bytes([value[0], value[1]]))
-                    .collect::<Vec<_>>()
-                    .into();
-                if view.dtype() == Dtype::F16 {
-                    Ok(Self::F16(values))
-                } else {
-                    Ok(Self::BF16(values))
-                }
-            }
-            dtype => Err(format!(
-                "Vulkan models support F32, F16, or BF16 weights; tensor '{name}' uses {dtype:?}."
-            )),
-        }
-    }
-
-    fn value(&self, index: usize) -> f32 {
-        match self {
-            Self::F32(values) => values[index],
-            Self::F16(values) => half::f16::from_bits(values[index]).to_f32(),
-            Self::BF16(values) => half::bf16::from_bits(values[index]).to_f32(),
-            // Q8 is only meaningful with row/col context; callers that hit
-            // the flat accessor get the dequantized value with scale 1 rows.
-            Self::Q8(matrix) => matrix.dequant_value(0, index.min(matrix.cols - 1)),
-        }
-    }
-
-    /// Row-wise symmetric int8 quantization: scale = max|w| / 127 per row.
-    fn quantize_q8_rowwise(&self, rows: usize, cols: usize) -> Result<Self, String> {
-        let expected = rows
-            .checked_mul(cols)
-            .ok_or("Q8 quantization size overflow")?;
-        if self.len() != expected {
-            return Err(format!(
-                "Q8 quantization expected {expected} elements, found {}.",
-                self.len()
-            ));
-        }
-        let row_bytes = (cols + 3) / 4 * 4;
-        let mut buffer = vec![0u8; rows * 4 + rows * row_bytes];
-        for row in 0..rows {
-            let start = row * cols;
-            let mut row_slice = Vec::with_capacity(cols);
-            for col in 0..cols {
-                row_slice.push(self.value(start + col));
-            }
-            let max_abs = row_slice
-                .iter()
-                .fold(0f32, |acc, value| acc.max(value.abs()));
-            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-            let scale_base = row * 4;
-            buffer[scale_base..scale_base + 4].copy_from_slice(&scale.to_le_bytes());
-            for (col, value) in row_slice.iter().enumerate() {
-                let quantized = (value / scale).round().clamp(-127.0, 127.0) as i8;
-                buffer[rows * 4 + row * row_bytes + col] = quantized as u8;
-            }
-        }
-        Ok(Self::Q8(Arc::new(Q8Matrix {
-            rows,
-            cols,
-            buffer: buffer.into(),
-        })))
-    }
-
-    fn add_one(&self) -> Self {
-        Self::F32(
-            (0..self.len())
-                .map(|index| self.value(index) + 1.0)
-                .collect(),
-        )
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::F32(values) => values.len(),
-            Self::F16(values) | Self::BF16(values) => values.len(),
-            Self::Q8(matrix) => matrix.rows * matrix.cols,
-        }
-    }
-
-    /// FFI view for shader operators: (pointer, weight_format, element_count).
-    /// Format encoding matches shared_ops.comp: 0 = f32, 2 = f16, 3 = bf16;
-    /// 4 = q8 (row-wise int8, buffer = scales head + packed rows) — q8 is
-    /// only served by the dedicated matmul pipeline, not shared_ops.
-    fn ffi_parts(&self) -> (*const std::os::raw::c_void, u32, usize) {
-        match self {
-            Self::F32(values) => (values.as_ptr().cast(), 0, values.len()),
-            Self::F16(values) => (values.as_ptr().cast(), 2, values.len()),
-            Self::BF16(values) => (values.as_ptr().cast(), 3, values.len()),
-            Self::Q8(matrix) => (matrix.buffer.as_ptr().cast(), 4, matrix.buffer_bytes() / 4),
-        }
-    }
-
-    fn rms_norm(
-        &self,
-        input: &[f32],
-        rows: usize,
-        width: usize,
-        epsilon: f32,
-    ) -> Result<Vec<f32>, String> {
-        match self {
-            Self::F32(weights) => {
-                cheetah::native::vulkan::rms_norm_f32(input, weights, rows, width, epsilon)
-            }
-            Self::F16(weights) => {
-                cheetah::native::vulkan::rms_norm_fp16(input, weights, rows, width, epsilon)
-            }
-            Self::BF16(weights) => {
-                cheetah::native::vulkan::rms_norm_bf16(input, weights, rows, width, epsilon)
-            }
-            Self::Q8(_) => {
-                Err("Q8 quantization applies to linear projections only; norms stay in their original precision.".to_string())
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn layer_norm(
-        &self,
-        bias: &Self,
-        input: &[f32],
-        rows: usize,
-        width: usize,
-        epsilon: f32,
-    ) -> Result<Vec<f32>, String> {
-        match (self, bias) {
-            (Self::F32(weights), Self::F32(bias)) => {
-                cheetah::native::vulkan::layer_norm_f32(input, weights, bias, rows, width, epsilon)
-            }
-            (Self::F16(weights), Self::F16(bias)) => {
-                cheetah::native::vulkan::layer_norm_fp16(input, weights, bias, rows, width, epsilon)
-            }
-            (Self::BF16(weights), Self::BF16(bias)) => {
-                cheetah::native::vulkan::layer_norm_bf16(input, weights, bias, rows, width, epsilon)
-            }
-            _ => Err("Layer normalization weight and bias dtypes do not match.".into()),
-        }
-    }
-
-    fn linear(
-        &self,
-        input: &[f32],
-        rows: usize,
-        input_size: usize,
-        output_size: usize,
-    ) -> Result<Vec<f32>, String> {
-        let input_len = rows
-            .checked_mul(input_size)
-            .ok_or_else(|| "Vulkan linear input size overflow.".to_string())?;
-        let output_len = rows
-            .checked_mul(output_size)
-            .ok_or_else(|| "Vulkan linear output size overflow.".to_string())?;
-        if rows == 0 || input_size == 0 || output_size == 0 || input.len() != input_len {
-            return Err("Invalid Vulkan linear dimensions or input length.".into());
-        }
-        const MAX_WEIGHT_TILE_ELEMENTS: usize = 16 * 1024 * 1024;
-        const MAX_ROW_TILE: usize = 64;
-        let mut output = vec![0.0; output_len];
-        let tile_size = output_size
-            .min(16_384)
-            .min((MAX_WEIGHT_TILE_ELEMENTS / input_size).max(1));
-        for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
-            let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
-            let input_start = row_offset * input_size;
-            let input_tile = &input[input_start..input_start + tile_rows * input_size];
-            for column_offset in (0..output_size).step_by(tile_size) {
-                let columns = (output_size - column_offset).min(tile_size);
-                let weight_start = column_offset * input_size;
-                let weight_end = (column_offset + columns) * input_size;
-                let tile = match self {
-                    Self::F32(weights) => cheetah::native::vulkan::matmul_f32_transposed(
-                        input_tile,
-                        &weights[weight_start..weight_end],
-                        tile_rows,
-                        input_size,
-                        columns,
-                    )?,
-                    Self::F16(weights) => cheetah::native::vulkan::matmul_fp16_transposed(
-                        input_tile,
-                        &weights[weight_start..weight_end],
-                        tile_rows,
-                        input_size,
-                        columns,
-                    )?,
-                    Self::BF16(weights) => cheetah::native::vulkan::matmul_bf16_transposed(
-                        input_tile,
-                        &weights[weight_start..weight_end],
-                        tile_rows,
-                        input_size,
-                        columns,
-                    )?,
-                    Self::Q8(matrix) => {
-                        // Host-streaming q8 path: the whole buffer (scale
-                        // head + packed rows) is small enough to stage in one
-                        // pass, so no column tiling is needed.
-                        cheetah::native::vulkan::matmul_q8_transposed(
-                            input_tile,
-                            &matrix.buffer,
-                            matrix.rows,
-                            matrix.cols,
-                            tile_rows,
-                            input_size,
-                            matrix.rows,
-                        )?
-                    }
-                };
-                for row in 0..tile_rows {
-                    let source = &tile[row * columns..(row + 1) * columns];
-                    let destination_start = (row_offset + row) * output_size + column_offset;
-                    output[destination_start..destination_start + columns].copy_from_slice(source);
-                }
-            }
-        }
-        Ok(output)
-    }
-}
-
-struct NamedWeight {
-    shape: Vec<usize>,
-    data: WeightData,
-}
-
-/// Ant residency slot for one weight tensor: Some = resident in the GPU
-/// bucket (device-local when available, persistent host-coherent otherwise);
-/// None = streaming path (weights re-staged per matmul from host memory).
-#[derive(Clone)]
-#[allow(dead_code)]
-struct VulkanWeightSlot {
-    handle: u64,
-    element_count: usize,
-    device_local: bool,
-}
-
-#[derive(Clone)]
-struct Linear {
-    name: String,
-    input_size: usize,
-    output_size: usize,
-    weight: WeightData,
-    bias: Option<WeightData>,
-    slot: Option<VulkanWeightSlot>,
-}
-
-const MAX_ROW_TILE: usize = 64;
-
-impl Linear {
-    fn forward(&self, input: &[f32], rows: usize) -> Result<Vec<f32>, String> {
-        let expected = rows
-            .checked_mul(self.input_size)
-            .ok_or_else(|| format!("Input size overflow in '{}'.", self.name))?;
-        if rows == 0 || input.len() != expected {
-            return Err(format!(
-                "Invalid input for '{}': expected {expected} values, received {}.",
-                self.name,
-                input.len()
-            ));
-        }
-        let mut output = if let (WeightData::Q8(_matrix), Some(slot)) = (&self.weight, &self.slot) {
-            // Ant resident q8: the quantized buffer stays bound on the GPU.
-            let mut output = vec![0.0; rows * self.output_size];
-            for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
-                let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
-                let input_tile =
-                    &input[row_offset * self.input_size..][..tile_rows * self.input_size];
-                let out_tile = cheetah::native::vulkan::matmul_q8_transposed_resident(
-                    slot.handle,
-                    input_tile,
-                    tile_rows,
-                    self.input_size,
-                    self.output_size,
-                )?;
-                output[row_offset * self.output_size..][..tile_rows * self.output_size]
-                    .copy_from_slice(&out_tile);
-            }
-            if let Some(bias) = &self.bias {
-                for row in output.chunks_exact_mut(self.output_size) {
-                    for (value, index) in row.iter_mut().zip(0..self.output_size) {
-                        *value += bias.value(index);
-                    }
-                }
-            }
-            return Ok(output);
-        } else if let WeightData::Q8(matrix) = &self.weight {
-            // Q8 host-streaming path: the whole quantized buffer (scale head
-            // + packed int8 rows) stages in one pass — roughly half the size
-            // of the BF16 weights and far below the storage-buffer range.
-            let output_len = rows * self.output_size;
-            eprintln!(
-                "dbg: Q8 forward rows={rows} k={} n={} buffer_bytes={} row_bytes={}",
-                self.input_size,
-                self.output_size,
-                matrix.buffer_bytes(),
-                matrix.row_bytes()
-            );
-            let mut output = vec![0.0; output_len];
-            for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
-                let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
-                let input_tile =
-                    &input[row_offset * self.input_size..][..tile_rows * self.input_size];
-                let out_tile = cheetah::native::vulkan::matmul_q8_transposed(
-                    input_tile,
-                    &matrix.buffer,
-                    matrix.rows,
-                    matrix.cols,
-                    tile_rows,
-                    self.input_size,
-                    matrix.rows,
-                )?;
-                output[row_offset * self.output_size..][..tile_rows * self.output_size]
-                    .copy_from_slice(&out_tile);
-            }
-            output
-        } else if let Some(slot) = &self.slot {
-            // Ant resident bucket (bf16): the weight stays bound in place on
-            // the GPU — only activation and output tiles pass through the
-            // host pool.
-            let mut output = vec![0.0; rows * self.output_size];
-            for row_offset in (0..rows).step_by(MAX_ROW_TILE) {
-                let tile_rows = (rows - row_offset).min(MAX_ROW_TILE);
-                let input_tile =
-                    &input[row_offset * self.input_size..][..tile_rows * self.input_size];
-                let out_tile = cheetah::native::vulkan::matmul_bf16_transposed_resident(
-                    slot.handle,
-                    input_tile,
-                    tile_rows,
-                    self.input_size,
-                    self.output_size,
-                )?;
-                output[row_offset * self.output_size..][..tile_rows * self.output_size]
-                    .copy_from_slice(&out_tile);
-            }
-            output
-        } else {
-            self.weight
-                .linear(input, rows, self.input_size, self.output_size)?
-        };
-        if let Some(bias) = &self.bias {
-            if bias.len() != self.output_size {
-                return Err(format!("Invalid bias shape for '{}'.", self.name));
-            }
-            for row in output.chunks_exact_mut(self.output_size) {
-                for (value, index) in row.iter_mut().zip(0..self.output_size) {
-                    *value += bias.value(index);
-                }
-            }
-        }
-        Ok(output)
-    }
-}
-
 #[derive(Clone)]
 struct Expert {
     gate: Linear,
@@ -871,15 +339,25 @@ impl FeedForward {
                         if resident {
                             let expert = &mut experts[expert_index];
                             if expert.gate.slot.is_none() {
-                                expert.gate.slot =
-                                    upload_slot(&expert.gate.name, &expert.gate.weight);
+                                expert.gate.slot = upload_slot(
+                                    &expert.gate.name,
+                                    &expert.gate.weight,
+                                    (expert.gate.input_size + 3) / 4 * 4,
+                                );
                             }
                             if expert.up.slot.is_none() {
-                                expert.up.slot = upload_slot(&expert.up.name, &expert.up.weight);
+                                expert.up.slot = upload_slot(
+                                    &expert.up.name,
+                                    &expert.up.weight,
+                                    (expert.up.input_size + 3) / 4 * 4,
+                                );
                             }
                             if expert.down.slot.is_none() {
-                                expert.down.slot =
-                                    upload_slot(&expert.down.name, &expert.down.weight);
+                                expert.down.slot = upload_slot(
+                                    &expert.down.name,
+                                    &expert.down.weight,
+                                    (expert.down.input_size + 3) / 4 * 4,
+                                );
                             }
                         } else {
                             let expert = &mut experts[expert_index];
@@ -964,7 +442,7 @@ pub(crate) struct VulkanTransformerExecutor {
     expert_residency: HashMap<(usize, usize), bool>,
 }
 
-impl super::models::ModelRuntime for VulkanTransformerExecutor {
+impl crate::chat::models::ModelRuntime for VulkanTransformerExecutor {
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         VulkanTransformerExecutor::forward(self, tokens, offset)
     }
@@ -977,7 +455,7 @@ impl super::models::ModelRuntime for VulkanTransformerExecutor {
         "Vulkan"
     }
 
-    fn as_ant_tier_control(&mut self) -> Option<&mut dyn super::models::AntTierControl> {
+    fn as_ant_tier_control(&mut self) -> Option<&mut dyn crate::chat::models::AntTierControl> {
         Some(self)
     }
 }
@@ -1002,7 +480,8 @@ impl VulkanTransformerExecutor {
                 handled = true;
                 match (resident, &mut linear.slot) {
                     (true, slot @ None) => {
-                        *slot = upload_slot(&linear.name, &linear.weight);
+                        let row_bytes = (linear.input_size + 3) / 4 * 4;
+                        *slot = upload_slot(&linear.name, &linear.weight, row_bytes);
                     }
                     (false, slot @ Some(_)) => {
                         if let Some(slot) = slot.take() {
@@ -1021,7 +500,8 @@ impl VulkanTransformerExecutor {
                         handled = true;
                         match (resident, &mut linear.slot) {
                             (true, slot @ None) => {
-                                *slot = upload_slot(&linear.name, &linear.weight);
+                                let row_bytes = (linear.input_size + 3) / 4 * 4;
+                                *slot = upload_slot(&linear.name, &linear.weight, row_bytes);
                             }
                             (false, slot @ Some(_)) => {
                                 if let Some(slot) = slot.take() {
@@ -1046,7 +526,8 @@ impl VulkanTransformerExecutor {
                         handled = true;
                         match (resident, &mut linear.slot) {
                             (true, slot @ None) => {
-                                *slot = upload_slot(&linear.name, &linear.weight);
+                                let row_bytes = (linear.input_size + 3) / 4 * 4;
+                                *slot = upload_slot(&linear.name, &linear.weight, row_bytes);
                             }
                             (false, slot @ Some(_)) => {
                                 if let Some(slot) = slot.take() {
@@ -1063,37 +544,13 @@ impl VulkanTransformerExecutor {
     }
 }
 
-impl super::models::AntTierControl for VulkanTransformerExecutor {
+impl crate::chat::models::AntTierControl for VulkanTransformerExecutor {
     fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
         self.page_weight(unit_id, true)
     }
 
     fn evict_unit(&mut self, unit_id: &str) -> bool {
         self.page_weight(unit_id, false)
-    }
-}
-
-/// Upload one linear weight into the resident bucket; returns None when the
-/// backend cannot serve it (then the streaming path stays active).
-fn upload_slot(name: &str, weight: &WeightData) -> Option<VulkanWeightSlot> {
-    match weight {
-        WeightData::BF16(values) => {
-            cheetah::native::vulkan::weight_upload_bf16(values).map(|handle| {
-                eprintln!(
-                    "{}",
-                    color::stderr(
-                        &format!("cheetah: Ant page-in '{name}' -> GPU bucket."),
-                        Color::Green
-                    )
-                );
-                VulkanWeightSlot {
-                    handle,
-                    element_count: values.len(),
-                    device_local: true,
-                }
-            })
-        }
-        _ => None,
     }
 }
 
@@ -1491,485 +948,6 @@ fn load_moe_feed_forward(
         num_experts_per_tok,
         activation: config.activation,
     })
-}
-
-fn load_weights(paths: &[PathBuf]) -> Result<HashMap<String, NamedWeight>, String> {
-    let mut weights = HashMap::new();
-    for path in paths {
-        let file = File::open(path).map_err(|error| {
-            format!(
-                "Cannot open Vulkan model shard '{}': {error}",
-                path.display()
-            )
-        })?;
-        let mapping = unsafe {
-            memmap2::MmapOptions::new().map(&file).map_err(|error| {
-                format!(
-                    "Cannot mmap Vulkan model shard '{}': {error}",
-                    path.display()
-                )
-            })?
-        };
-        let tensors = SafeTensors::deserialize(&mapping)
-            .map_err(|error| format!("Invalid Vulkan model shard '{}': {error}", path.display()))?;
-        for name in tensors.names() {
-            if name.starts_with("__cheetah_padding_") {
-                continue;
-            }
-            let view = tensors.tensor(name).map_err(|error| {
-                format!(
-                    "Cannot read tensor '{name}' from '{}': {error}",
-                    path.display()
-                )
-            })?;
-            let weight = NamedWeight {
-                shape: view.shape().to_vec(),
-                data: WeightData::from_view(name, &view)?,
-            };
-            if weights.insert(name.to_owned(), weight).is_some() {
-                return Err(format!("Duplicate tensor '{name}' across model shards."));
-            }
-        }
-    }
-    Ok(weights)
-}
-
-fn take_weight(
-    weights: &mut HashMap<String, NamedWeight>,
-    name: &str,
-    expected_shape: &[usize],
-) -> Result<NamedWeight, String> {
-    let weight = weights
-        .remove(name)
-        .ok_or_else(|| format!("Vulkan model checkpoint is missing tensor '{name}'."))?;
-    if weight.shape != expected_shape {
-        return Err(format!(
-            "Tensor '{name}' has shape {:?}; expected {expected_shape:?}.",
-            weight.shape
-        ));
-    }
-    Ok(weight)
-}
-
-fn validate_shape(name: &str, actual: &[usize], expected: &[usize]) -> Result<(), String> {
-    if actual != expected {
-        return Err(format!(
-            "Tensor '{name}' has shape {actual:?}; expected {expected:?}."
-        ));
-    }
-    Ok(())
-}
-
-fn take_linear(
-    weights: &mut HashMap<String, NamedWeight>,
-    plan: &BTreeMap<String, String>,
-    prefix: &str,
-    input_size: usize,
-    output_size: usize,
-    with_bias: bool,
-) -> Result<Linear, String> {
-    let weight_name = format!("{prefix}.weight");
-    let resident = plan.get(&weight_name).map(String::as_str) == Some("vram");
-    // Ant quantization: CHEETAH_QUANT_Q8=1 quantizes linear projections to
-    // row-wise int8 (halves the weight footprint for both the streaming and
-    // the resident path). Norms, biases and the embedding stay in full precision.
-    let quantize_q8 = std::env::var("CHEETAH_QUANT_Q8")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let weight = take_weight(weights, &weight_name, &[output_size, input_size])?;
-    let bias_name = format!("{prefix}.bias");
-    let bias = match weights.remove(&bias_name) {
-        Some(bias) => {
-            if bias.shape != [output_size] {
-                return Err(format!(
-                    "Tensor '{bias_name}' has shape {:?}; expected [{output_size}].",
-                    bias.shape
-                ));
-            }
-            Some(bias.data)
-        }
-        None if with_bias => {
-            return Err(format!(
-                "Vulkan checkpoint is missing tensor '{bias_name}'."
-            ));
-        }
-        None => None,
-    };
-    // Ant bucketing: units planned into the VRAM tier are uploaded once into
-    // the resident bucket (device-local when available); the host copy stays
-    // authoritative for page-ins after an eviction. Upload failures fall back
-    // to the per-step streaming path.
-    let slot = if resident {
-        match &weight.data {
-            WeightData::BF16(values) => {
-                cheetah::native::vulkan::weight_upload_bf16(values).map(|handle| VulkanWeightSlot {
-                    handle,
-                    element_count: values.len(),
-                    device_local: true,
-                })
-            }
-            _ => None, // F32/F16 resident upload lands with the bf16 path
-        }
-    } else {
-        None
-    };
-    if resident && slot.is_none() {
-        eprintln!(
-            "{}",
-            color::stderr(
-                &format!(
-                    "cheetah: resident upload for '{prefix}' unavailable; keeping the streaming path."
-                ),
-                Color::Yellow
-            )
-        );
-    }
-    let weight = if quantize_q8 {
-        weight.data.quantize_q8_rowwise(output_size, input_size)?
-    } else {
-        weight.data
-    };
-    Ok(Linear {
-        name: prefix.to_owned(),
-        input_size,
-        output_size,
-        weight,
-        bias,
-        slot,
-    })
-}
-
-#[derive(Clone)]
-#[allow(dead_code)]
-struct PhiNorm {
-    weight: WeightData,
-    bias: WeightData,
-}
-
-impl PhiNorm {
-    #[allow(dead_code)]
-    fn forward(
-        &self,
-        input: &[f32],
-        rows: usize,
-        width: usize,
-        epsilon: f32,
-    ) -> Result<Vec<f32>, String> {
-        self.weight
-            .layer_norm(&self.bias, input, rows, width, epsilon)
-    }
-}
-
-#[allow(dead_code)]
-fn take_phi_norm(
-    weights: &mut HashMap<String, NamedWeight>,
-    prefix: &str,
-    width: usize,
-) -> Result<PhiNorm, String> {
-    let weight_name = format!("{prefix}.weight");
-    let bias_name = format!("{prefix}.bias");
-    Ok(PhiNorm {
-        weight: take_weight(weights, &weight_name, &[width])?.data,
-        bias: take_weight(weights, &bias_name, &[width])?.data,
-    })
-}
-
-#[derive(Clone)]
-#[allow(dead_code)]
-struct PhiLayer {
-    input_norm: PhiNorm,
-    q_norm: Option<PhiNorm>,
-    k_norm: Option<PhiNorm>,
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    dense: Linear,
-    fc1: Linear,
-    fc2: Linear,
-    keys: Vec<f32>,
-    values: Vec<f32>,
-}
-
-#[derive(Clone)]
-#[allow(dead_code)]
-pub(crate) struct VulkanPhiExecutor {
-    config: VulkanPhiConfig,
-    embedding: WeightData,
-    layers: Vec<PhiLayer>,
-    final_norm: PhiNorm,
-    lm_head: Linear,
-}
-
-impl super::models::ModelRuntime for VulkanPhiExecutor {
-    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
-        VulkanPhiExecutor::forward(self, tokens, offset)
-    }
-
-    fn clear_cache(&mut self) {
-        for layer in &mut self.layers {
-            layer.keys.clear();
-            layer.values.clear();
-        }
-    }
-
-    fn device_name(&self) -> &'static str {
-        "Vulkan"
-    }
-}
-
-impl VulkanPhiExecutor {
-    #[allow(dead_code)]
-    pub(crate) fn load(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
-        let result = (|| {
-            cheetah::native::vulkan::initialize()?;
-            cheetah::native::vulkan::prepare()?;
-            Self::load_initialized(paths, config)
-        })();
-        if result.is_err()
-            && let Err(shutdown_error) = cheetah::native::vulkan::shutdown()
-        {
-            eprintln!(
-                "{}",
-                color::stderr(
-                    &format!(
-                        "cheetah: Vulkan cleanup after Phi startup failure also failed ({shutdown_error})."
-                    ),
-                    Color::Red
-                )
-            );
-        }
-        result
-    }
-
-    fn load_initialized(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
-        let mut weights = load_weights(paths)?;
-        let embedding = take_weight(
-            &mut weights,
-            "model.embed_tokens.weight",
-            &[config.vocab_size, config.hidden_size],
-        )?
-        .data;
-        let final_norm = take_phi_norm(&mut weights, "model.final_layernorm", config.hidden_size)?;
-        let lm_head = if weights.contains_key("lm_head.weight") {
-            take_linear(
-                &mut weights,
-                &BTreeMap::new(),
-                "lm_head",
-                config.hidden_size,
-                config.vocab_size,
-                true,
-            )?
-        } else if config.tie_word_embeddings {
-            Linear {
-                name: "lm_head".into(),
-                input_size: config.hidden_size,
-                output_size: config.vocab_size,
-                weight: embedding.clone(),
-                slot: None,
-                bias: None,
-            }
-        } else {
-            return Err("Vulkan Phi checkpoint is missing tensor 'lm_head.weight'.".into());
-        };
-        let qk_norm_size = config.head_dim;
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for index in 0..config.num_hidden_layers {
-            let prefix = format!("model.layers.{index}");
-            let attention = format!("{prefix}.self_attn");
-            let input_norm = take_phi_norm(
-                &mut weights,
-                &format!("{prefix}.input_layernorm"),
-                config.hidden_size,
-            )?;
-            let (q_norm, k_norm) = if config.qk_layernorm {
-                (
-                    Some(take_phi_norm(
-                        &mut weights,
-                        &format!("{attention}.q_layernorm"),
-                        qk_norm_size,
-                    )?),
-                    Some(take_phi_norm(
-                        &mut weights,
-                        &format!("{attention}.k_layernorm"),
-                        qk_norm_size,
-                    )?),
-                )
-            } else {
-                (None, None)
-            };
-            layers.push(PhiLayer {
-                input_norm,
-                q_norm,
-                k_norm,
-                q_proj: take_linear(
-                    &mut weights,
-                    &BTreeMap::new(),
-                    &format!("{attention}.q_proj"),
-                    config.hidden_size,
-                    config.num_attention_heads * config.head_dim,
-                    true,
-                )?,
-                k_proj: take_linear(
-                    &mut weights,
-                    &BTreeMap::new(),
-                    &format!("{attention}.k_proj"),
-                    config.hidden_size,
-                    config.num_key_value_heads * config.head_dim,
-                    true,
-                )?,
-                v_proj: take_linear(
-                    &mut weights,
-                    &BTreeMap::new(),
-                    &format!("{attention}.v_proj"),
-                    config.hidden_size,
-                    config.num_key_value_heads * config.head_dim,
-                    true,
-                )?,
-                dense: take_linear(
-                    &mut weights,
-                    &BTreeMap::new(),
-                    &format!("{attention}.dense"),
-                    config.num_attention_heads * config.head_dim,
-                    config.hidden_size,
-                    true,
-                )?,
-                fc1: take_linear(
-                    &mut weights,
-                    &BTreeMap::new(),
-                    &format!("{prefix}.mlp.fc1"),
-                    config.hidden_size,
-                    config.intermediate_size,
-                    true,
-                )?,
-                fc2: take_linear(
-                    &mut weights,
-                    &BTreeMap::new(),
-                    &format!("{prefix}.mlp.fc2"),
-                    config.intermediate_size,
-                    config.hidden_size,
-                    true,
-                )?,
-                keys: Vec::new(),
-                values: Vec::new(),
-            });
-        }
-        Ok(Self {
-            config: config.clone(),
-            embedding,
-            layers,
-            final_norm,
-            lm_head,
-        })
-    }
-
-    #[allow(dead_code)]
-    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
-        let sequence = tokens.len();
-        if sequence == 0 {
-            return Err("Vulkan Phi currently requires a non-empty batch of size one.".into());
-        }
-        let last_position = offset
-            .checked_add(sequence)
-            .ok_or_else(|| "Vulkan Phi sequence position overflow.".to_string())?;
-        if last_position > self.config.max_position_embeddings {
-            return Err("Vulkan Phi input exceeds max_position_embeddings.".into());
-        }
-        let expected_cache = offset
-            .checked_mul(self.config.num_key_value_heads)
-            .and_then(|count| count.checked_mul(self.config.head_dim))
-            .ok_or_else(|| "Vulkan Phi cache size overflow.".to_string())?;
-        if self
-            .layers
-            .first()
-            .is_some_and(|layer| layer.keys.len() != expected_cache)
-        {
-            return Err("Vulkan Phi KV cache position does not match the input offset.".into());
-        }
-        let hidden = self.config.hidden_size;
-        let mut activations = Vec::with_capacity(sequence * hidden);
-        for token_id in tokens {
-            let token = *token_id as usize;
-            if token >= self.config.vocab_size {
-                return Err(format!("Token ID {token} exceeds the Phi vocabulary."));
-            }
-            let start = token * hidden;
-            activations.extend((0..hidden).map(|index| self.embedding.value(start + index)));
-        }
-
-        for layer in &mut self.layers {
-            let residual = activations.clone();
-            let normalized = layer.input_norm.forward(
-                &activations,
-                sequence,
-                hidden,
-                self.config.layer_norm_eps,
-            )?;
-            let mut query = layer.q_proj.forward(&normalized, sequence)?;
-            let mut keys = layer.k_proj.forward(&normalized, sequence)?;
-            let values = layer.v_proj.forward(&normalized, sequence)?;
-            if let Some(norm) = &layer.q_norm {
-                query = norm.forward(
-                    &query,
-                    sequence * self.config.num_attention_heads,
-                    self.config.head_dim,
-                    self.config.layer_norm_eps,
-                )?;
-            }
-            if let Some(norm) = &layer.k_norm {
-                keys = norm.forward(
-                    &keys,
-                    sequence * self.config.num_key_value_heads,
-                    self.config.head_dim,
-                    self.config.layer_norm_eps,
-                )?;
-            }
-            (query, keys) = cheetah::native::vulkan::rotary(
-                &query,
-                &keys,
-                sequence,
-                offset,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-                self.config.rotary_dim,
-                self.config.rope_theta,
-            )?;
-            layer.keys.extend_from_slice(&keys);
-            layer.values.extend_from_slice(&values);
-            let attention = cheetah::native::vulkan::attention(
-                &query,
-                &layer.keys,
-                &layer.values,
-                sequence,
-                offset,
-                offset + sequence,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-                0,
-            )?;
-            let attention = layer.dense.forward(&attention, sequence)?;
-            let mut feed_forward = layer.fc1.forward(&normalized, sequence)?;
-            let ones = vec![1.0; feed_forward.len()];
-            feed_forward = match self.config.activation {
-                Activation::Silu => cheetah::native::vulkan::silu_mul(&feed_forward, &ones)?,
-                Activation::Gelu => cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, false)?,
-                Activation::NewGelu => {
-                    cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, true)?
-                }
-            };
-            feed_forward = layer.fc2.forward(&feed_forward, sequence)?;
-            let residual_attention = cheetah::native::vulkan::add(&residual, &attention)?;
-            activations = cheetah::native::vulkan::add(&residual_attention, &feed_forward)?;
-        }
-
-        let last = &activations[(sequence - 1) * hidden..sequence * hidden];
-        let normalized = self
-            .final_norm
-            .forward(last, 1, hidden, self.config.layer_norm_eps)?;
-        let logits = self.lm_head.forward(&normalized, 1)?;
-        Ok(logits)
-    }
 }
 
 #[cfg(test)]

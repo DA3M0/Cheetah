@@ -8,7 +8,6 @@ mod templates;
 // below, and the runtime lookups derive from it — adding a family is adding
 // a registration file, no table edits. The Vulkan side is one generic
 // loader: executor features derive from the model's own `model_type`.
-mod vulkan_executors;
 
 use serde_json::Value;
 use std::path::PathBuf;

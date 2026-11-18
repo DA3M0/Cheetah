@@ -21,6 +21,12 @@
 #ifndef CHEETAH_DEFAULT_MATMUL_BF16_SPV
 #define CHEETAH_DEFAULT_MATMUL_BF16_SPV "matmul_bf16.spv"
 #endif
+#ifndef CHEETAH_DEFAULT_MATMUL_Q8_SPV
+#define CHEETAH_DEFAULT_MATMUL_Q8_SPV "matmul_q8.spv"
+#endif
+#ifndef CHEETAH_DEFAULT_MATMUL_Q4_SPV
+#define CHEETAH_DEFAULT_MATMUL_Q4_SPV "matmul_q4.spv"
+#endif
 #ifndef CHEETAH_DEFAULT_SHARED_OPS_SPV
 #define CHEETAH_DEFAULT_SHARED_OPS_SPV "shared_ops.spv"
 #endif
@@ -67,7 +73,63 @@ static VkDescriptorSetLayout g_matmul_descriptor_layout = VK_NULL_HANDLE;
 static VkPipelineLayout g_matmul_pipeline_layout = VK_NULL_HANDLE;
 static VkPipeline g_matmul_pipeline = VK_NULL_HANDLE;
 static VkPipeline g_matmul_bf16_pipeline = VK_NULL_HANDLE;
-static VkPipeline g_matmul_q8_pipeline = VK_NULL_HANDLE;
+/* Quantized-format matmul pipelines, indexed by the registered weight-format
+ * code (q8 = 4, q4 = 5; codes match the Rust precision registry). */
+#define CHEETAH_QUANT_PIPELINE_BASE 4U
+#define CHEETAH_QUANT_PIPELINE_SLOTS 8U
+static VkPipeline g_matmul_quant_pipelines[CHEETAH_QUANT_PIPELINE_SLOTS];
+
+/* One row per registered quantization format: the weight-format code the
+ * resident records carry plus the shader override pair (env + build-time
+ * default define) of the format's matmul pipeline. Adding a quantization
+ * format is adding a row here plus its .comp shader. */
+static const struct QuantFormatInfo {
+    uint32_t weight_format;
+    const char *shader_env;
+    const char *default_shader;
+} g_quant_formats[] = {
+    {4U, "CHEETAH_MATMUL_Q8_SPV", CHEETAH_DEFAULT_MATMUL_Q8_SPV},
+    {5U, "CHEETAH_MATMUL_Q4_SPV", CHEETAH_DEFAULT_MATMUL_Q4_SPV},
+};
+
+static const struct QuantFormatInfo *quant_format_info(uint32_t weight_format) {
+    size_t index;
+    for (index = 0;
+         index < sizeof(g_quant_formats) / sizeof(g_quant_formats[0]);
+         ++index) {
+        if (g_quant_formats[index].weight_format == weight_format) {
+            return &g_quant_formats[index];
+        }
+    }
+    return NULL;
+}
+
+static VkPipeline *quant_pipeline_slot(uint32_t weight_format) {
+    if (weight_format < CHEETAH_QUANT_PIPELINE_BASE ||
+        weight_format - CHEETAH_QUANT_PIPELINE_BASE >=
+            CHEETAH_QUANT_PIPELINE_SLOTS) {
+        return NULL;
+    }
+    return &g_matmul_quant_pipelines[weight_format - CHEETAH_QUANT_PIPELINE_BASE];
+}
+
+/* Format-generic operator bodies (defined below); the per-format entry
+ * points — vk_matmul_q8/q4_transposed_checked, cheetah_vulkan_weight_upload_q8/q4
+ * and vk_matmul_q8/q4_transposed_resident_checked — are thin wrappers that
+ * pass the format's weight-format code and row stride. */
+static int vk_matmul_quant_transposed_checked(const float *a,
+                                              const uint8_t *quantized,
+                                              float *c, int m, int k, int n,
+                                              uint32_t weight_format,
+                                              uint32_t row_bytes);
+static uint64_t cheetah_vulkan_weight_upload_quant(const uint8_t *bytes,
+                                                   uint64_t byte_size,
+                                                   uint32_t row_bytes,
+                                                   uint32_t weight_format);
+static int vk_matmul_quant_transposed_resident_checked(uint64_t weight_handle,
+                                                       const float *a,
+                                                       float *c, int m, int k,
+                                                       int n);
 static VkDescriptorSetLayout g_qwen_descriptor_layout = VK_NULL_HANDLE;
 static VkPipelineLayout g_qwen_pipeline_layout = VK_NULL_HANDLE;
 static VkPipeline g_qwen_pipeline = VK_NULL_HANDLE;
@@ -857,6 +919,15 @@ static void destroy_matmul_pipeline(void) {
         if (g_matmul_bf16_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(g_vulkan.device, g_matmul_bf16_pipeline, NULL);
         }
+        {
+            size_t slot;
+            for (slot = 0; slot < CHEETAH_QUANT_PIPELINE_SLOTS; ++slot) {
+                if (g_matmul_quant_pipelines[slot] != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(g_vulkan.device,
+                                      g_matmul_quant_pipelines[slot], NULL);
+                }
+            }
+        }
         if (g_qwen_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(g_vulkan.device, g_qwen_pipeline, NULL);
         }
@@ -879,6 +950,7 @@ static void destroy_matmul_pipeline(void) {
     }
     g_matmul_pipeline = VK_NULL_HANDLE;
     g_matmul_bf16_pipeline = VK_NULL_HANDLE;
+    memset(g_matmul_quant_pipelines, 0, sizeof(g_matmul_quant_pipelines));
     g_matmul_pipeline_layout = VK_NULL_HANDLE;
     g_matmul_descriptor_layout = VK_NULL_HANDLE;
     g_qwen_pipeline = VK_NULL_HANDLE;
@@ -2303,26 +2375,37 @@ int vk_qwen_bias_add(const float *values, const void *bias,
                             ceil_div_u32((uint32_t)total_count, 64));
 }
 
-/* ---- Ant q8 operators: row-wise int8 quantized matmul ----
+/* ---- Ant quantized matmul operators (format-generic) ----
  *
- * Quantized weight buffer layout (shared by streaming and resident paths):
- * a head of `n` f32 row scales (raw bits) followed by the row-major int8
- * payloads, each row padded to a multiple of four bytes. The shader unpacks
- * four int8 lanes per u32 word and multiplies by the row scale. */
+ * Each registered quantization format (see the Rust precision registry,
+ * src/chat/precision) contributes one g_quant_formats row and one .comp
+ * shader unpacking its packed payloads:
+ *   q8 - a head of `n` f32 row scales then row-major int8 payloads, each row
+ *        padded to a multiple of four bytes; four int8 lanes per u32 word.
+ *   q4 - the same layout with int4 payloads, two codes per byte (low nibble
+ *        = even column); eight int4 lanes per u32 word.
+ * The streaming matmul, resident upload and resident matmul bodies below are
+ * format-generic: only the weight-format code and the pipeline differ. */
 
-static int ensure_matmul_q8_pipeline(void) {
+static int ensure_matmul_quant_pipeline(
+    const struct QuantFormatInfo *format) {
     VkShaderModule shader = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline *slot = quant_pipeline_slot(format->weight_format);
+    const char *env_value = getenv(format->shader_env);
+    const char *shader_path =
+        env_value != NULL && env_value[0] != '\0' ? env_value
+                                                  : format->default_shader;
     VkPipelineShaderStageCreateInfo stage_info;
     VkComputePipelineCreateInfo pipeline_info;
     VkDescriptorSetLayoutBinding bindings[3];
     VkDescriptorSetLayoutCreateInfo descriptor_layout_info;
     VkPushConstantRange push_constant;
     VkPipelineLayoutCreateInfo pipeline_layout_info;
-    const char *shader_path = getenv("CHEETAH_MATMUL_Q8_SPV") != NULL &&
-                                      getenv("CHEETAH_MATMUL_Q8_SPV")[0] != '\0'
-                                  ? getenv("CHEETAH_MATMUL_Q8_SPV")
-                                  : CHEETAH_DEFAULT_MATMUL_Q8_SPV;
+    if (slot == NULL) {
+        report_error("unknown quantized weight format");
+        return -1;
+    }
     if (g_matmul_descriptor_layout == VK_NULL_HANDLE) {
         memset(bindings, 0, sizeof(bindings));
         for (uint32_t i = 0; i < 3; ++i) {
@@ -2340,7 +2423,7 @@ static int ensure_matmul_q8_pipeline(void) {
         if (vkCreateDescriptorSetLayout(g_vulkan.device,
                                         &descriptor_layout_info, NULL,
                                         &g_matmul_descriptor_layout) != VK_SUCCESS) {
-            report_error("unable to create the q8 matmul descriptor layout");
+            report_error("unable to create the quantized matmul descriptor layout");
             return -1;
         }
     }
@@ -2357,13 +2440,13 @@ static int ensure_matmul_q8_pipeline(void) {
         pipeline_layout_info.pPushConstantRanges = &push_constant;
         if (vkCreatePipelineLayout(g_vulkan.device, &pipeline_layout_info, NULL,
                                    &g_matmul_pipeline_layout) != VK_SUCCESS) {
-            report_error("unable to create the q8 matmul pipeline layout");
+            report_error("unable to create the quantized matmul pipeline layout");
             return -1;
         }
     }
     shader = vk_load_spirv_shader(shader_path);
     if (shader == VK_NULL_HANDLE) {
-        report_error("unable to load the q8 matmul shader");
+        report_error("unable to load the quantized matmul shader");
         return -1;
     }
     memset(&stage_info, 0, sizeof(stage_info));
@@ -2379,17 +2462,37 @@ static int ensure_matmul_q8_pipeline(void) {
     if (vkCreateComputePipelines(g_vulkan.device, VK_NULL_HANDLE, 1,
                                  &pipeline_info, NULL, &pipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(g_vulkan.device, shader, NULL);
-        report_error("unable to create the q8 matmul pipeline");
+        report_error("unable to create the quantized matmul pipeline");
         return -1;
     }
     vkDestroyShaderModule(g_vulkan.device, shader, NULL);
-    g_matmul_q8_pipeline = pipeline;
+    *slot = pipeline;
     return 0;
 }
 
 int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
                                     float *c, int m, int k, int n) {
-    uint32_t row_bytes = ((uint32_t)k + 3U) / 4U * 4U;
+    return vk_matmul_quant_transposed_checked(a, q8, c, m, k, n, 4U,
+                                              ((uint32_t)k + 3U) / 4U * 4U);
+}
+
+/* Row-major int4 payloads, two codes per byte (low nibble = even column),
+ * rows padded to a multiple of four bytes (see src/chat/precision/q4.rs --
+ * the Rust and C layouts must match). */
+int vk_matmul_q4_transposed_checked(const float *a, const uint8_t *q4,
+                                    float *c, int m, int k, int n) {
+    return vk_matmul_quant_transposed_checked(
+        a, q4, c, m, k, n, 5U,
+        (((uint32_t)k + 1U) / 2U + 3U) / 4U * 4U);
+}
+
+static int vk_matmul_quant_transposed_checked(const float *a,
+                                              const uint8_t *quantized,
+                                              float *c, int m, int k, int n,
+                                              uint32_t weight_format,
+                                              uint32_t row_bytes) {
+    const struct QuantFormatInfo *format = quant_format_info(weight_format);
+    VkPipeline *pipeline_slot = quant_pipeline_slot(weight_format);
     VkDescriptorPoolSize descriptor_pool_size;
     VkDescriptorPoolCreateInfo descriptor_pool_info;
     VkDescriptorSetAllocateInfo descriptor_allocate_info;
@@ -2431,33 +2534,31 @@ int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
     VkDeviceSize bytes_c = (VkDeviceSize)m * (VkDeviceSize)n * sizeof(float);
 
     if (!g_vulkan.initialized) {
-        report_error("q8 matmul called before Vulkan initialization");
+        report_error("quantized matmul called before Vulkan initialization");
         return -1;
     }
-    if (m <= 0 || k <= 0 || n <= 0 || row_bytes < (uint32_t)k) {
-        report_error("invalid q8 matmul dimensions");
+    if (m <= 0 || k <= 0 || n <= 0 || row_bytes == 0U || format == NULL ||
+        pipeline_slot == NULL) {
+        report_error("invalid quantized matmul dimensions or format");
         return -1;
     }
     if (bytes_a > g_vulkan.properties.limits.maxStorageBufferRange ||
         bytes_b > g_vulkan.properties.limits.maxStorageBufferRange ||
         bytes_c > g_vulkan.properties.limits.maxStorageBufferRange) {
-        report_error("q8 matmul allocation exceeds maxStorageBufferRange");
+        report_error("quantized matmul allocation exceeds maxStorageBufferRange");
         return -1;
     }
     groups_x = ((uint32_t)n + 15U) / 16U;
     groups_y = ((uint32_t)m + 15U) / 16U;
 
     matmul_lock();
-    if (g_matmul_q8_pipeline == VK_NULL_HANDLE &&
-        ensure_matmul_q8_pipeline() != 0) {
+    if (*pipeline_slot == VK_NULL_HANDLE &&
+        ensure_matmul_quant_pipeline(format) != 0) {
         matmul_unlock();
         return -1;
     }
     matmul_unlock();
 
-    fprintf(stderr, "dbg: q8 matmul allocating a=%llu b=%llu c=%llu\n",
-            (unsigned long long)bytes_a, (unsigned long long)bytes_b,
-            (unsigned long long)bytes_c);
     device_a = vk_alloc_vram((size_t)bytes_a);
     device_b = vk_alloc_vram((size_t)bytes_b);
     device_c = vk_alloc_vram((size_t)bytes_c);
@@ -2465,7 +2566,7 @@ int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
         goto cleanup;
     }
     memcpy(device_a, a, (size_t)bytes_a);
-    memcpy(device_b, q8, (size_t)bytes_b);
+    memcpy(device_b, quantized, (size_t)bytes_b);
     memset(device_c, 0, (size_t)bytes_c);
     if (vk_get_vram_allocation(device_a, &pool_buffer, &offset_a, &size_a) != 0 ||
         vk_get_vram_allocation(device_b, &pool_buffer, &offset_b, &size_b) != 0 ||
@@ -2473,7 +2574,7 @@ int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
         goto cleanup;
     }
     if (buffer_a != buffer_b || buffer_a != buffer_c) {
-        report_error("q8 matmul matrices do not share the pool buffer");
+        report_error("quantized matmul matrices do not share the pool buffer");
         goto cleanup;
     }
 
@@ -2520,9 +2621,6 @@ int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         descriptor_writes[i].pBufferInfo = &buffer_infos[i];
     }
-    fprintf(stderr, "dbg: q8 matmul writing descriptors a_off=%llu b_off=%llu c_off=%llu\n",
-            (unsigned long long)offset_a, (unsigned long long)offset_b,
-            (unsigned long long)offset_c);
     vkUpdateDescriptorSets(g_vulkan.device, 3, descriptor_writes, 0, NULL);
 
     memset(&command_allocate_info, 0, sizeof(command_allocate_info));
@@ -2546,7 +2644,7 @@ int vk_matmul_q8_transposed_checked(const float *a, const uint8_t *q8,
     dimensions[2] = (uint32_t)n;
     dimensions[3] = row_bytes;
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      g_matmul_q8_pipeline);
+                      *pipeline_slot);
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             g_matmul_pipeline_layout, 0, 1, &descriptor_set,
                             0, NULL);
@@ -2608,11 +2706,25 @@ cleanup:
     return status;
 }
 
-/* Upload one q8 quantized weight buffer into the resident bucket.
- * byte_size covers the f32 scale head plus the packed int8 rows. */
+/* Upload one quantized weight buffer into the resident bucket. byte_size
+ * covers the f32 scale head plus the packed payloads; weight_format is the
+ * registered format code the resident record carries (q8 = 4, q4 = 5). */
 uint64_t cheetah_vulkan_weight_upload_q8(const uint8_t *bytes,
                                          uint64_t byte_size,
                                          uint32_t row_bytes) {
+    return cheetah_vulkan_weight_upload_quant(bytes, byte_size, row_bytes, 4U);
+}
+
+uint64_t cheetah_vulkan_weight_upload_q4(const uint8_t *bytes,
+                                         uint64_t byte_size,
+                                         uint32_t row_bytes) {
+    return cheetah_vulkan_weight_upload_quant(bytes, byte_size, row_bytes, 5U);
+}
+
+static uint64_t cheetah_vulkan_weight_upload_quant(const uint8_t *bytes,
+                                                   uint64_t byte_size,
+                                                   uint32_t row_bytes,
+                                                   uint32_t weight_format) {
     VkMemoryRequirements memory_requirements;
     VkMemoryAllocateInfo memory_info;
     VkBufferCreateInfo buffer_info;
@@ -2636,7 +2748,8 @@ uint64_t cheetah_vulkan_weight_upload_q8(const uint8_t *bytes,
     int registered = 0;
 
     if (!g_vulkan.initialized || byte_size == 0 ||
-        byte_size > g_vulkan.properties.limits.maxStorageBufferRange) {
+        byte_size > g_vulkan.properties.limits.maxStorageBufferRange ||
+        quant_format_info(weight_format) == NULL) {
         return 0;
     }
     memset(&buffer_info, 0, sizeof(buffer_info));
@@ -2756,7 +2869,7 @@ uint64_t cheetah_vulkan_weight_upload_q8(const uint8_t *bytes,
     record->buffer = weight_buffer;
     record->memory = weight_memory;
     record->size = byte_size;
-    record->weight_format = 4; /* q8 */
+    record->weight_format = weight_format;
     record->element_count = 0;
     record->row_bytes = row_bytes;
     record->device_local = device_local;
@@ -2792,6 +2905,23 @@ cleanup:
 int vk_matmul_q8_transposed_resident_checked(uint64_t weight_handle,
                                              const float *a, float *c, int m,
                                              int k, int n) {
+    return vk_matmul_quant_transposed_resident_checked(weight_handle, a, c, m,
+                                                       k, n);
+}
+
+int vk_matmul_q4_transposed_resident_checked(uint64_t weight_handle,
+                                             const float *a, float *c, int m,
+                                             int k, int n) {
+    return vk_matmul_quant_transposed_resident_checked(weight_handle, a, c, m,
+                                                       k, n);
+}
+
+static int vk_matmul_quant_transposed_resident_checked(uint64_t weight_handle,
+                                                       const float *a,
+                                                       float *c, int m, int k,
+                                                       int n) {
+    const struct QuantFormatInfo *format = NULL;
+    VkPipeline *pipeline_slot = NULL;
     VkDescriptorPoolSize descriptor_pool_size;
     VkDescriptorPoolCreateInfo descriptor_pool_info;
     VkDescriptorSetAllocateInfo descriptor_allocate_info;
@@ -2827,18 +2957,17 @@ int vk_matmul_q8_transposed_resident_checked(uint64_t weight_handle,
     VkDeviceSize bytes_c = (VkDeviceSize)m * (VkDeviceSize)n * sizeof(float);
 
     if (!g_vulkan.initialized) {
-        report_error("resident q8 matmul called before initialization");
+        report_error("resident quantized matmul called before initialization");
         return -1;
     }
     weight = find_resident_weight(weight_handle);
-    if (weight == NULL || weight->weight_format != 4) {
-        report_error("resident q8 matmul called with an invalid handle");
+    if (weight == NULL || quant_format_info(weight->weight_format) == NULL) {
+        report_error("resident quantized matmul called with an invalid handle");
         return -1;
     }
     weight_buffer = weight->buffer;
-    if (m <= 0 || k <= 0 || n <= 0 ||
-        weight->row_bytes < (uint32_t)((k + 3U) / 4U * 4U)) {
-        report_error("invalid resident q8 matmul dimensions");
+    if (m <= 0 || k <= 0 || n <= 0 || weight->row_bytes == 0U) {
+        report_error("invalid resident quantized matmul dimensions");
         return -1;
     }
     bytes_a = (VkDeviceSize)m * (VkDeviceSize)k * sizeof(float);
@@ -2847,15 +2976,19 @@ int vk_matmul_q8_transposed_resident_checked(uint64_t weight_handle,
         bytes_c > g_vulkan.properties.limits.maxStorageBufferRange ||
         (VkDeviceSize)weight->size >
             g_vulkan.properties.limits.maxStorageBufferRange) {
-        report_error("resident q8 matmul allocation exceeds limits");
+        report_error("resident quantized matmul allocation exceeds limits");
         return -1;
     }
     groups_x = ((uint32_t)n + 15U) / 16U;
     groups_y = ((uint32_t)m + 15U) / 16U;
 
+    format = quant_format_info(weight->weight_format);
+    pipeline_slot =
+        format != NULL ? quant_pipeline_slot(weight->weight_format) : NULL;
     matmul_lock();
-    if (g_matmul_q8_pipeline == VK_NULL_HANDLE &&
-        ensure_matmul_q8_pipeline() != 0) {
+    if (pipeline_slot == NULL ||
+        (*pipeline_slot == VK_NULL_HANDLE &&
+         ensure_matmul_quant_pipeline(format) != 0)) {
         matmul_unlock();
         return -1;
     }
@@ -2941,7 +3074,7 @@ int vk_matmul_q8_transposed_resident_checked(uint64_t weight_handle,
     dimensions[2] = (uint32_t)n;
     dimensions[3] = weight->row_bytes;
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      g_matmul_q8_pipeline);
+                      *pipeline_slot);
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             g_matmul_pipeline_layout, 0, 1, &descriptor_set,
                             0, NULL);

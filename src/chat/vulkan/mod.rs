@@ -1,12 +1,20 @@
-//! Generic Vulkan executor loader for every registered family. All backend
-//! tables reference the one `load` entry point; the per-family executor
-//! features derive from the model's own `config.json` (`model_type`), so a
-//! registration file needs nothing beyond that reference. A family only
-//! touches this module when it needs executor features no existing arm
-//! covers.
+//! The Vulkan backend: one generic loader for every registered family. All
+//! backend tables reference the one `load` entry point; the per-family
+//! executor features derive from the model's own `config.json`
+//! (`model_type`), so a registration file needs nothing beyond that
+//! reference. A family only touches this module when it needs executor
+//! features no existing arm covers.
+//!
+//! - `transformer` — the generic transformer executor (llama-shaped families)
+//! - `phi` — the phi executor (different block topology)
+//! - `weights` — the shared weight layer + precision-registry dispatch
+
+mod phi;
+mod transformer;
+mod weights;
 
 #[cfg(feature = "vulkan")]
-use super::ModelRuntime;
+use super::models::ModelRuntime;
 #[cfg(feature = "vulkan")]
 use serde_json::Value;
 #[cfg(feature = "vulkan")]
@@ -31,20 +39,21 @@ pub(super) fn load(
                 .to_string()
         })?;
     match model_type {
-        "llama" => transformer(weight_paths, plan, llama_config(&raw_config)?),
-        "qwen2" => transformer(weight_paths, plan, qwen2_config(&raw_config)?),
-        "qwen3" => transformer(weight_paths, plan, qwen3_config(&raw_config)?),
-        "mistral" => transformer(weight_paths, plan, mistral_config(&raw_config)?),
-        "gemma" => transformer(weight_paths, plan, gemma_config(&raw_config)?),
-        "mixtral" => transformer(weight_paths, plan, mixtral_config(&raw_config)?),
+        "llama" => build_transformer(weight_paths, plan, llama_config(&raw_config)?),
+        "qwen2" => build_transformer(weight_paths, plan, qwen2_config(&raw_config)?),
+        "qwen3" => build_transformer(weight_paths, plan, qwen3_config(&raw_config)?),
+        "mistral" => build_transformer(weight_paths, plan, mistral_config(&raw_config)?),
+        "gemma" => build_transformer(weight_paths, plan, gemma_config(&raw_config)?),
+        "mixtral" => build_transformer(weight_paths, plan, mixtral_config(&raw_config)?),
         // Phi runs its own executor: a different block topology (biased
         // LayerNorms, parallel residual, fused projections), so it does not
         // share the transformer config builder.
         "phi" => {
-            let config = super::super::vulkan_transformer::VulkanPhiConfig::parse(&raw_config)?;
-            Ok(Box::new(
-                super::super::vulkan_transformer::VulkanPhiExecutor::load(weight_paths, &config)?,
-            ))
+            let config = phi::VulkanPhiConfig::parse(&raw_config)?;
+            Ok(Box::new(phi::VulkanPhiExecutor::load(
+                weight_paths,
+                &config,
+            )?))
         }
         other => Err(format!(
             "Vulkan executor: no executor features for model_type '{other}'."
@@ -54,25 +63,29 @@ pub(super) fn load(
 
 /// Build the transformer executor around an already-derived feature set.
 #[cfg(feature = "vulkan")]
-fn transformer(
+fn build_transformer(
     weight_paths: &[PathBuf],
     plan: &std::collections::BTreeMap<String, String>,
-    config: super::super::vulkan_transformer::VulkanTransformerConfig,
+    config: transformer::VulkanTransformerConfig,
 ) -> Result<Box<dyn ModelRuntime>, String> {
-    Ok(Box::new(
-        super::super::vulkan_transformer::VulkanTransformerExecutor::load(
-            weight_paths,
-            &config,
-            plan,
-        )?,
-    ))
+    Ok(Box::new(transformer::VulkanTransformerExecutor::load(
+        weight_paths,
+        &config,
+        plan,
+    )?))
+}
+
+pub(crate) fn required_usize(config: &Value, name: &str) -> Result<usize, String> {
+    config
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("Model config is missing a valid {name}."))
+        .and_then(|value| usize::try_from(value).map_err(|_| format!("{name} does not fit usize.")))
 }
 
 #[cfg(feature = "vulkan")]
-fn llama_config(
-    raw_config: &Value,
-) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{TransformerFeatures, VulkanTransformerConfig};
+fn llama_config(raw_config: &Value) -> Result<transformer::VulkanTransformerConfig, String> {
+    use self::transformer::{TransformerFeatures, VulkanTransformerConfig};
 
     if raw_config
         .get("rope_scaling")
@@ -107,12 +120,8 @@ fn llama_config(
 }
 
 #[cfg(feature = "vulkan")]
-fn qwen2_config(
-    raw_config: &Value,
-) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{
-        TransformerFeatures, VulkanTransformerConfig, required_usize,
-    };
+fn qwen2_config(raw_config: &Value) -> Result<transformer::VulkanTransformerConfig, String> {
+    use self::transformer::{TransformerFeatures, VulkanTransformerConfig};
 
     let hidden_size = required_usize(raw_config, "hidden_size")?;
     let num_attention_heads = required_usize(raw_config, "num_attention_heads")?;
@@ -143,10 +152,8 @@ fn qwen2_config(
 }
 
 #[cfg(feature = "vulkan")]
-fn qwen3_config(
-    raw_config: &Value,
-) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{
+fn qwen3_config(raw_config: &Value) -> Result<transformer::VulkanTransformerConfig, String> {
+    use self::transformer::{
         TransformerFeatures, TransformerFeedForwardFeatures, VulkanTransformerConfig,
     };
 
@@ -167,10 +174,8 @@ fn qwen3_config(
 }
 
 #[cfg(feature = "vulkan")]
-fn mistral_config(
-    raw_config: &Value,
-) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{TransformerFeatures, VulkanTransformerConfig};
+fn mistral_config(raw_config: &Value) -> Result<transformer::VulkanTransformerConfig, String> {
+    use self::transformer::{TransformerFeatures, VulkanTransformerConfig};
 
     if raw_config
         .get("num_local_experts")
@@ -199,10 +204,8 @@ fn mistral_config(
 }
 
 #[cfg(feature = "vulkan")]
-fn gemma_config(
-    raw_config: &Value,
-) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{TransformerFeatures, VulkanTransformerConfig};
+fn gemma_config(raw_config: &Value) -> Result<transformer::VulkanTransformerConfig, String> {
+    use self::transformer::{TransformerFeatures, VulkanTransformerConfig};
 
     if raw_config
         .get("num_local_experts")
@@ -232,12 +235,9 @@ fn gemma_config(
 }
 
 #[cfg(feature = "vulkan")]
-fn mixtral_config(
-    raw_config: &Value,
-) -> Result<super::super::vulkan_transformer::VulkanTransformerConfig, String> {
-    use super::super::vulkan_transformer::{
+fn mixtral_config(raw_config: &Value) -> Result<transformer::VulkanTransformerConfig, String> {
+    use self::transformer::{
         TransformerFeatures, TransformerFeedForwardFeatures, VulkanTransformerConfig,
-        required_usize,
     };
 
     let num_local_experts = required_usize(raw_config, "num_local_experts")?;
@@ -259,8 +259,8 @@ fn mixtral_config(
 
 #[cfg(all(test, feature = "vulkan"))]
 mod tests {
+    use self::transformer::TransformerFeedForwardFeatures;
     use super::*;
-    use crate::chat::vulkan_transformer::TransformerFeedForwardFeatures;
 
     /// Load error without `Debug` on the runtime handle.
     fn load_error(raw: serde_json::Value) -> String {

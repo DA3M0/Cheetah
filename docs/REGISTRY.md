@@ -86,7 +86,7 @@ pub(crate) const REGISTRATION: ModelRegistration = ModelRegistration {
 - **`backends`** — `&[(&'static str, BackendLoader)]` in declared order; the
   order is what `registered_backends` reports and what the startup banner
   prints. `BackendLoader::Native(super::native::native_family_loader)` for the
-  native mmap backend; `BackendLoader::Vulkan(super::vulkan_executors::load)`
+  native mmap backend; `BackendLoader::Vulkan(crate::chat::vulkan::load)`
   behind `#[cfg(feature = "vulkan")]` — one generic loader, executor features
   derived from the config's `model_type`.
 - **`family`** — `Option<ModelFamily>`: fallback inference constants
@@ -128,7 +128,7 @@ The only static table left in `registry.rs` is the **device selection** table
 1. Implement the runtime — usually nothing: the native runner needs no new
    code when `DenseFeatures` already covers the deltas
    ([ANT_MEMORY.md](ANT_MEMORY.md) §11), and the Vulkan side needs no new
-   code when `vulkan_executors.rs` has a `model_type` arm with the right
+   code when `vulkan/mod.rs` has a `model_type` arm with the right
    executor features. Both sides only change when the family introduces a
    structure no existing arm/flag covers.
 2. **Add `src/chat/models/registrations/<name>.rs`** with the architecture
@@ -158,11 +158,12 @@ The only static table left in `registry.rs` is the **device selection** table
 
 ### 4.4 A Vulkan model executor
 
-The executor implementation (`vulkan_transformer.rs`) owns the actual compute
-graph and the Ant GPU-bucket residency; every registration points its
-`vulkan` backend name at the one generic loader (`super::vulkan_executors::load`),
-which selects executor features by the config's `model_type` and dispatches to
-`VulkanTransformerExecutor` (transformer + Phi variants). Keep the executors
+The executor implementations live in `src/chat/vulkan/` — `mod.rs` is the one
+generic loader every registration references (it selects executor features by
+the config's `model_type`), `transformer.rs` / `phi.rs` own the compute graphs
+and the Ant GPU-bucket residency, and `weights.rs` is the shared weight layer
+whose streaming/resident matmuls dispatch through the precision registry
+(`crate::chat::precision`). Keep the executors
 Candle-free (the shared shader library lives in `*.comp` at the repo root;
 shaders are discovered from `src/chat/models/` at build time).
 

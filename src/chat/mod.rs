@@ -3,8 +3,9 @@
 mod engine;
 mod models;
 pub(crate) mod moe;
+pub(crate) mod precision;
 #[cfg(feature = "vulkan")]
-pub(crate) mod vulkan_transformer;
+pub(crate) mod vulkan;
 
 pub(crate) use engine::{
     ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice, load_engine_with_progress,

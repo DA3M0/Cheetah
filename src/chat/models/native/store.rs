@@ -24,6 +24,17 @@ impl WeightDType {
             WeightDType::F32 => 4,
         }
     }
+
+    /// The registered precision format id this dtype maps to
+    /// (`crate::chat::precision` — "bf16" / "f16" / "f32"); the decoder's
+    /// linear matmuls dispatch through the registry by this id.
+    pub fn format_id(self) -> &'static str {
+        match self {
+            WeightDType::Bf16 => "bf16",
+            WeightDType::F16 => "f16",
+            WeightDType::F32 => "f32",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

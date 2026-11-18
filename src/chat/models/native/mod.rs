@@ -3,8 +3,10 @@
 //! so the resident set only holds what the plan keeps resident.
 
 pub(super) mod decoder;
-pub(super) mod kernels;
-pub(super) mod store;
+// kernels and store are reached by the precision operator registry
+// (src/chat/precision/<format>.rs wires the registered gemv operators).
+pub(crate) mod kernels;
+pub(crate) mod store;
 
 use super::{AntTierControl, ModelRuntime};
 use std::collections::BTreeMap;

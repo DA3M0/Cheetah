@@ -33,14 +33,18 @@ cheetah/
 │   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + ModelRegistration + REGISTRY include
 │   │       ├── registrations/  ★ declarative capability per family (build.rs → generated REGISTRY)
 │   │       ├── registry.rs     derived lookups (loader/family/backends) + device dispatch
-│   │       ├── vulkan_executors.rs  one generic Vulkan loader; features derive from config model_type
 │   │       ├── templates.rs    chat template renderers
 │   │       └── native/         ★ the native mmap backend
 │   │           ├── store.rs    MmapWeightStore + madvise tier control
 │   │           ├── kernels.rs  gemv (AVX2 + portable), rmsnorm, layernorm, rope, softmax, silu/gelu
 │   │           ├── decoder.rs    decoder runner (DecoderNative) + DecoderConfig::resolve
 │   │           └── mod.rs      NativeCpuRuntime + native family loader + native tests
-│   ├── vulkan_transformer.rs   Vulkan model executors (transformer + Phi), Candle-free
+│   ├── vulkan/                ★ the Vulkan backend
+│   │       ├── mod.rs         one generic Vulkan loader; features derive from config model_type
+│   │       ├── transformer.rs generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
+│   │       ├── phi.rs         phi executor (parallel residual, fused projections)
+│   │       └── weights.rs     shared weight layer + precision-registry dispatch
+│   ├── precision/              ★ weight-precision operator registry (f32/f16/bf16/q8 → native+vulkan ops)
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue)
 │   ├── inspect.rs              model inspection (load/inspect command)
@@ -161,7 +165,22 @@ run_init_command      src/main.rs:90
 | `registrations/<family>.rs` | registrations/ | declarative capability (architectures / template / stops / backends / family); build.rs → generated `REGISTRY` |
 | `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | lookups derived from the generated `REGISTRY` |
 | `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
-| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan_transformer.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
+| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan/transformer.rs, vulkan/phi.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
+| generic Vulkan `load` | vulkan/mod.rs | the one loader every registration references; executor features derive from `model_type` |
+| `WeightData` / `Linear` / `take_linear` / resident upload | vulkan/weights.rs | shared weight layer; streaming/resident matmuls dispatch through the precision registry |
+
+### `src/chat/precision/` — weight-precision operator registry
+
+| Item | File | Role |
+|------|------|------|
+| `PrecisionRegistration` / `PrecisionKind` / `PrecisionBackend` | mod.rs | declarative per-precision entries (`registrations/{f32,f16,bf16,q4,q8}.rs`): kind (Original / Quantized), optional selector env, per-backend operator tables; build.rs → generated `REGISTRY` |
+| `VulkanOps` | mod.rs | per-format Vulkan operators: load-time `quantize`, streaming matmul, resident upload / resident matmul, shared-ops format code, shader-override env |
+| `NativeOps` | mod.rs | per-format native operators: `quantize` (quantized kinds) + `gemv` computed in the format's own precision domain |
+| `PrecisionBuffer` | mod.rs | quantized buffer abstraction (q8 layout: f32 scale head + packed int8 rows) |
+| `selected_format` / `selected_vulkan_ops` / `selected_native_ops` | mod.rs | selector-env driven lookups (`CHEETAH_QUANT_Q8` selects q8) |
+| `bytes::f32_view` / `u16_view` | bytes.rs | typed views over the registry's uniform byte payloads (no copy) |
+| `gemv_q8` / `gemv_q4` / `dequant_values` | native/kernels.rs | int8/int4 ×scale per-row gemv (same math as `matmul_q8.comp` / `matmul_q4.comp`) + f32 dequant feeding the quantize operators |
+| `QuantState::gemv_linear` | native/decoder.rs | native linear dispatch: quantize-at-first-use + registered gemv; original precisions dispatch by dtype format id |
 
 ### CLI/serve
 
@@ -184,7 +203,8 @@ run_init_command      src/main.rs:90
 |----------|---------|--------|--------|
 | `CHEETAH_DEVICE` | registry.rs, engine.rs | `cpu` / `cuda` / `metal` / `vulkan` | backend selection. `cpu` (default) → native mmap backend for architecture-resolved families (Qwen2, Llama, Qwen3); `cuda`/`metal` → Candle; `vulkan` → independent executor. |
 | `CHEETAH_NATIVE` | engine.rs | `0` / `1` | `0` skips native selection (surfaces the guidance error for architectures without a native backend on CPU). Kept for policy testing. |
-| `CHEETAH_QUANT_Q8` | vulkan_transformer.rs (take_linear) | `1` / `true` | Quantizes all Linear projections to row-wise int8 (Q8) at load time. Halves weight footprint; norms/biases/embeddings stay in original precision. Vulkan only. |
+| `CHEETAH_QUANT_Q8` | precision registry (`chat::precision::selected_format`) → both backends | `1` / `true` | Selects the registered `q8` format: Linear projections quantize to row-wise int8 at load time through the format's registered operators — Vulkan (streaming + resident matmul) and native (quantize-at-first-use gemv, source pages released). Halves the weight footprint; norms/biases/embeddings stay in original precision. |
+| `CHEETAH_QUANT_Q4` | precision registry (`chat::precision::selected_format`) → both backends | `1` / `true` | Selects the registered `q4` format: Linear projections quantize to row-wise symmetric int4 (two codes per byte, scale = max\|w\|/7) — a quarter of the BF16 footprint. Same dual-backend operator table as q8 (`matmul_q4.comp` pipeline on Vulkan, `gemv_q4` on native). |
 
 ### 4.2 Vulkan substrate
 
@@ -194,6 +214,7 @@ run_init_command      src/main.rs:90
 | `CHEETAH_MATMUL_SPV` | cheetah_vulkan.c | .spv path | overrides the f32 matmul shader |
 | `CHEETAH_MATMUL_BF16_SPV` | cheetah_vulkan.c | .spv path | overrides the bf16 matmul shader |
 | `CHEETAH_MATMUL_Q8_SPV` | cheetah_vulkan.c | .spv path | overrides the q8 matmul shader |
+| `CHEETAH_MATMUL_Q4_SPV` | cheetah_vulkan.c | .spv path | overrides the q4 matmul shader |
 | `CHEETAH_QWEN_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the shared_ops shader (rmsnorm/rope/attention/silu/gelu/elementwise) |
 
 ### 4.3 Build-time
@@ -206,7 +227,7 @@ run_init_command      src/main.rs:90
 
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `CHEETAH_TEST_VULKAN_Q8` | vulkan_transformer.rs (tests) | set `1` to run the q8 resident-matmul forward test (needs a Vulkan device) |
+| `CHEETAH_TEST_VULKAN_Q8` | vulkan/transformer.rs (tests) | set `1` to run the q8 resident-matmul forward test (needs a Vulkan device) |
 | `NO_COLOR` | color.rs | disable ANSI coloring |
 
 Constant filenames (not env): `cheetah_units.json`, `cheetah_manifest.json`,

@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer MatrixA {
+    float values[];
+} a;
+
+// Quantized weight buffer: a head of `n` f32 row scales (raw bits) followed
+// by row-major int4 payloads, two codes per byte (low nibble = even column),
+// each row padded to a multiple of four bytes. The same layout the native
+// `gemv_q4` kernel reads (src/chat/precision/q4.rs).
+layout(set = 0, binding = 1, std430) readonly buffer MatrixQ4 {
+    uint values[];
+} q;
+
+layout(set = 0, binding = 2, std430) writeonly buffer MatrixC {
+    float values[];
+} c;
+
+layout(push_constant) uniform Dimensions {
+    uint m;
+    uint k;
+    uint n;
+    uint row_bytes;
+} dimensions;
+
+float load_q4(uint row, uint column) {
+    float scale = uintBitsToFloat(q.values[row]);
+    uint head = dimensions.n;
+    uint packed = q.values[head + row * (dimensions.row_bytes / 4u) + column / 8u];
+    uint shift = (column % 8u) * 4u;
+    uint nibble = (packed >> shift) & 0xFu;
+    int quantized = int(nibble >= 8u ? nibble - 16u : nibble); // sign-extend the i4 lane
+    return scale * float(quantized);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint column = gl_GlobalInvocationID.x;
+    if (row >= dimensions.m || column >= dimensions.n) {
+        return;
+    }
+    float sum = 0.0;
+    for (uint index = 0; index < dimensions.k; ++index) {
+        sum += a.values[row * dimensions.k + index] * load_q4(column, index);
+    }
+    c.values[row * dimensions.n + column] = sum;
+}

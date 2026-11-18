@@ -539,6 +539,10 @@ pub mod vulkan {
             n: c_int,
         ) -> c_int;
         fn cheetah_vulkan_weight_upload_bf16(weights: *const u16, element_count: u64) -> u64;
+        fn cheetah_vulkan_weight_upload_q8(bytes: *const u8, byte_size: u64, row_bytes: u32)
+        -> u64;
+        fn cheetah_vulkan_weight_upload_q4(bytes: *const u8, byte_size: u64, row_bytes: u32)
+        -> u64;
         fn cheetah_vulkan_weight_release(handle: u64) -> c_int;
         fn vk_matmul_bf16_transposed_resident_checked(
             handle: u64,
@@ -551,6 +555,22 @@ pub mod vulkan {
         fn vk_matmul_q8_transposed_checked(
             a: *const f32,
             q8: *const u8,
+            c: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+        ) -> c_int;
+        fn vk_matmul_q4_transposed_checked(
+            a: *const f32,
+            q4: *const u8,
+            c: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+        ) -> c_int;
+        fn vk_matmul_q4_transposed_resident_checked(
+            handle: u64,
+            a: *const f32,
             c: *mut f32,
             m: c_int,
             k: c_int,
@@ -757,6 +777,31 @@ pub mod vulkan {
         if handle == 0 { None } else { Some(handle) }
     }
 
+    /// Upload one q8 quantized weight buffer into the resident bucket.
+    /// `bytes` covers the f32 scale head plus the packed int8 rows;
+    /// `row_bytes` is the padded per-row stride the resident matmul validates
+    /// against. Returns None when the upload cannot be served and the caller
+    /// should keep the per-step streaming path.
+    pub fn weight_upload_q8(bytes: &[u8], row_bytes: u32) -> Option<u64> {
+        let guard = VULKAN_LOCK.lock();
+        let _guard = guard.unwrap_or_else(|poisoned| poisoned.into_inner());
+        let handle = unsafe {
+            cheetah_vulkan_weight_upload_q8(bytes.as_ptr(), bytes.len() as u64, row_bytes)
+        };
+        if handle == 0 { None } else { Some(handle) }
+    }
+
+    /// Upload one q4 quantized weight buffer into the resident bucket; same
+    /// contract as `weight_upload_q8` (f32 scale head + packed nibble rows).
+    pub fn weight_upload_q4(bytes: &[u8], row_bytes: u32) -> Option<u64> {
+        let guard = VULKAN_LOCK.lock();
+        let _guard = guard.unwrap_or_else(|poisoned| poisoned.into_inner());
+        let handle = unsafe {
+            cheetah_vulkan_weight_upload_q4(bytes.as_ptr(), bytes.len() as u64, row_bytes)
+        };
+        if handle == 0 { None } else { Some(handle) }
+    }
+
     /// Release a resident weight bucket (device-local allocation or the
     /// persistent host-coherent one, depending on where it was uploaded).
     pub fn weight_release(handle: u64) {
@@ -882,6 +927,81 @@ pub mod vulkan {
         Ok(output)
     }
 
+    /// Host-streaming q4 matmul: C[M,N] = A[M,K] * W^T over the quantized
+    /// buffer (f32 scale head + packed int4 rows); a quarter of the BF16
+    /// footprint and half of q8.
+    pub fn matmul_q4_transposed(
+        a: &[f32],
+        q4: &[u8],
+        _weight_rows: usize,
+        _weight_cols: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        if m == 0 || k == 0 || n == 0 {
+            return Err("Vulkan matrix dimensions must be positive.".to_string());
+        }
+        let expected_a = m
+            .checked_mul(k)
+            .ok_or_else(|| "A matrix element count overflows usize.".to_string())?;
+        let row_bytes = (k + 1).div_ceil(2).div_ceil(4) * 4;
+        let expected_q4 = n * 4 + n * row_bytes;
+        if q4.len() != expected_q4 {
+            return Err(format!(
+                "Vulkan q4 matmul expected {expected_q4} bytes, received {}.",
+                q4.len()
+            ));
+        }
+        let output_len = m
+            .checked_mul(n)
+            .ok_or_else(|| "C matrix element count overflows usize.".to_string())?;
+        if a.len() != expected_a {
+            return Err(format!(
+                "Vulkan q4 matmul expected A length {expected_a}, received {}.",
+                a.len()
+            ));
+        }
+        let mut output = vec![0.0; output_len];
+        let _guard = VULKAN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = unsafe {
+            vk_matmul_q4_transposed_checked(
+                a.as_ptr(),
+                q4.as_ptr(),
+                output.as_mut_ptr(),
+                m as c_int,
+                k as c_int,
+                n as c_int,
+            )
+        };
+        check_native_result(result, "Vulkan q4 matmul")?;
+        Ok(output)
+    }
+
+    /// Ant resident q4 matmul: the quantized weight buffer stays bound on
+    /// the GPU; only activations and outputs pass through the pool.
+    /// Caller must hold a valid q4 upload handle (weight_upload_q4).
+    pub fn matmul_q4_transposed_resident(
+        handle: u64,
+        a: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        matmul_common(m, k, n, a.len(), |dims, output| unsafe {
+            vk_matmul_q4_transposed_resident_checked(
+                handle,
+                a.as_ptr(),
+                output,
+                dims[0],
+                dims[1],
+                dims[2],
+            )
+        })
+    }
+
     /// Ant resident q8 matmul: the quantized weight buffer stays bound on
     /// the GPU; only activations and outputs pass through the pool.
     /// Caller must hold a valid q8 upload handle (weight_upload_q8).
@@ -892,7 +1012,7 @@ pub mod vulkan {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>, String> {
-        matmul_with(m, k, n, a.len(), n, |dims, output| unsafe {
+        matmul_common(m, k, n, a.len(), |dims, output| unsafe {
             vk_matmul_q8_transposed_resident_checked(
                 handle,
                 a.as_ptr(),
@@ -914,7 +1034,7 @@ pub mod vulkan {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>, String> {
-        matmul_with(m, k, n, a.len(), n, |dims, output| unsafe {
+        matmul_common(m, k, n, a.len(), |dims, output| unsafe {
             vk_matmul_bf16_transposed_resident_checked(
                 handle,
                 a.as_ptr(),
@@ -1269,12 +1389,15 @@ pub mod vulkan {
         }
     }
 
-    fn matmul_with(
+    /// Shared matmul driver: validates the dimensions and A, drives the
+    /// dispatch once, assembles the output. Resident matmuls use this
+    /// directly — their weight is bound on the GPU behind a handle and no B
+    /// buffer flows through the pool.
+    fn matmul_common(
         m: usize,
         k: usize,
         n: usize,
         a_len: usize,
-        b_len: usize,
         dispatch: impl FnOnce([c_int; 3], *mut f32) -> c_int,
     ) -> Result<Vec<f32>, String> {
         if m == 0 || k == 0 || n == 0 {
@@ -1283,16 +1406,12 @@ pub mod vulkan {
         let expected_a = m
             .checked_mul(k)
             .ok_or_else(|| "A matrix element count overflows usize.".to_string())?;
-        let expected_b = k
-            .checked_mul(n)
-            .ok_or_else(|| "B matrix element count overflows usize.".to_string())?;
         let output_len = m
             .checked_mul(n)
             .ok_or_else(|| "C matrix element count overflows usize.".to_string())?;
-        if a_len != expected_a || b_len != expected_b {
+        if a_len != expected_a {
             return Err(format!(
-                "Vulkan matmul expected A/B lengths {expected_a}/{expected_b}, received {}/{}.",
-                a_len, b_len
+                "Vulkan matmul expected A length {expected_a}, received {a_len}."
             ));
         }
         let _guard = VULKAN_LOCK
@@ -1314,6 +1433,27 @@ pub mod vulkan {
         } else {
             Err("Vulkan matrix multiplication failed; see the native diagnostic above.".into())
         }
+    }
+
+    /// Streaming matmul driver: additionally validates the B buffer against
+    /// `k * n` before touching the device.
+    fn matmul_with(
+        m: usize,
+        k: usize,
+        n: usize,
+        a_len: usize,
+        b_len: usize,
+        dispatch: impl FnOnce([c_int; 3], *mut f32) -> c_int,
+    ) -> Result<Vec<f32>, String> {
+        let expected_b = k
+            .checked_mul(n)
+            .ok_or_else(|| "B matrix element count overflows usize.".to_string())?;
+        if b_len != expected_b {
+            return Err(format!(
+                "Vulkan matmul expected B length {expected_b}, received {b_len}."
+            ));
+        }
+        matmul_common(m, k, n, a_len, dispatch)
     }
 
     #[cfg(test)]

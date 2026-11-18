@@ -383,10 +383,20 @@ Other kernels (`rmsnorm`, `rope_in_place`, `silu_multiply`, `softmax`) are
 scalar loops in f32 — they are not bandwidth-bound and do not benefit from
 explicit SIMD at current model sizes.
 
-### 7.5 Q8 quantization (Vulkan + all paths)
+### 7.5 Q8 quantization (the weight-precision operator registry)
 
-`CHEETAH_QUANT_Q8=1` quantizes every Linear projection to row-wise
-symmetric int8 at load time. The quantized buffer layout:
+Quantization lives in the declarative precision registry
+(`src/chat/precision/` — see CODEBASE §3): quantized registrations (`q8` =
+row-wise int8, selector `CHEETAH_QUANT_Q8`; `q4` = row-wise int4, selector
+`CHEETAH_QUANT_Q4`) each declare a full operator table for both backends —
+load-time `quantize`, streaming and resident matmul plus resident upload on
+Vulkan, and quantize + `gemv_<format>` on the native backend. The C substrate
+is format-generic (`g_quant_formats` table in cheetah_vulkan.c): a new
+quantization format adds one table row, one `.comp` shader and one
+registration file. `CHEETAH_QUANT_Q8=1` (or `CHEETAH_QUANT_Q4=1`) quantizes
+every Linear projection to that format's symmetric range at load time. The
+quantized buffer layout (shared by every registered operator, the shader, and
+the CPU gemv — q4 packs two codes per byte, low nibble = even column):
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -398,10 +408,22 @@ symmetric int8 at load time. The quantized buffer layout:
 └─────────────────────────────────────────────────────────┘
 ```
 
-The shader (`matmul_q8.comp`) unpacks four int8 lanes per u32 word with a
-sign-extending shift and multiplies by the row scale loaded from the head.
+The shaders (`matmul_q8.comp` / `matmul_q4.comp`) unpack the packed lanes per
+u32 word with sign-extending shifts and multiply by the row scale loaded from
+the head.
 Dedicated pipeline (`ensure_matmul_q8_pipeline`) with its own descriptor
 layout and push-constant layout to avoid NULL-layout crashes on first use.
+The native CPU gemvs (`kernels::gemv_q8` / `gemv_q4`) run the same math: codes
+unpack and multiply their row scale, f32 accumulate — the compute stays in the
+quantized domain, never a bulk dequantize into another storage width.
+
+Native path: the decoder quantizes a linear unit at first use
+(`QuantState::gemv_linear`) through the registered operator, releases the
+unit's source pages (`madvise(DONTNEED)`) since they are never read again,
+and computes from the owned quantized buffer from then on — the same
+coverage the Vulkan executor's `take_linear` provides (layer linear
+projections; `lm_head` keeps its chunked source-precision sweep on both
+backends).
 
 Coverage: Linear projections only (norms, biases and the embedding stay in
 their original precision). Both the host-streaming and the resident path

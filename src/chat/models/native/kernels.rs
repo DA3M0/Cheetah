@@ -224,6 +224,114 @@ pub fn gemv(
         });
 }
 
+/// Q8 matvec over the registered quantized buffer layout (`q8` in
+/// `crate::chat::precision`): a head of `rows` f32 row scales followed by
+/// row-major int8 payloads, each row padded to a multiple of four bytes. The
+/// dot runs in the quantized domain — codes are unpacked as int8 and
+/// multiplied by their row scale, f32 accumulate; the weights are never
+/// bulk-dequantized into another storage width (the same math the
+/// `matmul_q8.comp` shader performs).
+pub fn gemv_q8(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(x.len(), cols, "gemv_q8 input width mismatch");
+    assert_eq!(y.len(), rows, "gemv_q8 output width mismatch");
+    let row_bytes = (cols + 3) / 4 * 4;
+    let head_bytes = rows * 4;
+    let dot_row = |row: usize| -> f32 {
+        let scale = f32::from_le_bytes([
+            weight[row * 4],
+            weight[row * 4 + 1],
+            weight[row * 4 + 2],
+            weight[row * 4 + 3],
+        ]);
+        let codes = &weight[head_bytes + row * row_bytes..head_bytes + row * row_bytes + cols];
+        let mut sum = 0f32;
+        for (column, code) in codes.iter().enumerate() {
+            sum += scale * (*code as i8 as f32) * x[column];
+        }
+        sum
+    };
+    if rows <= GEMV_CHUNK_ROWS {
+        for (row, y_value) in y.iter_mut().enumerate() {
+            *y_value = dot_row(row);
+        }
+        return;
+    }
+    y.par_chunks_mut(GEMV_CHUNK_ROWS)
+        .enumerate()
+        .for_each(|(chunk, out)| {
+            let row_start = chunk * GEMV_CHUNK_ROWS;
+            for (index_in_chunk, y_value) in out.iter_mut().enumerate() {
+                *y_value = dot_row(row_start + index_in_chunk);
+            }
+        });
+}
+
+/// Q4 matvec over the registered quantized buffer layout (`q4` in
+/// `crate::chat::precision`): a head of `rows` f32 row scales followed by
+/// row-major int4 payloads, two codes per byte (low nibble = even column),
+/// each row padded to a multiple of four bytes. The dot runs in the
+/// quantized domain — codes are unpacked as int4 and multiplied by their row
+/// scale, f32 accumulate; the weights are never bulk-dequantized into another
+/// storage width (the same math the `matmul_q4.comp` shader performs).
+pub fn gemv_q4(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(x.len(), cols, "gemv_q4 input width mismatch");
+    assert_eq!(y.len(), rows, "gemv_q4 output width mismatch");
+    let row_bytes = (cols + 1).div_ceil(2).div_ceil(4) * 4;
+    let head_bytes = rows * 4;
+    let dot_row = |row: usize| -> f32 {
+        let scale = f32::from_le_bytes([
+            weight[row * 4],
+            weight[row * 4 + 1],
+            weight[row * 4 + 2],
+            weight[row * 4 + 3],
+        ]);
+        let row_start = head_bytes + row * row_bytes;
+        let mut sum = 0f32;
+        for (column, value) in x.iter().enumerate() {
+            let byte = weight[row_start + column / 2];
+            let nibble = if column % 2 == 0 {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
+            let code = if nibble >= 8 {
+                nibble as i8 - 16
+            } else {
+                nibble as i8
+            };
+            sum += scale * (code as f32) * value;
+        }
+        sum
+    };
+    if rows <= GEMV_CHUNK_ROWS {
+        for (row, y_value) in y.iter_mut().enumerate() {
+            *y_value = dot_row(row);
+        }
+        return;
+    }
+    y.par_chunks_mut(GEMV_CHUNK_ROWS)
+        .enumerate()
+        .for_each(|(chunk, out)| {
+            let row_start = chunk * GEMV_CHUNK_ROWS;
+            for (index_in_chunk, y_value) in out.iter_mut().enumerate() {
+                *y_value = dot_row(row_start + index_in_chunk);
+            }
+        });
+}
+
+/// Dequantize a contiguous weight array (row-major) to f32 values — the
+/// load-time quantize path feeds the registered quantize operators with this.
+pub fn dequant_values(bytes: &[u8], dtype: super::store::WeightDType, count: usize) -> Vec<f32> {
+    debug_assert_eq!(
+        bytes.len(),
+        count * dtype.element_size(),
+        "dequant_values length mismatch"
+    );
+    (0..count)
+        .map(|index| scalar_at(bytes, index, dtype))
+        .collect()
+}
+
 /// RMSNorm: x / sqrt(mean(x²) + eps) · weight, computed in f32 in place.
 pub fn rmsnorm(x: &mut [f32], weight: &[u8], dtype: super::store::WeightDType, eps: f32) {
     let mean_square = x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32;
@@ -369,6 +477,143 @@ mod tests {
         }
         gemv(&weight_bf16, WeightDType::Bf16, 2, 3, &x, &mut y);
         assert_eq!(y, vec![-2.0, -2.0]);
+    }
+
+    /// gemv_q8: the dot runs in the quantized domain — per-row scale × int8
+    /// codes accumulated in f32 — and ignores the 4-byte row padding, matching
+    /// the `matmul_q8.comp` shader's math bit for bit.
+    #[test]
+    fn gemv_q8_matches_rowwise_scale_code_reference() {
+        let rows = 3usize;
+        let cols = 6usize; // not a multiple of four: exercises the padded tail
+        let row_bytes = (cols + 3) / 4 * 4;
+        let x: Vec<f32> = (0..cols).map(|index| 0.5f32 - index as f32 * 0.1).collect();
+        let weights: Vec<Vec<f32>> = vec![
+            vec![1.0, -2.0, 0.0, 3.5, -0.25, 2.0],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // zero row: scale falls back to 1.0
+            vec![-7.0, 7.0, -1.0, 1.0, -0.5, 0.5],
+        ];
+        let mut buffer = vec![0u8; rows * 4 + rows * row_bytes];
+        let mut expected = vec![0f32; rows];
+        for row in 0..rows {
+            let max_abs = weights[row]
+                .iter()
+                .fold(0f32, |acc, value| acc.max(value.abs()));
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            buffer[row * 4..row * 4 + 4].copy_from_slice(&scale.to_le_bytes());
+            let mut sum = 0f32;
+            for (col, value) in weights[row].iter().enumerate() {
+                let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
+                buffer[rows * 4 + row * row_bytes + col] = code as u8;
+                sum += scale * (code as f32) * x[col];
+            }
+            expected[row] = sum;
+        }
+        let mut y = vec![0f32; rows];
+        gemv_q8(&buffer, rows, cols, &x, &mut y);
+        for (row, (got, want)) in y.iter().zip(&expected).enumerate() {
+            assert!((got - want).abs() < 1e-5, "row {row}: {got} vs {want}");
+        }
+    }
+
+    /// gemv_q4: the dot runs in the quantized domain — per-row scale × int4
+    /// codes (two per byte, low nibble = even column) accumulated in f32 —
+    /// matching the `matmul_q4.comp` shader's math bit for bit.
+    #[test]
+    fn gemv_q4_matches_rowwise_scale_code_reference() {
+        let rows = 3usize;
+        let cols = 9usize; // odd width: exercises both nibble parities + padding
+        let row_bytes = (cols + 1).div_ceil(2).div_ceil(4) * 4;
+        let x: Vec<f32> = (0..cols).map(|index| 0.5f32 - index as f32 * 0.1).collect();
+        let weights: Vec<Vec<f32>> = vec![
+            vec![1.0, -2.0, 0.0, 3.5, -0.25, 2.0, -1.5, 0.75, 4.0],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![-7.0, 7.0, -1.0, 1.0, -0.5, 0.5, -3.0, 3.0, 0.0],
+        ];
+        let mut buffer = vec![0u8; rows * 4 + rows * row_bytes];
+        let mut expected = vec![0f32; rows];
+        for row in 0..rows {
+            let max_abs = weights[row]
+                .iter()
+                .fold(0f32, |acc, value| acc.max(value.abs()));
+            let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+            buffer[row * 4..row * 4 + 4].copy_from_slice(&scale.to_le_bytes());
+            let mut sum = 0f32;
+            for (col, value) in weights[row].iter().enumerate() {
+                let code = (value / scale).round().clamp(-7.0, 7.0) as i8;
+                let index = rows * 4 + row * row_bytes + col / 2;
+                buffer[index] |= ((code as u8) & 0x0F) << ((col % 2) * 4);
+                sum += scale * (code as f32) * x[col];
+            }
+            expected[row] = sum;
+        }
+        let mut y = vec![0f32; rows];
+        gemv_q4(&buffer, rows, cols, &x, &mut y);
+        for (row, (got, want)) in y.iter().zip(&expected).enumerate() {
+            assert!((got - want).abs() < 1e-5, "row {row}: {got} vs {want}");
+        }
+    }
+
+    /// The registered quantize operator and the native q4 gemv agree: feeding
+    /// quantized weights back through gemv_q4 reconstructs the dequantized
+    /// matvec (the two operators share one buffer layout by contract).
+    #[test]
+    fn gemv_q4_consumes_the_registered_quantize_output() {
+        let rows = 5usize;
+        let cols = 9usize;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index % 23) as f32 - 11.0) * 0.3)
+            .collect();
+        let quantize = crate::chat::precision::native_ops_for_format("q4")
+            .and_then(|ops| ops.quantize)
+            .expect("q4 must register a native quantize operator");
+        let buffer = quantize(&values, rows, cols).unwrap();
+        let x: Vec<f32> = (0..cols)
+            .map(|index| (index as f32 * 0.7 - 2.0).sin())
+            .collect();
+        let mut y = vec![0f32; rows];
+        gemv_q4(buffer.buffer(), buffer.rows(), buffer.cols(), &x, &mut y);
+        for row in 0..rows {
+            let want: f32 = (0..cols)
+                .map(|col| buffer.dequant_value(row, col) * x[col])
+                .sum();
+            assert!(
+                (y[row] - want).abs() < 1e-4,
+                "row {row}: {} vs {want}",
+                y[row]
+            );
+        }
+    }
+
+    /// The registered quantize operator and the native q8 gemv agree: feeding
+    /// quantized weights back through gemv_q8 reconstructs the dequantized
+    /// matvec (the two operators share one buffer layout by contract).
+    #[test]
+    fn gemv_q8_consumes_the_registered_quantize_output() {
+        let rows = 5usize;
+        let cols = 9usize;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index % 23) as f32 - 11.0) * 0.3)
+            .collect();
+        let quantize = crate::chat::precision::native_ops_for_format("q8")
+            .and_then(|ops| ops.quantize)
+            .expect("q8 must register a native quantize operator");
+        let buffer = quantize(&values, rows, cols).unwrap();
+        let x: Vec<f32> = (0..cols)
+            .map(|index| (index as f32 * 0.7 - 2.0).sin())
+            .collect();
+        let mut y = vec![0f32; rows];
+        gemv_q8(buffer.buffer(), buffer.rows(), buffer.cols(), &x, &mut y);
+        for row in 0..rows {
+            let want: f32 = (0..cols)
+                .map(|col| buffer.dequant_value(row, col) * x[col])
+                .sum();
+            assert!(
+                (y[row] - want).abs() < 1e-4,
+                "row {row}: {} vs {want}",
+                y[row]
+            );
+        }
     }
 
     #[test]

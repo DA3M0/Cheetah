@@ -164,7 +164,7 @@ cheetah-vulkan: device '...' (API ..., discrete=N)   ← vulkan builds only
 Before opening a change, verify:
 
 - [ ] `cargo build` + `cargo test` clean (default features)
-- [ ] `cargo test --features vulkan` clean if `vulkan_transformer.rs`,
+- [ ] `cargo test --features vulkan` clean if `src/chat/vulkan/`,
       `registry.rs`, or shader-adjacent code changed
 - [ ] New native paths: comparison test added and passing (<1e-3)
 - [ ] Ant-touching changes: tier invariants hold

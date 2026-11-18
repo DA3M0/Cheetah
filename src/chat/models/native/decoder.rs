@@ -2,9 +2,14 @@
 //! are f32; weight bytes are read in their stored dtype straight from the
 //! mapping (zero copies). Disk-tier units are dropped from the resident set at
 //! the end of every step so a generation holds only the planned resident bytes.
+//! Linear matmuls dispatch through the precision operator registry
+//! (`crate::chat::precision`): original precisions run their registered gemv,
+//! and a selected quantization format quantizes linear units at first use and
+//! computes from the quantized buffer.
 
 use super::kernels;
 use super::store::{MmapWeightStore, Tier, WeightDType};
+use crate::chat::precision::{self, PrecisionBuffer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -436,6 +441,91 @@ pub struct DecoderNative {
     /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
     /// router's top-k selections while a generation walks the layers.
     expert_residency: HashMap<(usize, usize), bool>,
+    /// Selected quantization (precision registry): linear units quantize at
+    /// first use and compute from the quantized buffer.
+    quant: QuantState,
+}
+
+/// The selected quantization format's native operators (from the precision
+/// registry) plus the quantized unit buffers it has produced. `None`-free
+/// design: without a selected format both operators stay `None` and every
+/// unit keeps its stored precision.
+struct QuantState {
+    quantize: Option<fn(&[f32], usize, usize) -> Result<Arc<dyn PrecisionBuffer>, String>>,
+    gemv: Option<fn(&[u8], usize, usize, &[f32], &mut [f32])>,
+    /// Quantized linear units, keyed by unit id: first use quantizes the
+    /// source unit through the registered operator and drops its source
+    /// pages; later steps compute from the quantized buffer.
+    buffers: HashMap<String, Arc<dyn PrecisionBuffer>>,
+}
+
+impl QuantState {
+    /// The selected quantization format's native operator table (precision
+    /// registry), or an inert state when no format is selected / the format
+    /// does not serve the native backend.
+    fn selected() -> Self {
+        let ops = precision::selected_native_ops();
+        Self {
+            quantize: ops.and_then(|ops| ops.quantize),
+            gemv: ops.map(|ops| ops.gemv),
+            buffers: HashMap::new(),
+        }
+    }
+
+    fn gemv_linear(
+        &mut self,
+        store: &MmapWeightStore,
+        unit: &str,
+        rows: usize,
+        cols: usize,
+        x: &[f32],
+        y: &mut [f32],
+    ) -> Result<(), String> {
+        if let Some(buffer) = self.buffers.get(unit) {
+            let gemv = self
+                .gemv
+                .expect("quantized unit present without a registered gemv operator");
+            (gemv)(buffer.buffer(), buffer.rows(), buffer.cols(), x, y);
+            return Ok(());
+        }
+        if let (Some(quantize), Some(gemv)) = (self.quantize, self.gemv) {
+            // Lazy load-time quantization: dequantize the source unit to f32
+            // values once, run the registered quantize operator, and release
+            // the source pages — the unit computes from the quantized buffer
+            // (roughly half the footprint) from then on. Norms, biases and
+            // the embedding never reach this path.
+            let (bytes, dtype, _) = store.slice(unit)?;
+            let count = rows
+                .checked_mul(cols)
+                .ok_or_else(|| format!("Linear unit '{unit}' size overflow."))?;
+            if bytes.len() != count * dtype.element_size() {
+                return Err(format!(
+                    "Linear unit '{unit}' does not match its {rows}x{cols} shape."
+                ));
+            }
+            let values = kernels::dequant_values(bytes, dtype, count);
+            let buffer = quantize(&values, rows, cols)?;
+            self.buffers.insert(unit.to_owned(), buffer);
+            // The source bytes are never read again once quantized.
+            store.drop_pages(unit);
+            let buffer = self
+                .buffers
+                .get(unit)
+                .expect("quantized buffer was just inserted");
+            (gemv)(buffer.buffer(), buffer.rows(), buffer.cols(), x, y);
+            return Ok(());
+        }
+        let (bytes, dtype, _) = store.slice(unit)?;
+        let format_id = dtype.format_id();
+        let ops = precision::native_ops_for_format(format_id).ok_or_else(|| {
+            format!(
+                "Weight precision '{format_id}' ({}) has no native operator table for unit '{unit}'.",
+                precision::format_label(format_id)
+            )
+        })?;
+        (ops.gemv)(bytes, rows, cols, x, y);
+        Ok(())
+    }
 }
 
 /// Stage-wise debug capture of layer 0 at the last input position.
@@ -498,6 +588,7 @@ impl DecoderNative {
             k_raw_capture: Vec::new(),
             normed_capture: Vec::new(),
             expert_residency: HashMap::new(),
+            quant: QuantState::selected(),
         }
     }
 
@@ -689,24 +780,21 @@ impl DecoderNative {
         if cfg.features.fused_qkv {
             // phi: one `qkv_proj` unit stacks q/k/v rows; split after the
             // projection (+ fused bias).
-            let (qkv_weight, qkv_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.qkv_proj.weight"))?;
             let (qkv_bias, qkv_bias_dtype, _) = self
                 .store
                 .slice(&format!("{prefix}self_attn.qkv_proj.bias"))
-                .unwrap_or((&[], qkv_dtype, &[]));
+                .unwrap_or((&[], WeightDType::F32, &[]));
             let fused_rows = (cfg.q_heads + 2 * cfg.kv_heads) * cfg.head_dim;
             self.scratch.q.clear();
             self.scratch.q.resize(fused_rows, 0.0);
-            kernels::gemv(
-                qkv_weight,
-                qkv_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &format!("{prefix}self_attn.qkv_proj.weight"),
                 fused_rows,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.q,
-            );
+            )?;
             add_bias(&mut self.scratch.q, qkv_bias, qkv_bias_dtype);
             let q_dim = cfg.q_heads * cfg.head_dim;
             let kv_dim = cfg.kv_heads * cfg.head_dim;
@@ -720,39 +808,30 @@ impl DecoderNative {
                 .extend_from_slice(&self.scratch.q[q_dim + kv_dim..q_dim + 2 * kv_dim]);
             self.scratch.q.truncate(q_dim);
         } else {
-            let (q_weight, q_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.q_proj.weight"))?;
             // Biases are family-optional (qwen2 has them, llama does not).
             let (q_bias, q_bias_dtype, _) = self
                 .store
                 .slice(&format!("{prefix}self_attn.q_proj.bias"))
-                .unwrap_or((&[], q_dtype, &[]));
-            let (k_weight, k_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.k_proj.weight"))?;
+                .unwrap_or((&[], WeightDType::F32, &[]));
             let (k_bias, k_bias_dtype, _) = self
                 .store
                 .slice(&format!("{prefix}self_attn.k_proj.bias"))
-                .unwrap_or((&[], k_dtype, &[]));
-            let (v_weight, v_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.v_proj.weight"))?;
+                .unwrap_or((&[], WeightDType::F32, &[]));
             let (v_bias, v_bias_dtype, _) = self
                 .store
                 .slice(&format!("{prefix}self_attn.v_proj.bias"))
-                .unwrap_or((&[], v_dtype, &[]));
+                .unwrap_or((&[], WeightDType::F32, &[]));
 
             self.scratch.q.clear();
             self.scratch.q.resize(cfg.q_heads * cfg.head_dim, 0.0);
-            kernels::gemv(
-                q_weight,
-                q_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &format!("{prefix}self_attn.q_proj.weight"),
                 cfg.q_heads * cfg.head_dim,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.q,
-            );
+            )?;
             add_bias(&mut self.scratch.q, q_bias, q_bias_dtype);
             // qwen3-style per-head RMSNorm on q, applied before rope when the
             // family carries a q_norm unit.
@@ -778,14 +857,14 @@ impl DecoderNative {
             }
             self.scratch.k.clear();
             self.scratch.k.resize(cfg.kv_heads * cfg.head_dim, 0.0);
-            kernels::gemv(
-                k_weight,
-                k_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &format!("{prefix}self_attn.k_proj.weight"),
                 cfg.kv_heads * cfg.head_dim,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.k,
-            );
+            )?;
             add_bias(&mut self.scratch.k, k_bias, k_bias_dtype);
             if self
                 .store
@@ -809,14 +888,14 @@ impl DecoderNative {
             }
             self.scratch.v.clear();
             self.scratch.v.resize(cfg.kv_heads * cfg.head_dim, 0.0);
-            kernels::gemv(
-                v_weight,
-                v_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &format!("{prefix}self_attn.v_proj.weight"),
                 cfg.kv_heads * cfg.head_dim,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.v,
-            );
+            )?;
             add_bias(&mut self.scratch.v, v_bias, v_bias_dtype);
         }
 
@@ -913,19 +992,18 @@ impl DecoderNative {
         } else {
             format!("{prefix}self_attn.o_proj")
         };
-        let (o_weight, o_dtype, _) = self.store.slice(&format!("{output_unit}.weight"))?;
         let (o_bias, o_bias_dtype, _) = self
             .store
             .slice(&format!("{output_unit}.bias"))
-            .unwrap_or((&[], o_dtype, &[]));
-        kernels::gemv(
-            o_weight,
-            o_dtype,
+            .unwrap_or((&[], WeightDType::F32, &[]));
+        self.quant.gemv_linear(
+            &self.store,
+            &format!("{output_unit}.weight"),
             cfg.hidden_size,
             cfg.q_heads * cfg.head_dim,
             &self.scratch.attn_out,
             &mut self.scratch.attn_projected,
-        );
+        )?;
         add_bias(&mut self.scratch.attn_projected, o_bias, o_bias_dtype);
         if self.debug_capture_layer0_attn && layer == 0 {
             self.debug_capture_layer0_attn = false;
@@ -966,16 +1044,14 @@ impl DecoderNative {
         // Router: compute expert scores from normalized hidden states
         self.scratch.router.clear();
         self.scratch.router.resize(cfg.num_local_experts, 0.0);
-        let (router_weight, router_dtype, _) =
-            self.store.slice(&cfg.moe_layout.router_unit(prefix))?;
-        kernels::gemv(
-            router_weight,
-            router_dtype,
+        self.quant.gemv_linear(
+            &self.store,
+            &cfg.moe_layout.router_unit(prefix),
             cfg.num_local_experts,
             cfg.hidden_size,
             &self.scratch.normed,
             &mut self.scratch.router,
-        );
+        )?;
 
         // Router selection: softmax over the router logits, top-k by score,
         // selected weights renormalized to one — the shared routing rule every
@@ -1019,44 +1095,40 @@ impl DecoderNative {
                 .moe_layout
                 .expert_unit(prefix, expert, cfg.moe_layout.down);
 
-            let (gate_weight, gate_dtype, _) = self.store.slice(&gate_unit)?;
-            let (up_weight, up_dtype, _) = self.store.slice(&up_unit)?;
-            let (down_weight, down_dtype, _) = self.store.slice(&down_unit)?;
-
             self.scratch.gate.clear();
             self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-            kernels::gemv(
-                gate_weight,
-                gate_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &gate_unit,
                 cfg.intermediate_size,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.gate,
-            );
+            )?;
 
             self.scratch.up.clear();
             self.scratch.up.resize(cfg.intermediate_size, 0.0);
-            kernels::gemv(
-                up_weight,
-                up_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &up_unit,
                 cfg.intermediate_size,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.up,
-            );
+            )?;
 
             kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
 
             self.scratch.mlp_out.clear();
             self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-            kernels::gemv(
-                down_weight,
-                down_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &down_unit,
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 &self.scratch.gate,
                 &mut self.scratch.mlp_out,
-            );
+            )?;
 
             // Accumulate this expert's output, weighted by the router's
             // probability for the token; the caller owns the residual add.
@@ -1085,71 +1157,64 @@ impl DecoderNative {
         if cfg.features.fc_mlp {
             // phi plain MLP: fc1 (hidden -> intermediate) with bias, tanh
             // GELU, fc2 (intermediate -> hidden) with bias.
-            let (fc1_weight, fc1_dtype, _) =
-                self.store.slice(&format!("{prefix}mlp.fc1.weight"))?;
             let (fc1_bias, fc1_bias_dtype, _) = self
                 .store
                 .slice(&format!("{prefix}mlp.fc1.bias"))
-                .unwrap_or((&[], fc1_dtype, &[]));
+                .unwrap_or((&[], WeightDType::F32, &[]));
             self.scratch.gate.clear();
             self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-            kernels::gemv(
-                fc1_weight,
-                fc1_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &format!("{prefix}mlp.fc1.weight"),
                 cfg.intermediate_size,
                 cfg.hidden_size,
                 &self.scratch.normed,
                 &mut self.scratch.gate,
-            );
+            )?;
             add_bias(&mut self.scratch.gate, fc1_bias, fc1_bias_dtype);
             kernels::gelu(&mut self.scratch.gate);
 
-            let (fc2_weight, fc2_dtype, _) =
-                self.store.slice(&format!("{prefix}mlp.fc2.weight"))?;
             let (fc2_bias, fc2_bias_dtype, _) = self
                 .store
                 .slice(&format!("{prefix}mlp.fc2.bias"))
-                .unwrap_or((&[], fc2_dtype, &[]));
+                .unwrap_or((&[], WeightDType::F32, &[]));
             self.scratch.mlp_out.clear();
             self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-            kernels::gemv(
-                fc2_weight,
-                fc2_dtype,
+            self.quant.gemv_linear(
+                &self.store,
+                &format!("{prefix}mlp.fc2.weight"),
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 &self.scratch.gate,
                 &mut self.scratch.mlp_out,
-            );
+            )?;
             add_bias(&mut self.scratch.mlp_out, fc2_bias, fc2_bias_dtype);
             return Ok(());
         }
 
         // Gate projection
-        let (gate_weight, gate_dtype, _) =
-            self.store.slice(&format!("{prefix}mlp.gate_proj.weight"))?;
         self.scratch.gate.clear();
         self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-        kernels::gemv(
-            gate_weight,
-            gate_dtype,
+        self.quant.gemv_linear(
+            &self.store,
+            &format!("{prefix}mlp.gate_proj.weight"),
             cfg.intermediate_size,
             cfg.hidden_size,
             &self.scratch.normed,
             &mut self.scratch.gate,
-        );
+        )?;
 
         // Up projection
-        let (up_weight, up_dtype, _) = self.store.slice(&format!("{prefix}mlp.up_proj.weight"))?;
         self.scratch.up.clear();
         self.scratch.up.resize(cfg.intermediate_size, 0.0);
-        kernels::gemv(
-            up_weight,
-            up_dtype,
+        self.quant.gemv_linear(
+            &self.store,
+            &format!("{prefix}mlp.up_proj.weight"),
             cfg.intermediate_size,
             cfg.hidden_size,
             &self.scratch.normed,
             &mut self.scratch.up,
-        );
+        )?;
 
         // SwiGLU (baseline) or GeGLU (gemma) activation: act(gate) ⊙ up
         if cfg.features.mlp_gelu {
@@ -1159,18 +1224,16 @@ impl DecoderNative {
         }
 
         // Down projection
-        let (down_weight, down_dtype, _) =
-            self.store.slice(&format!("{prefix}mlp.down_proj.weight"))?;
         self.scratch.mlp_out.clear();
         self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-        kernels::gemv(
-            down_weight,
-            down_dtype,
+        self.quant.gemv_linear(
+            &self.store,
+            &format!("{prefix}mlp.down_proj.weight"),
             cfg.hidden_size,
             cfg.intermediate_size,
             &self.scratch.gate,
             &mut self.scratch.mlp_out,
-        );
+        )?;
         Ok(())
     }
 
@@ -1197,6 +1260,16 @@ impl DecoderNative {
         }
         self.scratch.logits.clear();
         self.scratch.logits.resize(cfg.vocab_size, 0.0);
+        // lm_head keeps its stored precision (the registered quantize formats
+        // cover the layer linear projections, matching the Vulkan executor's
+        // take_linear coverage) — the chunked sweep below is already the
+        // memory-optimal path for the largest unit.
+        let format_id = dtype.format_id();
+        let ops = precision::native_ops_for_format(format_id).ok_or_else(|| {
+            format!(
+                "Weight precision '{format_id}' has no native operator table for '{head_unit}'."
+            )
+        })?;
         // Ant: sweep the embedding (the largest tensor) in row chunks and
         // release each chunk's pages right away when it sits on the disk tier,
         // so the lm_head pass does not transiently hold all 272 MB resident.
@@ -1207,9 +1280,8 @@ impl DecoderNative {
             let end_row = (start_row + chunk_rows).min(cfg.vocab_size);
             let byte_start = start_row * row_stride;
             let byte_len = (end_row - start_row) * row_stride;
-            kernels::gemv(
+            (ops.gemv)(
                 &bytes[byte_start..byte_start + byte_len],
-                dtype,
                 end_row - start_row,
                 cfg.hidden_size,
                 &self.scratch.hidden,
@@ -1638,6 +1710,57 @@ mod forward_tests {
         decoder.clear_kv();
         let logits_paged_in = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first, logits_paged_in);
+    }
+
+    /// CHEETAH_QUANT_Q8=1 (the registered q8 selector) + the dense fixture:
+    /// every linear unit quantizes at first use through the precision
+    /// registry's native operator table and the forward computes from the
+    /// quantized buffers — finite, deterministic across a residency cycle,
+    /// with the quantized-unit table populated. Norms/biases/embedding never
+    /// quantize, so the embedding unit stays absent from the table.
+    /// Opt-in via CHEETAH_TEST_NATIVE_Q8=1 (the env mutation is
+    /// process-global; same gating as the Vulkan q8 forward test).
+    #[test]
+    fn q8_quantized_forward_terminates_and_populates_quantized_units() {
+        if std::env::var("CHEETAH_TEST_NATIVE_Q8").is_err() {
+            eprintln!("skipping native q8 forward test (set CHEETAH_TEST_NATIVE_Q8=1)");
+            return;
+        }
+        // SAFETY: test-scoped process env mutation; single-threaded within
+        // this test (same pattern as the Vulkan q8 forward test).
+        unsafe { std::env::set_var("CHEETAH_QUANT_Q8", "1") };
+        let fixture = Fixture::new("native_q8_forward", FeedForward::Dense, false);
+        let mut decoder = DecoderNative::with_store(dense_config(0), Arc::clone(&fixture.store));
+        let tokens: Vec<u32> = vec![3];
+        let logits_first = decoder.forward(&tokens, 0).unwrap();
+        assert!(logits_first.iter().all(|value| value.is_finite()));
+        assert!(
+            !decoder.quant.buffers.is_empty(),
+            "linear units must quantize at first use"
+        );
+        assert!(
+            !decoder
+                .quant
+                .buffers
+                .contains_key("model.embed_tokens.weight"),
+            "the embedding stays in its stored precision"
+        );
+        // Deterministic across evict -> page-in: the quantized buffers are
+        // owned; tier transitions only touch the source pages.
+        for unit in &fixture.unit_ids {
+            decoder.evict_unit(unit);
+        }
+        decoder.clear_kv();
+        let logits_evicted = decoder.forward(&tokens, 0).unwrap();
+        assert_eq!(logits_first, logits_evicted);
+        for unit in &fixture.unit_ids {
+            decoder.page_in_unit(unit);
+        }
+        decoder.clear_kv();
+        let logits_paged_in = decoder.forward(&tokens, 0).unwrap();
+        assert_eq!(logits_first, logits_paged_in);
+        // SAFETY: restoring the process env after the opt-in test.
+        unsafe { std::env::remove_var("CHEETAH_QUANT_Q8") };
     }
 
     /// RC3 sparse/MoE completion: the router-selected experts follow the same
