@@ -6,6 +6,30 @@
 //! = even column), each row padded to a multiple of four bytes so the shader
 //! unpacks eight lanes per u32 word.
 //!
+//! ```text
+//! offset  0                head: rows × 4 B — f32 scale per OUTPUT row
+//! offset  rows*4           payloads: rows rows of `row_bytes` bytes each
+//!
+//! one payload byte (column pair):  [high nibble]  [low nibble]
+//!                                   col 2b+1       col 2b
+//!                                   (code >> 4)    (code & 0xF)
+//!
+//! one u32 word (shader view):      8 columns, nibble n at bit n*4;
+//!                                  word index = column / 8 within the row
+//! ```
+//!
+//! Bit-level correspondence (the contract between packer, CPU gemv and
+//! shader): column `c` lives in byte `c / 2` at nibble `c % 2`, i.e. bit
+//! offset `(c % 8) * 4` inside u32 word `c / 8` of the row. Both decoders
+//! sign-extend the 4-bit lane (nibble ≥ 8 → nibble − 16) so the ±7 code
+//! range survives as int4.
+//!
+//! Numerics: per-row symmetric quantization with `scale = max|w| / 7` and
+//! codes clamped to ±7 — the same scheme as q8 scaled down to the 4-bit
+//! range, so one code step is `scale` and the error is bounded by
+//! ±scale/2 (±max|w|/14). A zero row keeps `scale = 1.0`. The quantized
+//! footprint is a quarter of BF16 and half of q8.
+//!
 //! Compute contract: operators work from the quantized representation —
 //! codes are unpacked as int4 and multiplied by the row scale; the weights
 //! are never bulk-dequantized into another storage width. Symmetric range:
@@ -16,11 +40,22 @@ use std::sync::Arc;
 
 /// Padded per-row byte stride: `(cols + 1) / 2` payload bytes rounded up to
 /// a multiple of four (the shader reads whole u32 words per row).
+///
+/// Two-stage rounding: `cols` codes need `(cols + 1) / 2` bytes (two codes
+/// per byte), and the shader indexes the row as u32 words —
+/// `q.values[head + row * (row_bytes / 4) + column / 8]` — so the stride
+/// must be a multiple of four. The C entry point computes the same formula
+/// from `k`; a unit test pins the Rust/C agreement via the buffer length
+/// the FFI validates.
 pub(crate) fn row_stride(cols: usize) -> usize {
     (cols + 1).div_ceil(2).div_ceil(4) * 4
 }
 
 /// Decode one int4 code from `byte` (`half` selects the low/high nibble).
+///
+/// Sign extension: the packer stored `code & 0xF`, so codes −8..−1 come back
+/// as nibbles 8..15 and map back by subtracting 16. `half == 0` reads the
+/// low nibble (even column), `half == 1` the high nibble (odd column).
 fn decode_code(byte: u8, half: usize) -> i8 {
     let nibble = if half == 0 { byte & 0x0F } else { byte >> 4 };
     if nibble >= 8 {
@@ -70,6 +105,18 @@ impl PrecisionBuffer for Q4Matrix {
 }
 
 /// Row-wise symmetric int4 quantization: scale = max|w| / 7 per row.
+///
+/// Mirrors `q8::quantize` step for step, scaled to the 4-bit range:
+/// 1. scan the row for `max|w|`;
+/// 2. `scale = max|w| / 7` (or 1.0 for an all-zero row);
+/// 3. write the scale's f32 bits into the head at `row * 4`;
+/// 4. round to a code: `(w / scale).round()` clamped to ±7.
+///
+/// Payload writes are read-modify-write (`|=`) because each byte holds two
+/// independent column codes — the low nibble for the even column is written
+/// first, then the high nibble ORs in without disturbing it. The padded
+/// tail bytes stay zero (never decoded: the gemv stops at `cols`, the
+/// shader guards `column < n`).
 pub(crate) fn quantize(
     values: &[f32],
     rows: usize,
@@ -110,6 +157,10 @@ pub(crate) fn quantize(
 /// Upload the quantized buffer into the Ant resident bucket; `None` keeps the
 /// per-step streaming path (e.g. an oversized upload). `row_bytes` is the
 /// padded per-row stride the resident matmul validates against.
+///
+/// Same contract as `q8::upload`; the C side records format code q4 = 5 in
+/// the resident record and the resident matmul dispatches the q4 pipeline
+/// through the format table.
 #[cfg(feature = "vulkan")]
 pub(crate) fn upload(buffer: &[u8], row_bytes: usize) -> Option<u64> {
     cheetah::native::vulkan::weight_upload_q4(buffer, row_bytes as u32)
@@ -117,6 +168,12 @@ pub(crate) fn upload(buffer: &[u8], row_bytes: usize) -> Option<u64> {
 
 /// Host-streaming q4 matmul: the whole quantized buffer (scale head + packed
 /// rows) stages in one pass — a quarter of the BF16 footprint and half of q8.
+///
+/// `k` is the reduction width (input features), `n` the output features;
+/// the expected buffer length is `n * 4` scale bytes plus `n * row_bytes(k)`
+/// payload bytes — validated here and inside the C entry point. The row
+/// stride is derived from `k` on both sides (`row_stride`), so a Rust/C
+/// drift fails loudly at the length check instead of corrupting reads.
 #[cfg(feature = "vulkan")]
 pub(crate) fn matmul_streaming(
     input: &[f32],
@@ -139,6 +196,11 @@ pub(crate) fn matmul_streaming(
 /// Ant resident q4 matmul: the quantized weight buffer stays bound on the
 /// GPU behind `handle` (from `upload`); only activations and outputs pass
 /// through the pool.
+///
+/// The C side resolves the record's format code (q4 = 5) through
+/// `g_quant_formats`, lazily creates the q4 pipeline on first use and
+/// dispatches the same shader as the streaming path — the weight buffer is
+/// descriptor 1 of the resident record instead of a per-call pool staging.
 #[cfg(feature = "vulkan")]
 pub(crate) fn matmul_resident(
     handle: u64,
@@ -152,6 +214,10 @@ pub(crate) fn matmul_resident(
 
 /// `y = W·x` over the quantized buffer: int4 codes × per-row scale, f32
 /// accumulate — the same math the q4 shader performs.
+///
+/// Thin forward to `kernels::gemv_q4` (one symbol per backend, mirroring
+/// q8::gemv) so the decoder's quantized path and the registration table
+/// stay decoupled from the kernel module layout.
 pub(crate) fn gemv(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     crate::chat::models::native::kernels::gemv_q4(weight, rows, cols, x, y);
 }

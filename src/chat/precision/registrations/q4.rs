@@ -1,8 +1,23 @@
 //! Declarative registration for the `q4` quantization format.
 //!
-//! build.rs collects every file in `src/chat/precision/registrations/` into
-//! the generated `REGISTRY`; the operator implementations live in
-//! `super::q4`. This file intentionally contains no runtime code.
+//! This file is DATA ONLY: build.rs scans `src/chat/precision/registrations/`
+//! and splices every file into the generated `OUT_DIR/precision_registry.rs`
+//! as a `<name>_registration` module, assembling the `REGISTRY` table the
+//! runtime lookups (`registration_for_format`, `selected_format`, the
+//! per-backend operator lookups) derive from. Adding a weight precision is
+//! adding one file here plus its implementation module — no table edits
+//! anywhere, matching the model-family registration mode.
+//!
+//! Registration contract enforced by the registry tests:
+//! - format ids and selector variables are globally unique;
+//! - every format serves BOTH backends (native always, vulkan when compiled
+//!   in) — a half-registered format fails the build's tests;
+//! - `quantize` presence must match `PrecisionKind` (original precisions
+//!   never convert, quantized formats always do);
+//! - original precisions carry `selector_env: None`; only quantized formats
+//!   are opt-in.
+//!
+//! The operator implementations live in `super::q4`.
 
 use super::{PrecisionBackend, PrecisionKind, PrecisionRegistration};
 

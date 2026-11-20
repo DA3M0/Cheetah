@@ -1,4 +1,16 @@
-//! Cheetah's local model command-line interface.
+//! Cheetah's local model command-line interface (binary entry point).
+//!
+//! `main.rs` does only three things:
+//! 1. parses the first CLI argument and dispatches to the matching
+//!    subcommand (`init` / `chat` / `serve` / `inspect` / `context` ...);
+//! 2. assembles the runtime dependencies for each subcommand (Ant
+//!    settings, conversation archive, ChatOptions);
+//! 3. converts the backend's `Result<_, String>` errors into a [`RunError`]
+//!    with an exit code, printed to stderr.
+//!
+//! Argument parsing lives in `cli.rs`; subcommand implementations live in
+//! their own modules (`chat/`, `serve/`, `inspect.rs`, `ant.rs`). See
+//! `docs/CODEBASE.md` §2 for the end-to-end data flows.
 
 mod ant;
 mod chat;
@@ -18,6 +30,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// Process entry point: runs [`run`] and prints errors to stderr in red,
+/// then hands the [`RunError`]-mapped exit code back to the OS.
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -31,9 +45,12 @@ fn main() -> ExitCode {
     }
 }
 
+/// Subcommand dispatcher: routes on the first argument to each
+/// subcommand implementation.
 fn run(args: Vec<String>) -> Result<(), RunError> {
-    // Dispatch the first argument to a subcommand, while preserving the legacy bare-model chat form.
-    // 将首个参数分派到子命令，同时保留直接传入模型路径启动聊天的旧用法。
+    // Dispatch the first argument to a subcommand, while preserving the
+    // legacy bare-model chat form. (No arguments is equivalent to
+    // `cheetah chat .`, i.e. load the model in the current directory.)
     let Some(command) = args.first().map(String::as_str) else {
         return run_chat(
             Path::new("."),
@@ -87,7 +104,22 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
     }
 }
 
+/// `cheetah init <src> <dst>`: prepares an HF-format model into the local
+/// format.
+///
+/// Flow (see docs/CODEBASE.md §2.3):
+/// 1. read metadata such as `config.json` from the source directory;
+/// 2. call the C-side `cheetah_init_model` to write aligned shards, the
+///    manifest (`cheetah_manifest.json`), the units
+///    (`cheetah_units.json`), and to copy config/tokenizer;
+/// 3. resolve Ant settings and run the residency planner, assigning each
+///    atomic unit to one of the three tiers (VRAM → RAM → disk) and
+///    immediately `page_in`-ing it into the target tier.
 fn run_init_command(args: &[String]) -> Result<(), RunError> {
+    // init takes exactly two positional arguments (source and destination
+    // directories) plus a batch of Ant flags; group them coarsely here by
+    // "starts with '-' = flag" and leave the detailed flag parsing to
+    // parse_ant_args.
     let mut positional: Vec<String> = Vec::new();
     let mut flag_args: Vec<String> = Vec::new();
     for arg in args {
@@ -103,6 +135,8 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
         ));
     }
     let source = PathBuf::from(&positional[0]);
+    // Parse the architecture metadata on the Rust side first, then let the
+    // C side do the actual shard/manifest writing.
     let metadata = runtime(chat::model_metadata_for_init(&source))?;
     let destination = PathBuf::from(&positional[1]);
     runtime(native::init_model_with_metadata(
@@ -120,6 +154,10 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
     runtime(ant.write_settings_for_model(&destination, &settings))?;
     let units = runtime(ant.units_for_model(&destination))?;
     let plan = ant.plan_residency(&units);
+    // Apply the plan unit by unit and count units per tier; the tier
+    // string maps to the C-side tier number (0=vram, 1=ram, 2=disk).
+    // A failed page_in is deliberately ignored: one unit failing to
+    // residency must not abort the whole init.
     let (mut vram_units, mut ram_units, mut disk_units) = (0u64, 0u64, 0u64);
     for (unit_id, tier) in &plan {
         let tier_value = match tier.as_str() {
@@ -234,6 +272,8 @@ fn split_ant_args(args: &[String]) -> Result<(Vec<String>, cli::AntCliOptions), 
     Ok((rest, ant_options))
 }
 
+/// `cheetah inspect` / `cheetah load`: inspect a Safetensors file or model
+/// directory and print (or save) a metadata report.
 fn run_inspect_command(args: &[String]) -> Result<(), RunError> {
     let options = cli::parse_inspect_args(args)?;
     let info = runtime(inspect::inspect_model(&options.path))?;
@@ -252,6 +292,8 @@ fn run_inspect_command(args: &[String]) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Writes an inspection report to a file (overwrites any existing content)
+/// with a trailing newline.
 fn write_report(path: &Path, report: &str) -> Result<(), RunError> {
     std::fs::write(path, format!("{report}\n")).map_err(|error| {
         RunError::Runtime(format!(
@@ -261,6 +303,9 @@ fn write_report(path: &Path, report: &str) -> Result<(), RunError> {
     })
 }
 
+/// Applies explicit CLI Ant overrides on top of resolved settings; only the
+/// fields the user actually passed are touched (first-wins layering:
+/// defaults → preset → CLI).
 fn apply_ant_overrides(settings: &mut ant::AntSettings, ant_options: &cli::AntCliOptions) {
     if let Some(enabled) = ant_options.enabled {
         settings.enabled = enabled;
@@ -288,24 +333,30 @@ fn apply_ant_overrides(settings: &mut ant::AntSettings, ant_options: &cli::AntCl
     }
 }
 
+/// Entry point for the chat subcommand (and the legacy bare-model form):
+/// resolves Ant settings, restores/creates the conversation archive, and
+/// hands everything to `chat::chat`.
 fn run_chat(
     path: &Path,
     requested_options: ChatOptions,
     context_options: cli::ContextCliOptions,
     ant_options: cli::AntCliOptions,
 ) -> Result<(), RunError> {
-    // Ant: resolve effective memory settings from user-managed defaults, then CLI overrides.
-    // Ant: 先读取用户管理的默认设置，再叠加命令行覆盖项。
+    // Ant: resolve effective memory settings from user-managed defaults,
+    // then CLI overrides.
     let settings = resolve_ant_settings(path, &ant_options)?;
 
-    // Ant: warn when the target model has not been prepared for Ant memory management.
+    // Ant: warn when the target model has not been prepared for Ant memory
+    // management (chat still works, just without tiered residency).
     let ant_manager = runtime(ant::Ant::with_settings(&settings))?;
     if !ant_manager.model_is_initialized(path) {
         ant_manager.not_initialized_warning(&path.display().to_string(), path);
     }
 
-    // A named archive supplies its saved options unless the caller explicitly provided chat options.
-    // 恢复已命名会话时默认采用归档选项；只有命令行显式指定推理参数时才进行一致性校验。
+    // A named archive supplies its saved options unless the caller
+    // explicitly provided chat options (restored conversations adopt the
+    // archived options; only explicitly passed flags are validated against
+    // them).
     let chat_options_specified = context_options.chat_options_specified;
     let store = ContextStore::new(context_options.directory);
     let archive = match context_options.name {
@@ -320,6 +371,8 @@ fn run_chat(
     runtime(chat::chat(path, options, archive, store, Some(&settings)))
 }
 
+/// `cheetah context list | delete <name>`: manage saved conversation
+/// archives in the archive directory.
 fn run_context_command(
     operation: ContextCommand,
     directory: Option<PathBuf>,
@@ -349,10 +402,12 @@ fn run_context_command(
     }
 }
 
+/// Adapts the backend's `Result<_, String>` errors into [`RunError::Runtime`].
 fn runtime<T>(result: Result<T, String>) -> Result<T, RunError> {
     result.map_err(RunError::Runtime)
 }
 
+/// Prints the supported model formats (`cheetah formats`).
 fn print_formats() {
     println!(
         "{}",
@@ -363,6 +418,7 @@ fn print_formats() {
     );
 }
 
+/// Prints the full CLI help text (`cheetah help` / `--help`).
 fn print_help() {
     println!(
         "{}",
@@ -456,6 +512,8 @@ Enter /exit to leave a chat. Press Ctrl-C to stop the server.",
     );
 }
 
+/// Renders a human-readable inspection report (banner, metadata, tensor
+/// table bounded to [`DEFAULT_TENSOR_LIMIT`] entries unless `show_all`).
 fn render_model(info: &ModelInfo, show_all: bool) -> String {
     let mut output = String::new();
     use std::fmt::Write as _;
@@ -474,8 +532,8 @@ fn render_model(info: &ModelInfo, show_all: bool) -> String {
     }
     if !info.tensors.is_empty() {
         output.push_str("\nTensors:\n");
-        // Keep terminal output bounded by default; JSON export remains complete and machine-readable.
-        // 默认限制终端输出长度；JSON 报告仍包含全部张量，便于程序读取。
+        // Keep terminal output bounded by default; JSON export remains
+        // complete and machine-readable.
         let count = if show_all {
             info.tensors.len()
         } else {
@@ -505,6 +563,8 @@ fn render_model(info: &ModelInfo, show_all: bool) -> String {
     output.trim_end().to_string()
 }
 
+/// Renders the inspection report as pretty-printed JSON (complete tensor
+/// list, unlike the bounded terminal rendering).
 fn render_json(info: &ModelInfo) -> Result<String, RunError> {
     let output = serde_json::json!({
         "path": info.path,
@@ -523,6 +583,7 @@ fn render_json(info: &ModelInfo) -> Result<String, RunError> {
         .map_err(|error| RunError::Runtime(format!("Failed to generate JSON output: {error}")))
 }
 
+/// Formats a byte count in binary units (B/KB/MB/GB/TB, 1024-based).
 fn format_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = size as f64;
@@ -538,6 +599,8 @@ fn format_size(size: u64) -> String {
     }
 }
 
+/// Maximum number of tensors shown in the default (non `--all`) terminal
+/// report.
 const DEFAULT_TENSOR_LIMIT: usize = 20;
 
 #[cfg(test)]

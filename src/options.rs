@@ -1,43 +1,70 @@
 //! Shared options for local chat generation.
+//!
+//! [`ChatOptions`] is the generation-parameter struct shared by the CLI
+//! chat (`cheetah chat`) and the HTTP server (`cheetah serve`): sampling
+//! policy (temperature / top-p / top-k / repeat penalty), context length,
+//! per-turn token budget, random seed, and the system prompt. It is also
+//! serialized into conversation archives (`chat/context.rs`), so the
+//! fields must stay backward compatible — new fields need
+//! `#[serde(default)]`.
 
 use serde::{Deserialize, Serialize};
 
+/// Default cap on tokens generated per conversational turn.
 pub const DEFAULT_MAX_TOKENS_PER_TURN: usize = 256;
+/// Default context window (tokens); older history is dropped as a sliding
+/// window once exceeded.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
-/// 默认温度 0:确定性贪心输出;需要更多样化的回答时显式开启采样。
+/// Default temperature 0: deterministic greedy output; enable sampling
+/// explicitly when more varied answers are wanted.
 pub const DEFAULT_TEMPERATURE: f64 = 0.0;
+/// Default nucleus-sampling probability threshold; 1.0 disables truncation.
 pub const DEFAULT_TOP_P: f64 = 0.9;
+/// Default repeat penalty; 1.0 disables it.
 pub const DEFAULT_REPEAT_PENALTY: f32 = 1.0;
+/// System prompt injected when `--system` is not given.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a concise assistant. Respond in English.";
 
 // Serde uses this function when loading archives written before ctx_size was introduced.
-// 反序列化缺少 ctx_size 的旧版会话归档时，Serde 会使用此默认值函数。
 fn default_context_tokens() -> usize {
     DEFAULT_CONTEXT_TOKENS
 }
 
+/// All tunable parameters for one chat generation.
+///
+/// Most generation switches visible via `cheetah chat --help` land here,
+/// and the corresponding serve-request fields (temperature / top_p / ...)
+/// are merged into it as well.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatOptions {
+    /// Inference thread count; `None` lets the backend decide from the CPU
+    /// core count.
     pub threads: Option<usize>,
     #[serde(default = "default_context_tokens")]
     pub ctx_size: usize,
     pub max_tokens: usize,
-    /// 采样温度;0 表示关闭采样,使用确定性贪心。
+    /// Sampling temperature; 0 disables sampling and uses deterministic
+    /// greedy decoding.
     pub temperature: f64,
-    /// 核采样概率阈值;1 表示对完整分布采样。
+    /// Nucleus-sampling probability threshold; 1 samples from the full
+    /// distribution.
     pub top_p: f64,
-    /// 采样 top-k 候选数（仅对完整词表做截断）;0 表示关闭。
-    /// 注意：MoE 每 token 路由的专家数由模型配置中的 `num_experts_per_tok` 控制，与此字段无关。
+    /// Top-k candidate count for sampling (truncates the full vocabulary
+    /// only); 0 disables it.
+    /// Note: the per-token MoE expert count is controlled by the model
+    /// config's `num_experts_per_tok` and is unrelated to this field.
     pub top_k: usize,
-    /// 重复惩罚;1 表示关闭。
+    /// Repeat penalty; 1 disables it.
     pub repeat_penalty: f32,
-    /// 随机种子;None 表示按时间生成。
+    /// Random seed; `None` derives one from the clock.
     pub seed: Option<u64>,
-    /// 系统提示词,仅在首轮注入。
+    /// System prompt, injected on the first turn only.
     pub system: Option<String>,
 }
 
 impl Default for ChatOptions {
+    /// The only difference from [`DEFAULT_CHAT_OPTIONS`]: interactive chat
+    /// injects the system prompt by default (the HTTP server does not).
     fn default() -> Self {
         Self {
             system: Some(DEFAULT_SYSTEM_PROMPT.to_string()),
@@ -46,6 +73,8 @@ impl Default for ChatOptions {
     }
 }
 
+/// Const-friendly copy of the default options (safe to expand in `const`
+/// contexts).
 pub const DEFAULT_CHAT_OPTIONS: ChatOptions = ChatOptions {
     threads: None,
     ctx_size: DEFAULT_CONTEXT_TOKENS,

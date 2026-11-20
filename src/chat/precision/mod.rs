@@ -14,6 +14,33 @@
 //! rows decode IEEE half per row, and a quantized format computes from its
 //! packed codes and scales. No operator converts the weight into another
 //! storage width (there is no upcast-to-FP16 step anywhere).
+//!
+//! How dispatch flows through the registry:
+//!
+//! ```text
+//! checkpoint dtype (safetensors metadata) ──► format id ("f32"/"f16"/"bf16")
+//! selector env (CHEETAH_QUANT_Q4/Q8)      ──► selected_format()      [quantized only]
+//!                 │
+//!                 ▼
+//! registration_for_format ──► PrecisionRegistration.backends
+//!                 │                             ├─ "vulkan" → VulkanOps  (vulkan/weights.rs)
+//!                 │                             └─ "native" → NativeOps  (native decoder)
+//!                 ▼
+//! per-matmul operator call (fn pointers — zero dynamic dispatch per tile
+//! beyond the one table lookup the caller caches)
+//! ```
+//!
+//! Format codes reported to the C substrate (`cheetah_vulkan.c`): the
+//! shared_ops encoding is f32 = 0, f16 = 2, bf16 = 3 (decoded by
+//! `shared_ops.comp::load_weight`); quantized formats continue the sequence
+//! with q8 = 4 and q4 = 5, served by their dedicated matmul pipelines
+//! (`matmul_q8.comp` / `matmul_q4.comp`).
+//!
+//! What lives where: `registrations/<format>.rs` declares (no runtime
+//! code); `<format>.rs` implements the operators; `bytes.rs` restores typed
+//! views over the uniform byte payloads; the executors
+//! (`src/chat/vulkan/weights.rs`, `src/chat/models/native/decoder.rs`)
+//! consume the tables.
 
 use std::sync::Arc;
 
@@ -42,6 +69,20 @@ pub(crate) enum PrecisionKind {
 /// format (see `src/chat/precision/<format>.rs`); the executors hold these
 /// behind `WeightData::Quantized` / the decoder's quantized-unit table and
 /// dispatch through the format's registered operator table.
+///
+/// Layout contract (identical on both backends, and mirrored by the C
+/// substrate and the shaders): the buffer is a head of `rows` f32 row
+/// scales (raw little-endian bits, one word per row) followed by the packed
+/// payloads, row-major, each row padded so its byte stride is a multiple of
+/// four — GPU shaders read whole u32 words per row, so the stride formula
+/// lives in the format implementation (`row_bytes`) and must stay in sync
+/// with the shader and the C entry points. q8 pads `cols` int8 codes to a
+/// 4-byte stride; q4 packs two int4 codes per byte and pads to the same
+/// stride rule.
+///
+/// `Send + Sync` because the Vulkan executor clones weight data across
+/// threads (rayon tiles) and the native decoder shares buffers through
+/// `Arc` inside `QuantState`.
 #[allow(dead_code)] // buffer diagnostics (format_id/dequant_value) serve the
 // Vulkan executor and the tests; the CPU gemv reads rows/cols/buffer only.
 pub(crate) trait PrecisionBuffer: Send + Sync {
@@ -68,6 +109,22 @@ pub(crate) trait PrecisionBuffer: Send + Sync {
 /// The Vulkan operator set one registered precision serves: everything the
 /// executor needs to quantize (quantized formats), upload, and run matmuls
 /// in that precision.
+///
+/// Two matmul paths share one buffer layout:
+/// - **streaming** (`matmul_streaming`): the weight bytes stage through the
+///   HOST_COHERENT pool on every call — the default path and the fallback
+///   when a resident upload is refused (e.g. the buffer would exceed the
+///   device's storage-buffer range).
+/// - **resident** (`upload` + `matmul_resident`): VRAM-tier units upload
+///   once into the DEVICE_LOCAL bucket (or a persistent host-coherent
+///   allocation when device-local memory is unavailable) and stay bound;
+///   only activations and outputs pass through the pool per call. The
+///   executor releases the handle via `weight_release` when Ant evicts the
+///   unit.
+///
+/// All function pointers are plain `fn` — the tables are `Copy` consts in
+/// `&'static` registrations, so a dispatch costs one table lookup, not a
+/// vtable call.
 #[cfg(feature = "vulkan")]
 #[derive(Clone, Copy)]
 pub(crate) struct VulkanOps {
@@ -103,6 +160,14 @@ pub(crate) struct VulkanOps {
 }
 
 /// The native CPU operator set one registered precision serves.
+///
+/// The native decoder (`src/chat/models/native/decoder.rs`) holds the
+/// selected format's `NativeOps` in its `QuantState`: original precisions
+/// dispatch straight to `gemv` with the mmap'd unit bytes; a quantized
+/// format quantizes a unit at first use, releases the mmap pages (the
+/// memory win), and computes from the owned buffer afterwards. Norms,
+/// biases and the embedding never route through here — they keep their
+/// stored precision by design.
 #[derive(Clone, Copy)]
 pub(crate) struct NativeOps {
     /// Quantize a full-precision weight matrix into this format at load time
@@ -116,7 +181,10 @@ pub(crate) struct NativeOps {
     pub(crate) gemv: fn(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]),
 }
 
-/// One inference backend implementation for a weight precision.
+/// One inference backend implementation for a weight precision. The enum
+/// mirrors the model registry's `BackendLoader` shape — a new backend kind
+/// (cuda/metal) adds a variant plus per-format entries in the registration
+/// files; the lookups below dispatch on it.
 #[derive(Clone, Copy)]
 pub(crate) enum PrecisionBackend {
     #[cfg(feature = "vulkan")]
@@ -169,7 +237,10 @@ impl PrecisionRegistration {
 // `<format>_registration` modules plus the `REGISTRY` table.
 include!(concat!(env!("OUT_DIR"), "/precision_registry.rs"));
 
-/// The registration serving a format id, or a listing error.
+/// The registration serving a format id, or a listing error. The error
+/// carries the registered id list so a typo in a selector or a test names
+/// the valid formats; the lookup is case-insensitive because the ids
+/// surface in prose and environment values as well as code.
 pub(crate) fn registration_for_format(
     format: &str,
 ) -> Result<&'static PrecisionRegistration, String> {
@@ -233,6 +304,12 @@ fn selector_enabled(value: &str) -> bool {
 /// The quantization format enabled for this run through its registration's
 /// selector environment variable, if any. Both backends quantize linear
 /// projections with this format at load time.
+///
+/// First match in registry order wins; the uniqueness test below guarantees
+/// selector variables are distinct, so at most one format can be selected
+/// no matter how many variables are exported. When nothing matches (or the
+/// value is not "1"/"true") every unit runs in its stored precision —
+/// quantization is strictly opt-in.
 pub(crate) fn selected_format() -> Option<&'static PrecisionRegistration> {
     REGISTRY.iter().copied().find(|registration| {
         registration.selector_env.is_some_and(|variable| {

@@ -1,20 +1,45 @@
 //! Command-line argument parsing and runtime options.
+//!
+//! Every subcommand's flag grammar lives here as a hand-written parser
+//! (no clap dependency): `parse_chat_args` (also used by the legacy
+//! bare-model form), `parse_serve_args`, `parse_inspect_args`,
+//! `parse_context_args`, and `parse_ant_args` for the `--ant*` family.
+//! The parsers are intentionally strict — unknown flags and repeated
+//! single-value options are usage errors — so that typos surface at
+//! startup instead of silently changing behavior.
+//!
+//! Generic value parsing helpers (`parse_positive_option`,
+//! `parse_float_option`, ...) are `pub` because `main.rs` reuses the Ant
+//! flags via `split_ant_args`.
 
 use crate::ant::AntSettings;
 use crate::options::ChatOptions;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// CLI-level options for saved conversation archives (`--context*` flags).
+///
+/// `chat_options_specified` records whether the user passed any generation
+/// flag explicitly; when resuming a named archive this flag decides
+/// whether the archive's saved options are adopted as-is or validated
+/// against the CLI overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextCliOptions {
+    /// Name of the archive to resume (`--context <name>`); `None` starts a
+    /// fresh conversation.
     pub name: Option<String>,
+    /// Archive directory override (`--context-dir <path>`).
     pub directory: Option<PathBuf>,
+    /// True when at least one generation flag was given on the command line.
     pub chat_options_specified: bool,
 }
 
+/// `cheetah context <operation>` subcommands (list / delete).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextCommand {
+    /// List all saved archives.
     List,
+    /// Delete the archive with the given name.
     Delete(String),
 }
 
@@ -23,18 +48,25 @@ pub enum ContextCommand {
 pub struct ServeOptions {
     /// Model name, model directory, or Safetensors weight path.
     pub model: String,
-    /// 解析模型名称时搜索的目录。
+    /// Directory searched when resolving a model by name.
     pub model_dir: PathBuf,
+    /// Bind address; defaults to loopback so the server is not exposed
+    /// unless explicitly requested.
     pub host: String,
-    /// 0 表示由系统分配空闲端口。
+    /// Listen port; 0 lets the OS assign a free port.
     pub port: u16,
-    /// 同时执行模型推理的生成请求上限。
+    /// Cap on generation requests performing model inference at the same
+    /// time (enforced by `serve/queue.rs` tickets).
     pub max_concurrent_generations: usize,
+    /// When true, print a freshly generated API key and enable auth.
     pub generate_key: bool,
+    /// Explicit API key (`--api-key`); enables auth when set.
     pub api_key: Option<String>,
 }
 
 impl Default for ServeOptions {
+    /// Loopback-only listener with a single concurrent generation: the
+    /// safest out-of-the-box posture.
     fn default() -> Self {
         Self {
             model: String::new(),
@@ -48,18 +80,23 @@ impl Default for ServeOptions {
     }
 }
 
-/// 运行期错误:参数/用法错误以退出码 2 报告,其余运行时错误以退出码 1 报告。
+/// Runtime error reported by `main`: argument/usage errors exit with code 2,
+/// all other runtime errors exit with code 1.
 #[derive(Debug)]
 pub enum RunError {
+    /// Bad command-line usage (unknown flag, missing value, ...).
     Usage(String),
+    /// Failure while performing the requested work.
     Runtime(String),
 }
 
 impl RunError {
+    /// Convenience constructor for [`RunError::Usage`].
     pub fn usage(message: impl Into<String>) -> Self {
         Self::Usage(message.into())
     }
 
+    /// Maps the error kind to a process exit code (2 = usage, 1 = runtime).
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Usage(_) => ExitCode::from(2),
@@ -76,6 +113,13 @@ impl std::fmt::Display for RunError {
     }
 }
 
+/// Parses `cheetah chat <model-path> [options]` (and the legacy bare-model
+/// form, which funnels through the same parser).
+///
+/// Returns the model path, generation options, context/archive options, and
+/// Ant CLI overrides in one pass. Every recognized generation flag also
+/// sets `chat_options_specified` so archive restoration can tell explicit
+/// overrides from defaults.
 pub fn parse_chat_args(
     args: &[String],
 ) -> Result<(PathBuf, ChatOptions, ContextCliOptions, AntCliOptions), RunError> {
@@ -84,8 +128,8 @@ pub fn parse_chat_args(
     let mut context = ContextCliOptions::default();
     let mut ant = AntCliOptions::default();
     let mut index = 0;
-    // Track explicit inference flags separately so restored archives can distinguish defaults from overrides.
-    // 单独记录用户显式传入的推理参数，以便恢复归档时区分默认值与命令行覆盖值。
+    // Track explicit inference flags separately so restored archives can
+    // distinguish defaults from command-line overrides.
     while index < args.len() {
         match args[index].as_str() {
             "--threads" => {
@@ -223,6 +267,7 @@ pub fn parse_chat_args(
     Ok((path, options, context, ant))
 }
 
+/// Parses `cheetah context list | delete <name> [--context-dir <path>]`.
 pub fn parse_context_args(
     args: &[String],
 ) -> Result<(ContextCommand, ContextCliOptions), RunError> {
@@ -280,13 +325,19 @@ pub fn parse_context_args(
     Ok((operation, context))
 }
 
+/// Parses `cheetah serve <name-or-path> [options]`.
+///
+/// Serve-specific flags land in [`ServeOptions`]; generation flags
+/// (`--temperature`, `--max-tokens`, ...) populate the default
+/// [`ChatOptions`] used as the server-wide defaults for every request
+/// (requests may still override them per call).
 pub fn parse_serve_args(args: &[String]) -> Result<(ServeOptions, ChatOptions), RunError> {
     let mut serve = ServeOptions::default();
     let mut options = ChatOptions::default();
     let mut max_concurrent_generations_specified = false;
     let mut index = 0;
-    // Serve accepts both a positional model and the legacy --model flag, but never both.
-    // 服务命令同时兼容位置模型参数和旧式 --model 标志，但不允许二者同时出现。
+    // Serve accepts both a positional model and the legacy --model flag,
+    // but never both at once.
     while index < args.len() {
         match args[index].as_str() {
             "--model" => {
@@ -434,14 +485,20 @@ pub fn parse_serve_args(args: &[String]) -> Result<(ServeOptions, ChatOptions), 
     Ok((serve, options))
 }
 
+/// Options for `cheetah inspect <model-path>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectOptions {
+    /// Safetensors file or model directory to inspect.
     pub path: PathBuf,
+    /// Emit machine-readable JSON instead of the human-readable table.
     pub json: bool,
+    /// Show all tensors instead of the bounded default list.
     pub show_all: bool,
+    /// Write the report to a file instead of stdout.
     pub output: Option<PathBuf>,
 }
 
+/// Parses `cheetah inspect <model-path> [--all] [--json] [-o <file>]`.
 pub fn parse_inspect_args(args: &[String]) -> Result<InspectOptions, RunError> {
     let mut path = None;
     let mut json = false;
@@ -492,6 +549,7 @@ pub fn parse_inspect_args(args: &[String]) -> Result<InspectOptions, RunError> {
     })
 }
 
+/// Parses an option value that must be a strictly positive integer (> 0).
 pub fn parse_positive_option(
     args: &[String],
     index: usize,
@@ -511,6 +569,7 @@ pub fn parse_positive_option(
     Ok(parsed)
 }
 
+/// Parses an option value that must be a non-negative integer (>= 0).
 pub fn parse_nonnegative_option(
     args: &[String],
     index: usize,
@@ -526,6 +585,8 @@ pub fn parse_nonnegative_option(
     })
 }
 
+/// Parses an option value as an unsigned 64-bit integer (used for byte
+/// budgets and seeds).
 fn parse_u64_option(args: &[String], index: usize, option: &str) -> Result<u64, RunError> {
     let value = args
         .get(index)
@@ -537,6 +598,7 @@ fn parse_u64_option(args: &[String], index: usize, option: &str) -> Result<u64, 
     })
 }
 
+/// Consumes the next argument as a raw text value (paths, unit ids, prompts).
 fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<String, RunError> {
     args.get(index).cloned().ok_or_else(|| {
         RunError::usage(format!(
@@ -545,13 +607,17 @@ fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<Stri
     })
 }
 
-/// 解析布尔开关值,接受 true/false/1/0/yes/no/on/off。
+/// Recognizes boolean flag values: true/false/1/0/yes/no/on/off
+/// (case-insensitive). Used to decide whether a bare flag like `--ant`
+/// consumed the next token as its value.
 pub fn is_boolean_literal(value: &str) -> bool {
     ["true", "false", "1", "0", "yes", "no", "on", "off"]
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(value))
 }
 
+/// Parses the next argument as a boolean (same literals as
+/// [`is_boolean_literal`]); anything else is a usage error.
 fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool, RunError> {
     let value = parse_text_option(args, index, option)?;
     match value.trim().to_ascii_lowercase().as_str() {
@@ -563,23 +629,34 @@ fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool
     }
 }
 
-/// Ant 内存优化的命令行覆盖项;`None` 表示未指定，交由用户配置/默认值处理。
+/// Command-line overrides for Ant memory optimization; `None` means the
+/// flag was not given, deferring to the user preset / built-in defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AntCliOptions {
+    /// `--ant [bool]`: enable/disable Ant entirely (bare flag = enable).
     pub enabled: Option<bool>,
+    /// `--ant-vram <bytes>`: VRAM pool size override.
     pub vram_pool_bytes: Option<u64>,
+    /// `--ant-ram <bytes>`: RAM budget override.
     pub ram_budget_bytes: Option<u64>,
+    /// `--ant-disk-dir <path>`: disk-residency directory override.
     pub disk_dir: Option<String>,
+    /// `--ant-resident <id>` (repeatable): unit ids to keep resident.
     pub resident_units: Vec<String>,
+    /// `--ant-eviction-policy <policy>`: eviction policy override.
     pub eviction_policy: Option<String>,
+    /// `--ant-prefetch-stages <n>`: prefetch look-ahead override.
     pub prefetch_stages: Option<i64>,
+    /// `--ant-allow-vram-swap <bool>`: VRAM swap permission override.
     pub allow_vram_swap: Option<bool>,
-    /// 交互式设置Ant加载策略;`None` 表示未指定。
+    /// `--setup` / `--ant-setup`: run the interactive preset wizard;
+    /// `None` means the flag was not given.
     pub interactive: Option<bool>,
 }
 
 impl AntCliOptions {
-    /// 合并为完整的 AntSettings(未指定项回落到默认值)。
+    /// Merges this set of overrides into a complete [`AntSettings`]
+    /// (unspecified fields fall back to the built-in defaults).
     pub fn resolve(&self) -> AntSettings {
         let mut settings = AntSettings::default();
         if let Some(enabled) = self.enabled {
@@ -627,7 +704,10 @@ fn parse_setup_flag(args: &[String], index: &mut usize, option: &str) -> Result<
     }
 }
 
-/// 解析 Ant 内存优化参数:`--ant <bool>` 以及预算/驻留类覆盖项。
+/// Parses Ant memory-optimization flags: `--ant <bool>` plus the
+/// budget / residency / eviction override family. Any unknown flag here is
+/// a usage error, which is what makes [`crate::main::split_ant_args`]-style
+/// pre-extraction safe.
 pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
     let mut options = AntCliOptions::default();
     let mut index = 0;
@@ -691,7 +771,7 @@ pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
     Ok(options)
 }
 
-/// 解析下界为 `min` 的浮点数(拒绝 NaN)。
+/// Parses a float with a lower bound `min` (NaN rejected).
 fn parse_float_option(
     args: &[String],
     index: usize,
@@ -707,7 +787,7 @@ fn parse_float_option(
     Ok(value)
 }
 
-/// 解析介于 `min` 与 `max` 之间(含边界)的浮点数。
+/// Parses a float constrained to the inclusive range `[min, max]`.
 fn parse_bounded_float_option(
     args: &[String],
     index: usize,
@@ -715,8 +795,8 @@ fn parse_bounded_float_option(
     min: f64,
     max: f64,
 ) -> Result<f64, RunError> {
-    // Range::contains also rejects NaN, which cannot be meaningfully ordered or used for sampling.
-    // 范围检查也会拒绝 NaN，因为它既无法可靠比较，也不适合作为采样参数。
+    // The range check also rejects NaN, which cannot be meaningfully
+    // ordered or used as a sampling parameter.
     let value = parse_float_raw(args, index, option)?;
     if !(min..=max).contains(&value) {
         return Err(RunError::usage(format!(
@@ -726,6 +806,7 @@ fn parse_bounded_float_option(
     Ok(value)
 }
 
+/// Parses the next argument as a finite f64, rejecting NaN up front.
 fn parse_float_raw(args: &[String], index: usize, option: &str) -> Result<f64, RunError> {
     let value = args
         .get(index)

@@ -1,11 +1,89 @@
-//! Native decoder forward pass over the mmap-backed weight store. Activations
-//! are f32; weight bytes are read in their stored dtype straight from the
-//! mapping (zero copies). Disk-tier units are dropped from the resident set at
-//! the end of every step so a generation holds only the planned resident bytes.
+//! CPU decoder forward pass over the mmap-backed weight store.
+//!
+//! This module is the reference execution path for the native backend. It runs
+//! a decoder-only transformer one token at a time against weights that stay in
+//! their stored precision: weight bytes are sliced straight out of the process
+//! memory mapping and consumed in place (no dequantize-to-f32 staging copy for
+//! the bulk tensors), while every activation buffer is f32. Disk-tier units are
+//! dropped from the resident set at the end of every step, so a generation holds
+//! only the planned resident bytes rather than the whole model.
+//!
+//! ## Tensor layouts
+//!
+//! Quantities follow Hugging Face naming. Linear weights are row-major
+//! `[rows, cols]`: a matvec computes `y[r] = sum_c W[r * cols + c] * x[c]`, so
+//! `rows` is the output width and `cols` the input width. The embedding and the
+//! lower-cased lm head share the `[vocab_size, hidden_size]` shape; norm
+//! weights are 1-D `[hidden_size]`; optional biases are 1-D over the projection
+//! output. All tensors are addressed through unit ids in the units manifest, so
+//! a single store can back several architectures with different tensor names.
+//!
+//! The residual stream lives in `Scratch::hidden` (length `hidden_size`). The
+//! KV cache is per layer and flat: `[position * kv_heads * head_dim + head *
+//! head_dim + dim]`, with a parallel vector for keys and values. Query heads are
+//! contiguous per head, `[q_heads * head_dim]`, and grouped-query attention maps
+//! query head `h` onto KV head `h / (q_heads / kv_heads)`.
+//!
+//! ## Forward pass structure
+//!
+//! `forward` validates token ids, walks every token through `forward_position`,
+//! and returns only the final position's logits. One position is: embedding row
+//! lookup (optionally scaled by `sqrt(hidden_size)` for gemma), then per layer
+//! an input norm, the attention block, a residual add, a post-attention norm
+//! (unless the family uses phi's parallel residual), the feed-forward block, and
+//! a residual add. After the last layer the final norm runs and `run_lm_head`
+//! produces the vocabulary logits. Dense feed-forward blocks are SwiGLU/GeGLU
+//! (`gate`/`up`/`down`) or phi's `fc1`/`fc2` GELU pair; sparse blocks replace
+//! them with a router plus the top-k experts.
+//!
+//! ## Attention and KV cache
+//!
+//! Attention projects q/k/v (fused `qkv_proj` for phi), applies qwen-style
+//! per-head RMSNorm when those units exist, and rotates the leading
+//! `rotary_dim` dims of each head with NeoX-style rotate-half rope. Keys and
+//! values are appended to the layer's cache for the current position, then each
+//! query head scores every visible cached key with a `1/sqrt(head_dim)` scale.
+//! A nonzero `sliding_window` masks keys older than the window out of the
+//! softmax before it runs; an all-masked row is impossible because the window
+//! start is clamped to the newest key. GQA lets several query heads read the
+//! same KV head, and the attention output goes through `o_proj` (or phi's
+//! `dense`).
+//!
+//! ## MoE routing
+//!
+//! Sparse layers run the router unit over the normed hidden state, then defer to
+//! `crate::chat::moe::select_experts` for the softmax/top-k/renormalize rule
+//! shared with the other backends. Each selected expert runs its gate, up, and
+//! down projections (Mixtral-style `w1`/`w3`/`w2` by default), with SiLU gating,
+//! and the outputs accumulate into the MLP buffer weighted by the route
+//! probability. The router selection also drives per-expert residency: experts
+//! that leave the top-k are demoted to the disk tier and newly selected ones are
+//! paged in.
+//!
+//! ## Quantization
+//!
 //! Linear matmuls dispatch through the precision operator registry
-//! (`crate::chat::precision`): original precisions run their registered gemv,
-//! and a selected quantization format quantizes linear units at first use and
-//! computes from the quantized buffer.
+//! (`crate::chat::precision`). Without a selected quantization format, each
+//! unit's stored dtype is looked up in `native_ops_for_format` and its
+//! registered gemv runs directly over the mapped bytes. With a selected format,
+//! the first use of a linear unit dequantizes its source bytes to f32, runs the
+//! registered quantize operator, caches the resulting `PrecisionBuffer`, and
+//! drops the source pages; later steps compute from the quantized buffer.
+//! Norms, biases, and the embedding table never take that path. The lm head also
+//! keeps its stored precision because the chunked row sweep is already
+//! memory-optimal for the largest tensor.
+//!
+//! ## Ant residency and prefetch integration
+//!
+//! Residency is owned by `MmapWeightStore` and expressed as a `Tier` per unit.
+//! `apply_tiers` installs an Ant plan (every unit not marked `disk` becomes
+//! resident), while the forward pass itself keeps the transient footprint
+//! small: `drop_disk_units_of_layer` releases each layer's disk-tier pages right
+//! after the layer runs, `forward` drops layer 0 again after the lm head, and
+//! `run_lm_head` drops each row chunk's pages as it sweeps. Dropped pages simply
+//! re-fault from the OS page cache on their next access, so correctness is
+//! independent of the tier state. `page_in_unit`/`evict_unit` expose the same
+//! control for tests and external planners.
 
 use super::kernels;
 use super::store::{MmapWeightStore, Tier, WeightDType};
@@ -15,26 +93,54 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Fully resolved decoder hyper-parameters for the CPU forward pass.
+///
+/// A config is produced either by `DecoderConfig::resolve` (config.json plus
+/// manifest fallbacks) or built directly by tests. Every field here is already
+/// concrete: there are no optional values, so the forward pass never has to
+/// re-derive shapes or re-read JSON. Cloning is cheap (only the feature and
+/// layout tags are copyable metadata; there are no heap allocations).
 #[derive(Clone)]
 pub struct DecoderConfig {
+    /// Width of the residual stream; also the embedding row length and the
+    /// input/output width of every linear projection that touches it.
     pub hidden_size: usize,
+    /// Number of transformer blocks. The per-layer KV caches are sized to match.
     pub num_layers: usize,
+    /// Number of query attention heads; q projection rows = this * `head_dim`.
     pub q_heads: usize,
+    /// Number of key/value heads. With `kv_heads < q_heads` the model is GQA:
+    /// each KV head serves `q_heads / kv_heads` consecutive query heads.
     pub kv_heads: usize,
+    /// Per-head width. q/k/v row slices are `head_dim` wide, and the attention
+    /// scale is `1 / sqrt(head_dim)`.
     pub head_dim: usize,
+    /// Hidden width of the feed-forward block: gate/up/fc1 output width and
+    /// down/fc2 input width. For sparse models a single expert's gate rows
+    /// carry the same value.
     pub intermediate_size: usize,
+    /// Vocabulary size: embedding and lm_head row count. Token ids must be
+    /// strictly smaller than this.
     pub vocab_size: usize,
+    /// Epsilon added to the mean-square/variance denominator of RMSNorm and
+    /// LayerNorm to avoid division by zero.
     pub rms_eps: f32,
+    /// Base frequency of the rotary embedding (`rope_theta`).
     pub rope_theta: f32,
+    /// Whether the lm head reuses the embedding table instead of reading a
+    /// separate `lm_head.weight` unit.
     pub tie_word_embeddings: bool,
     /// Sparse (sliding-window) attention: keys older than this many positions
     /// are masked out of the softmax. 0 disables the window (full attention),
     /// which is what an absent `sliding_window` or a config that sets
     /// `use_sliding_window: false` resolves to.
     pub sliding_window: usize,
-    /// Mixture-of-experts layout: number of experts (0 => dense feed-forward)
-    /// and experts routed per token (0 => dense).
+    /// Number of experts in every sparse feed-forward block. Zero means the
+    /// model is dense and `forward_mlp` takes the gated/plain MLP path.
     pub num_local_experts: usize,
+    /// Experts routed per token by the sparse router (top-k). Zero means dense;
+    /// it is required to be nonzero whenever `num_local_experts` is nonzero,
+    /// because tensor shapes cannot carry this value.
     pub num_experts_per_tok: usize,
     /// Resolved rotary span per head: `head_dim` for full rope (llama-shaped
     /// families), the `partial_rotary_factor * head_dim` share for phi-style
@@ -57,13 +163,26 @@ pub struct MoEExpertLayout {
     pub router: &'static str,
     /// Expert weight name prefix (Mixtral: `block_sparse_moe.experts`).
     pub experts_prefix: &'static str,
-    /// Expert gate/up/down file suffixes (Mixtral: `w1` / `w3` / `w2`).
+    /// Expert gate projection suffix (Mixtral: `w1`), used to build the first
+    /// of the three per-expert unit ids.
     pub gate: &'static str,
+    /// Expert up projection suffix (Mixtral: `w3`). Pairing it with `gate`
+    /// gives the two-branch gated activation before the down projection.
     pub up: &'static str,
+    /// Expert down projection suffix (Mixtral: `w2`), projecting the activated
+    /// intermediate back to the hidden width.
     pub down: &'static str,
 }
 
+/// Naming helpers and the Mixtral-compatible default layout for sparse blocks.
+///
+/// The unit ids produced here are the exact strings the units manifest and the
+/// Vulkan layout metadata use, including the `.weight` suffix, so the CPU and
+/// GPU loaders always agree on which file backs which projection.
 impl MoEExpertLayout {
+    /// Mixtral's expert naming: `block_sparse_moe.gate` plus
+    /// `block_sparse_moe.experts.<i>.{w1,w3,w2}`. This is also the fallback
+    /// layout for any family whose prepared config does not override it.
     pub const MIXTRAL: Self = Self {
         router: "block_sparse_moe.gate",
         experts_prefix: "block_sparse_moe.experts",
@@ -75,12 +194,20 @@ impl MoEExpertLayout {
     /// Router weight unit id for one layer. The units manifest stores full
     /// tensor names, so the `.weight` suffix belongs to the unit id — the same
     /// suffix the Vulkan loader appends to its layout strings.
+    /// Build the router's unit id for a layer prefix such as
+    /// `model.layers.3.`. The stored unit id includes the trailing `.weight`
+    /// because the manifest names whole tensors, not parameter groups.
     pub fn router_unit(&self, prefix: &str) -> String {
         format!("{prefix}{}.weight", self.router)
     }
 
     /// One expert projection's unit id for one layer (`projection` is `gate` /
     /// `up` / `down` from this layout).
+    ///
+    /// This produces e.g. `model.layers.3.block_sparse_moe.experts.1.w3.weight`:
+    /// layer prefix, experts collection, numeric expert index, projection
+    /// suffix, and the tensor suffix. The index is formatted in decimal with no
+    /// padding, matching the manifest naming convention.
     pub fn expert_unit(&self, prefix: &str, expert: usize, projection: &str) -> String {
         format!(
             "{prefix}{}.{}.{projection}.weight",
@@ -125,7 +252,10 @@ pub struct DenseFeatures {
     pub partial_rotary_factor: f32,
 }
 
+/// Baseline llama-shaped values: every structural delta disabled and a full
+/// rotary span, i.e. exactly the `LLAMA_BASELINE` constant written as an impl.
 impl Default for DenseFeatures {
+    /// Return the llama-shaped baseline feature set.
     fn default() -> Self {
         Self {
             norm_weight_offset: false,
@@ -183,17 +313,30 @@ pub const PHI_FEATURES: DenseFeatures = DenseFeatures {
     partial_rotary_factor: 0.4,
 };
 
+/// Config resolution: turn the optional model config.json plus the units
+/// manifest into a complete `DecoderConfig`.
 impl DecoderConfig {
     /// Resolve the configuration through the parameter fallback chain:
     /// explicit config fields, then derivation from the units manifest's
     /// tensor shapes, then the registered family constants. This keeps the
     /// native backend working when the model directory's config.json is
     /// missing or incomplete.
+    ///
+    /// The fallbacks are deliberately ordered most-specific first: a declared
+    /// `hidden_size` always wins, an embedding shape discovered in the
+    /// manifest is next, and family constants (rope theta, epsilon, tied
+    /// embeddings, MoE layout, dense features) fill the rest. Resolution fails
+    /// loudly when a value cannot be recovered at all, because silently
+    /// guessing a shape would corrupt every downstream matvec.
     pub(crate) fn resolve(
         raw: Option<&Value>,
         store: &MmapWeightStore,
         family: Option<crate::chat::models::ModelFamily>,
     ) -> Result<Self, String> {
+        // JSON accessors. Each returns `None` for an absent config object, a
+        // missing key, or a value of the wrong JSON type, letting `unwrap_or`
+        // chains fall through to manifest derivation. `field_u` narrows to
+        // usize, `field_f` to f64 (later cast to f32), `field_b` to bool.
         let field_u = |name: &str| {
             raw.and_then(|value| value.get(name))
                 .and_then(Value::as_u64)
@@ -207,6 +350,10 @@ impl DecoderConfig {
             raw.and_then(|value| value.get(name))
                 .and_then(Value::as_bool)
         };
+        // Unknown architecture: fall back to the llama-shaped family defaults
+        // (rope theta 1e6, epsilon 1e-6, untied head, Mixtral expert naming,
+        // baseline dense features). This is the same shape as a family whose
+        // config lists no extras.
         let family = family.unwrap_or(crate::chat::models::ModelFamily {
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
@@ -218,6 +365,9 @@ impl DecoderConfig {
             features: DenseFeatures::default(),
         });
 
+        // The embedding is the one tensor every decoder must have: its shape
+        // anchors the derived hidden size (columns) and vocabulary (rows) when
+        // config.json omits them.
         let embed_shape = store
             .unit_shape("model.embed_tokens.weight")
             .ok_or_else(|| "Native backend: units manifest has no embedding tensor.".to_string())?;
@@ -226,6 +376,9 @@ impl DecoderConfig {
         }
         let hidden_size = field_u("hidden_size").unwrap_or(embed_shape[1]);
         let vocab_size = field_u("vocab_size").unwrap_or(embed_shape[0]);
+        // Layer count: config first, otherwise one past the highest layer id
+        // seen in the manifest (clamped to at least 1 for a degenerate empty
+        // manifest).
         let num_layers =
             field_u("num_hidden_layers").unwrap_or((store.max_layer_id() + 1).max(1) as usize);
         // Attention projection naming: phi fuses q/k/v into one `qkv_proj`
@@ -236,9 +389,14 @@ impl DecoderConfig {
         } else {
             "model.layers.0.self_attn.q_proj.weight"
         };
+        // q projection row count: the full query width for split families, or
+        // the stacked q+k+v width for phi's fused tensor.
         let q_out = store
             .unit_shape(q_unit)
             .ok_or_else(|| format!("Native backend: units manifest has no {q_unit} tensor."))?[0];
+        // k projection width. Fused tensors carry it inside `q_out`, so the
+        // same row count is used as a stand-in; otherwise the manifest's
+        // k_proj shape is authoritative and distinguishes MHA from GQA.
         let k_out = if features.fused_qkv {
             q_out
         } else {
@@ -248,7 +406,12 @@ impl DecoderConfig {
                 [0]
         };
         let moe_layout = family.moe_layout;
+        // Probe unit id for expert 0's gate on layer 0; only consulted when the
+        // dense MLP units are absent, i.e. for a sparse manifest.
         let expert_gate_unit = moe_layout.expert_unit("model.layers.0.", 0, moe_layout.gate);
+        // Intermediate width fallback chain: config, dense gate rows, phi fc1
+        // rows, then a sparse expert's gate rows. Zero means nothing matched
+        // and resolution aborts below.
         let intermediate_size = field_u("intermediate_size").unwrap_or_else(|| {
             store
                 .unit_shape("model.layers.0.mlp.gate_proj.weight")
@@ -298,8 +461,14 @@ impl DecoderConfig {
             0
         };
 
+        // Head layout. When the config declares the query head count, derive
+        // head_dim and kv_heads around it; otherwise consult the family's
+        // (hidden_size, vocab_size) profiles and fail if none matches.
         let (q_heads, kv_heads, head_dim) = match field_u("num_attention_heads") {
             Some(q_heads) => {
+                // head_dim fallback order: explicit field, family profile,
+                // then width division. The `max(1)` guards against a malformed
+                // zero-head config turning this into a division by zero.
                 let head_dim = field_u("head_dim").unwrap_or_else(|| {
                     family
                         .profile_for(hidden_size, vocab_size)
@@ -313,6 +482,11 @@ impl DecoderConfig {
                             q_out / q_heads.max(1)
                         })
                 });
+                // kv head count fallback: phi mirrors q (MHA); otherwise the
+                // k_proj rows split evenly by head_dim (GQA/MHA). If they do
+                // not divide evenly the shape is inconsistent, so assume MHA
+                // to keep the forward valid rather than inventing a partial
+                // head.
                 let kv_heads = field_u("num_key_value_heads").unwrap_or_else(|| {
                     if features.fused_qkv {
                         q_heads // phi is MHA: the fused tensor mirrors q rows
@@ -384,6 +558,14 @@ impl DecoderConfig {
 
 /// Layer-0 expert count read back from the units manifest (sparse manifests
 /// name experts `<experts_prefix>.<index>.<projection>.weight`).
+/// Count layer-0 experts by scanning the units manifest.
+///
+/// Only the gate projection is counted (each expert has exactly one), and the
+/// expert index is recovered by trimming the shared prefix/suffix and parsing
+/// the numeric infix. The result is the highest index plus one, which assumes
+/// expert indices are contiguous from zero — true for every prepared
+/// Mixtral-shaped model. A manifest with no matching units reports zero,
+/// selecting the dense feed-forward path.
 fn count_layer_experts(store: &MmapWeightStore, layout: &MoEExpertLayout) -> usize {
     let prefix = format!("model.layers.0.{}.", layout.experts_prefix);
     let suffix = format!(".{}.weight", layout.gate);
@@ -391,6 +573,8 @@ fn count_layer_experts(store: &MmapWeightStore, layout: &MoEExpertLayout) -> usi
         .unit_ids()
         .filter(|unit_id| unit_id.starts_with(&prefix) && unit_id.ends_with(&suffix))
         .filter_map(|unit_id| {
+            // Slice out the infix between prefix and suffix: the expert index.
+            // Non-numeric infixes (other layout variants) are skipped.
             unit_id[prefix.len()..unit_id.len() - suffix.len()]
                 .parse::<usize>()
                 .ok()
@@ -400,42 +584,98 @@ fn count_layer_experts(store: &MmapWeightStore, layout: &MoEExpertLayout) -> usi
         .unwrap_or(0)
 }
 
-/// Slice borrows come from `store` (a field) while activations live in
-/// `scratch` (another field) — the borrow checker accepts the disjoint paths.
+/// Reusable activation buffers for one decoder.
+///
+/// Buffers are allocated once with their maximum capacity in `with_store` and
+/// then cleared/resized on every use: `Resize` keeps the capacity, so the hot
+/// path does no allocator work. Most values are overwritten wholesale, but
+/// `hidden` is the persistent residual stream across layers and positions.
+///
+/// Slice borrows come from `store` (a field of `DecoderNative`) while
+/// activations live in `scratch` (another field) — the borrow checker accepts
+/// the disjoint paths, which is why the nested struct exists at all.
 struct Scratch {
+    /// Residual stream for the token currently being decoded; length
+    /// `hidden_size`. Seeded from the embedding row and updated by each block.
     hidden: Vec<f32>,
+    /// Output of the most recent norm (input norm, post-attention norm, or
+    /// phi's shared input norm). Attention and MLP both read this.
     normed: Vec<f32>,
+    /// Query states after projection, optional q_norm, and rope; flattened as
+    /// `[q_heads * head_dim]`. For phi's fused path it temporarily holds the
+    /// stacked q/k/v rows before they are split.
     q: Vec<f32>,
+    /// Key states after projection, optional k_norm, and rope, flattened as
+    /// `[kv_heads * head_dim]`. Appended to the layer's KV cache.
     k: Vec<f32>,
+    /// Value states after projection, flattened as `[kv_heads * head_dim]`.
     v: Vec<f32>,
+    /// Attention output before the output projection, flattened as
+    /// `[q_heads * head_dim]`. This is the softmax-weighted value mix.
     attn_out: Vec<f32>,
+    /// Attention output after `o_proj`/`dense` (plus optional bias), length
+    /// `hidden_size`. The caller adds it to the residual stream.
     attn_projected: Vec<f32>,
+    /// Softmax scores for one query head, length = number of visible cached
+    /// keys. Reused per head; masked entries stay at negative infinity.
     scores: Vec<f32>,
+    /// Gate projection / fc1 output, length `intermediate_size`. Also holds
+    /// the activated intermediate (`act(gate) * up`) that feeds the down
+    /// projection.
     gate: Vec<f32>,
+    /// Up projection output, length `intermediate_size`, consumed by the
+    /// gated activation.
     up: Vec<f32>,
+    /// Feed-forward output of the current block, length `hidden_size`. Also
+    /// the per-expert scratch buffer inside the MoE loop.
     mlp_out: Vec<f32>,
     /// MoE accumulator: each selected expert's scaled output lands here
     /// before swapping into `mlp_out`.
     mlp_out_weighted: Vec<f32>,
+    /// Router logits for the sparse block, length `num_local_experts`; turned
+    /// into a softmax top-k selection by `select_experts`.
     router: Vec<f32>,
+    /// Final vocabulary logits, length `vocab_size`. `forward` moves this out
+    /// with `mem::take`, leaving an empty vector that is resized next time.
     logits: Vec<f32>,
 }
 
+/// A native (CPU) decoder bound to one mmap-backed weight store.
+///
+/// The decoder owns no weights of its own: `store` is an `Arc` shared by every
+/// clone, and all parameter access goes through unit ids resolved at call time.
+/// What it does own is the mutable generation state — the KV cache, reusable
+/// activation scratch, the expert residency bookkeeping, and the quantized
+/// linear buffers. Construction preallocates all activation capacity, so a
+/// forward pass performs no per-token allocation beyond the returned logits.
 pub struct DecoderNative {
+    /// Resolved hyper-parameters; `pub(super)` so the native module's tests
+    /// and sibling code can inspect without exposing it crate-wide.
     pub(super) cfg: DecoderConfig,
+    /// Shared handle to the mapped weight store. Clones share the same
+    /// mapping, so cloning a decoder does not duplicate weight pages.
     store: Arc<MmapWeightStore>,
-    /// Per-layer KV cache, flattened as [position * kv_heads * head_dim + index].
+    /// Per-layer key cache, flattened as
+    /// [position * kv_heads * head_dim + head * head_dim + dim].
     kv_k: Vec<Vec<f32>>,
+    /// Per-layer value cache with the same layout as `kv_k`.
     kv_v: Vec<Vec<f32>>,
+    /// Reusable activation buffers (residual stream, projections, scores).
     scratch: Scratch,
     /// Test hook: capture layer-0's attention o_proj output (pre-residual).
     debug_capture_layer0_attn: bool,
+    /// Filled by layer 0 when the debug hook is armed, then taken by the test
+    /// helper. `None` during normal generation, so it costs nothing.
     debug_capture_buf: Option<DebugCapture>,
     /// Scratch copy of head-0 scores used by the debug capture.
     head0_scores: Vec<f32>,
-    /// Pre-rope capture slots (only written while the debug flag is set).
+    /// Query states captured before rope (only written while the debug flag is
+    /// set).
     q_raw_capture: Vec<f32>,
+    /// Key states captured before rope (only written while the debug flag is
+    /// set).
     k_raw_capture: Vec<f32>,
+    /// Layer-0 input norm output captured for the debug comparison.
     normed_capture: Vec<f32>,
     /// RC2-B: routing-aware per-expert residency, keyed by
     /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
@@ -450,8 +690,18 @@ pub struct DecoderNative {
 /// registry) plus the quantized unit buffers it has produced. `None`-free
 /// design: without a selected format both operators stay `None` and every
 /// unit keeps its stored precision.
+///
+/// The two function pointers are the format's own entry points: `quantize`
+/// converts an f32 value vector into the format's packed buffer, and `gemv`
+/// computes a matvec over that packed representation. They travel together
+/// because a format that can compute cannot be useful without the ability to
+/// produce its buffer in the first place.
 struct QuantState {
+    /// Registered quantizer: (values, rows, cols) -> packed buffer. `None`
+    /// when no quantization format is selected.
     quantize: Option<fn(&[f32], usize, usize) -> Result<Arc<dyn PrecisionBuffer>, String>>,
+    /// Registered quantized matvec: (packed bytes, rows, cols, x, y). `None`
+    /// when no quantization format is selected.
     gemv: Option<fn(&[u8], usize, usize, &[f32], &mut [f32])>,
     /// Quantized linear units, keyed by unit id: first use quantizes the
     /// source unit through the registered operator and drops its source
@@ -459,11 +709,16 @@ struct QuantState {
     buffers: HashMap<String, Arc<dyn PrecisionBuffer>>,
 }
 
+/// Lazy per-unit quantization and the matvec dispatch used by every linear
+/// projection.
 impl QuantState {
     /// The selected quantization format's native operator table (precision
     /// registry), or an inert state when no format is selected / the format
     /// does not serve the native backend.
     fn selected() -> Self {
+        // `selected_native_ops` is `Option`: no selection (or a format that
+        // has no native kernels) yields `None`, which leaves both operator
+        // slots empty and makes `gemv_linear` use stored-precision paths.
         let ops = precision::selected_native_ops();
         Self {
             quantize: ops.and_then(|ops| ops.quantize),
@@ -472,6 +727,18 @@ impl QuantState {
         }
     }
 
+    /// Compute one linear layer `y = W * x` for the named unit.
+    ///
+    /// Three paths, checked in this order:
+    /// 1. the unit was already quantized: run the registered quantized gemv
+    ///    over the cached buffer;
+    /// 2. a quantization format is selected: dequantize the source bytes to
+    ///    f32 once, quantize them, drop the source pages, then gemv;
+    /// 3. no format: look up the native operator table for the unit's stored
+    ///    dtype and run its gemv directly over the mapped bytes.
+    ///
+    /// `rows`/`cols` are the logical shape of W (row-major) and must match
+    /// both the buffer and the destination length (`y.len() == rows`).
     fn gemv_linear(
         &mut self,
         store: &MmapWeightStore,
@@ -481,6 +748,9 @@ impl QuantState {
         x: &[f32],
         y: &mut [f32],
     ) -> Result<(), String> {
+        // Fast path: this unit has already been quantized at least once. The
+        // buffer owns its shape, so the caller's `rows`/`cols` are not used to
+        // compute — they only describe the expected logical shape.
         if let Some(buffer) = self.buffers.get(unit) {
             let gemv = self
                 .gemv

@@ -1,6 +1,12 @@
 //! F32 operators: the original storage precision. Every operator reads the
 //! stored f32 weights directly — the streaming matmul runs the dedicated f32
 //! pipeline and the CPU gemv dots f32 rows in f32. No conversion step.
+//!
+//! Registered facts (asserted by the registry tests): shared-ops format
+//! code 0, shader override `CHEETAH_MATMUL_SPV`, no resident upload (an
+//! f32 weight is the widest layout, so VRAM-tier units stream per step
+//! like every other non-uploadable format) and no quantize (an original
+//! precision never converts).
 
 #[cfg(feature = "vulkan")]
 use super::bytes::f32_view;

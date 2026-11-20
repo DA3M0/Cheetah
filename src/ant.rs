@@ -1,4 +1,31 @@
 //! Ant: extremely fine-grained model memory optimization for Cheetah.
+//!
+//! Ant treats every weight tensor ("atomic unit") as an independently
+//! placeable page and assigns each one a residency tier:
+//!
+//! - `vram` — lives in the Vulkan/CUDA VRAM pool (fastest matmuls);
+//! - `ram`  — lives in host memory, paged in on demand;
+//! - `disk` — released pages, re-read from the prepared shards on demand.
+//!
+//! This module owns the *planning* side of that system:
+//!
+//! 1. [`AntSettings`] — the persisted per-model configuration
+//!    (`cheetah_ant_settings.json`, user-managed, editable by the
+//!    `--setup` wizard);
+//! 2. [`Ant::plan_residency`] — the layer-ordered greedy fill that decides
+//!    each unit's tier up front (init) and seeds the engine's runtime
+//!    bookkeeping;
+//! 3. [`ant_swap_fit`] — the pure swap decision reused by the engine's
+//!    budget-checked swap (`ant_swap_in_unit`): every swap re-checks the
+//!    budget before each eviction (see docs/CODEBASE.md §6 invariant 4);
+//! 4. [`AntLayerResidency`] / [`Ant::layer_residency_summary`] — per-layer
+//!    breakdown used by the startup banner, making partial layers an
+//!    observable fact.
+//!
+//! The *execution* side (real `madvise`/page-in of mapped weight memory)
+//! lives in the native backend (`chat/models/native/{store,decoder}.rs`)
+//! and the C manager (`cheetah_memory.c`), wrapped here by thin FFI calls
+//! on [`Ant`].
 
 use cheetah::native::{self, AntFfiSettings};
 use serde::Deserialize;
@@ -7,22 +34,42 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
+/// Name of the atomic-units manifest written by `cheetah init`
+/// (one entry per weight tensor, with source file/offset for paging).
 pub const CHEETAH_UNITS_FILENAME: &str = "cheetah_units.json";
+/// Name of the user-managed Ant preset stored inside the model directory.
 pub const CHEETAH_ANT_SETTINGS_FILENAME: &str = "cheetah_ant_settings.json";
 
+/// Resolved Ant configuration for one model directory.
+///
+/// Layering: built-in defaults → user preset file (`settings_for_model`)
+/// → CLI overrides (`apply_ant_overrides`). The result is what every Ant
+/// entry point (init/chat/serve) executes with.
 #[derive(Debug, Clone)]
 pub struct AntSettings {
+    /// Master switch; disabled Ant skips all planning (empty plan).
     pub enabled: bool,
+    /// Size of the VRAM pool used for `vram`-tier units.
     pub vram_pool_bytes: u64,
+    /// Host-memory budget for `ram`-tier units.
     pub ram_budget_bytes: u64,
+    /// Optional directory holding disk-tier evicted pages
+    /// (`None` = the model directory).
     pub disk_dir: Option<String>,
+    /// Unit ids pinned into VRAM regardless of the greedy fill order.
     pub resident_units: Vec<String>,
+    /// Eviction policy name (`lru` / `clock` / `clock2`), interpreted by
+    /// the C manager.
     pub eviction_policy: String,
+    /// How many layers ahead the engine prefetches during generation.
     pub prefetch_stages: i32,
+    /// Whether the engine may evict VRAM units to admit a swap-in.
     pub allow_vram_swap: bool,
 }
 
 impl Default for AntSettings {
+    /// Conservative defaults: 8 GiB VRAM, 16 GiB RAM, LRU eviction,
+    /// two prefetch stages, VRAM swap allowed.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -37,26 +84,39 @@ impl Default for AntSettings {
     }
 }
 
+/// One atomic unit from `cheetah_units.json`: a single weight tensor with
+/// everything needed to locate its bytes in the prepared shards.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AntUnit {
+    /// Stable unit identifier (the tensor name, e.g.
+    /// `model.layers.3.mlp.gate_proj`); the key used in plans and settings.
     pub unit_id: String,
+    /// Human-readable tensor name (currently informational only).
     #[allow(dead_code)]
     pub name: String,
+    /// Element dtype as written by init (`f32`, `bf16`, ...).
     #[serde(default)]
     pub dtype: String,
+    /// Tensor dimensions.
     #[serde(default)]
     pub shape: Vec<u64>,
+    /// Size in bytes of the unit's payload.
     #[serde(default)]
     pub bytes: u64,
+    /// Prepared shard file holding this unit's bytes.
     pub source_file: String,
+    /// Byte offset of the payload within `source_file`.
     pub source_offset: u64,
+    /// Original HF shard the tensor came from (informational).
     #[allow(dead_code)]
     pub shard: String,
+    /// Decoder layer this unit belongs to (0 for embeddings/norms/head).
     #[serde(default)]
     pub layer_id: i32,
 }
 
 impl AntUnit {
+    /// Payload size used by the planner and budget checks.
     pub fn byte_size(&self) -> u64 {
         self.bytes
     }
@@ -101,6 +161,20 @@ impl AntLayerResidency {
 ///   units (empty when the pool already has room);
 /// - `None` when the swap cannot fit (over budget with swapping disallowed, or
 ///   no eviction of any candidate leaves enough room).
+/// Pure swap-admission decision: may `unit_bytes` join a pool holding
+/// `used_bytes` under `budget_bytes`?
+///
+/// When `allow_swap` is set, units are evicted from `evictable` (in the
+/// given order, cheapest first by convention) until the pool can hold the
+/// swap-in; the budget is re-checked before each eviction. Returns:
+/// - `Some(evictions)` when the swap may proceed after evicting the listed
+///   units (empty when the pool already has room);
+/// - `None` when the swap cannot fit (over budget with swapping
+///   disallowed, or no eviction of any candidate leaves enough room).
+///
+/// This function is the single source of truth for swap admission; the
+/// engine's `ant_swap_in_unit` re-derives the same decision immediately
+/// before executing it (docs/CODEBASE.md §6 invariant 4).
 pub fn ant_swap_fit(
     used_bytes: u64,
     budget_bytes: u64,
@@ -134,7 +208,8 @@ pub fn ant_swap_fit(
 }
 
 /// Keep only the requested unit ids that exist in the units manifest, warning
-/// on (and dropping) unknown ids and duplicates.
+/// on (and dropping) unknown ids and duplicates. Used by the `--setup`
+/// wizard to validate user-typed pinned unit ids.
 pub fn ant_filter_known_units(requested: &[String], units: &[AntUnit]) -> Vec<String> {
     let known: HashSet<&str> = units.iter().map(|unit| unit.unit_id.as_str()).collect();
     let mut kept: Vec<String> = Vec::new();
@@ -156,12 +231,22 @@ pub fn ant_filter_known_units(requested: &[String], units: &[AntUnit]) -> Vec<St
     kept
 }
 
+/// Rust handle over the C Ant manager (`cheetah_memory.c`).
+///
+/// The handle owns no Rust-side state beyond the cached [`AntSettings`];
+/// unit indexes and tier bookkeeping live in the C manager. All tier
+/// mutations (`page_in`, `evict_unit`, `unit_pin`) go straight through
+/// FFI, and `Drop` releases the C-side manager.
 pub struct Ant {
+    /// Opaque pointer returned by `ant_new`; freed in `Drop`.
     handle: *mut std::os::raw::c_void,
+    /// Cached copy of the settings pushed to the C side, used by
+    /// `plan_residency` (planning happens in Rust, execution in C).
     settings: AntSettings,
 }
 
 impl Ant {
+    /// Creates a manager with default settings.
     pub fn new() -> Result<Self, String> {
         let handle = native::ant_new()?;
         Ok(Self {
@@ -170,12 +255,18 @@ impl Ant {
         })
     }
 
+    /// Creates a manager and immediately pushes `settings` to the C side.
     pub fn with_settings(settings: &AntSettings) -> Result<Self, String> {
         let mut ant = Self::new()?;
         ant.set_settings(settings)?;
         Ok(ant)
     }
 
+    /// Copies `settings` into the C manager. Byte budgets and scalar
+    /// policies are passed by value; string-valued fields (disk dir,
+    /// resident units, eviction policy) are read by the C side from the
+    /// model directory / units manifest instead, so they are sent as null
+    /// pointers here.
     pub fn set_settings(&mut self, settings: &AntSettings) -> Result<(), String> {
         self.settings = settings.clone();
         let ffi = AntFfiSettings {
@@ -192,47 +283,59 @@ impl Ant {
         native::ant_set_settings(self.handle, &ffi)
     }
 
+    /// Currently active settings (the cached Rust-side copy).
     #[allow(dead_code)]
     pub fn settings(&self) -> &AntSettings {
         &self.settings
     }
 
+    /// Loads a prepared model into the C manager's unit index.
     #[allow(dead_code)]
     pub fn load_model(&self, dst_dir: &Path) -> Result<(), String> {
         native::ant_load_model(self.handle, dst_dir)
     }
 
+    /// Queries the current tier of one unit (0=vram, 1=ram, 2=disk).
     #[allow(dead_code)]
     pub fn unit_tier(&self, dst_dir: &Path, unit_id: &str) -> Result<i32, String> {
         native::ant_unit_tier(self.handle, dst_dir, unit_id)
     }
 
+    /// Pins/unpins a unit, protecting it from eviction.
     #[allow(dead_code)]
     pub fn unit_pin(&self, unit_id: &str, pin: bool) -> Result<(), String> {
         native::ant_unit_pin(self.handle, unit_id, pin)
     }
 
+    /// Evicts a unit down to the disk tier (releases its resident pages).
     pub fn evict_unit(&self, dst_dir: &Path, unit_id: &str) -> Result<(), String> {
         native::ant_evict_unit(self.handle, dst_dir, unit_id)
     }
 
+    /// Moves a unit into the given tier (0=vram, 1=ram, 2=disk).
     pub fn page_in(&self, unit_id: &str, tier: i32) -> Result<(), String> {
         native::ant_page_in(self.handle, unit_id, tier)
     }
 
+    /// True when the directory contains a completed Ant preparation
+    /// (manifest + units).
     pub fn model_is_initialized(&self, dst_dir: &Path) -> bool {
         native::ant_model_is_initialized(self.handle, dst_dir)
     }
 
+    /// True when the C manager still needs a model to be loaded.
     #[allow(dead_code)]
     pub fn requires_init(&self) -> bool {
         native::ant_requires_init(self.handle)
     }
 
+    /// Prints the C-side "model not prepared for Ant" advisory.
     pub fn not_initialized_warning(&self, model_id: &str, dst_dir: &Path) {
         native::ant_model_not_initialized_warning(model_id, dst_dir);
     }
 
+    /// Persists `settings` as the model's user-managed preset file
+    /// (`cheetah_ant_settings.json`), pretty-printed JSON.
     pub fn write_settings_for_model(
         &self,
         dst_dir: &Path,
@@ -255,6 +358,9 @@ impl Ant {
             .map_err(|error| format!("Failed to write {}: {error}", path.display()))
     }
 
+    /// Reads the model's user-managed preset file, falling back to
+    /// [`AntSettings::default`] per field when a key is missing (partial
+    /// presets are legal). Missing file = pure defaults.
     pub fn settings_for_model(&self, dst_dir: &Path) -> Result<AntSettings, String> {
         let path = dst_dir.join(CHEETAH_ANT_SETTINGS_FILENAME);
         let settings = if path.exists() {
@@ -318,8 +424,12 @@ impl Ant {
         Ok(settings)
     }
 
-    /// Run an interactive preset configuration for a model directory and persist it.
-    /// Ant: 交互式配置 Ant 加载策略并写入模型目录。
+    /// Runs the interactive preset configuration for a model directory
+    /// (`--setup`) and persists it via `write_settings_for_model`.
+    ///
+    /// Each prompt shows the default and accepts an empty answer to keep
+    /// it; pinned unit ids are validated against the units manifest when
+    /// one exists (unknown ids warn and are dropped).
     pub fn run_interactive_setup(&self, model_dir: &Path) -> Result<AntSettings, String> {
         println!("Ant interactive setup for '{}':", model_dir.display());
         let units = self.units_for_model(model_dir).ok();
@@ -345,6 +455,8 @@ impl Ant {
             );
         }
         let mut settings = AntSettings::default();
+        // The wizard always produces an enabled preset; disabling Ant is
+        // done via `--ant false`, not through the wizard.
         settings.enabled = true;
         settings.vram_pool_bytes = interactive_prompt_u64(
             &format!(
@@ -405,6 +517,8 @@ impl Ant {
             Some(units) => ant_filter_known_units(&requested, units),
             None => requested,
         };
+        // Round-trip through a fresh manager so the preset printed below is
+        // exactly what the C side would receive.
         let ant = Ant::with_settings(&settings)?;
         ant.write_settings_for_model(model_dir, &settings)?;
         println!(
@@ -427,6 +541,11 @@ impl Ant {
         Ok(settings)
     }
 
+    /// Loads and parses `cheetah_units.json` from the model directory.
+    ///
+    /// Parsing is lenient: entries without a usable `unit_id` are skipped
+    /// and absent numeric fields default, so a manifest written by an older
+    /// init still loads.
     pub fn units_for_model(&self, dst_dir: &Path) -> Result<Vec<AntUnit>, String> {
         let path = dst_dir.join(CHEETAH_UNITS_FILENAME);
         let bytes = std::fs::read(&path)
@@ -532,6 +651,19 @@ impl Ant {
         layers.into_values().collect()
     }
 
+    /// The residency planner: assigns every unit a tier (`vram` / `ram` /
+    /// `disk`) and returns the plan keyed by unit id.
+    ///
+    /// Algorithm (layer-ordered greedy fill):
+    /// 1. pinned units (`resident_units`) go to VRAM unconditionally;
+    /// 2. remaining units are visited layer by layer in numeric `layer_id`
+    ///    order (so the VRAM boundary falls inside one deterministic
+    ///    boundary layer, which becomes a tracked `partial` layer);
+    /// 3. each unit takes the first tier where it still fits:
+    ///    VRAM pool → RAM budget → disk. A unit larger than the whole VRAM
+    ///    pool goes straight to disk.
+    ///
+    /// Returns an empty plan when Ant is disabled.
     pub fn plan_residency(&self, units: &[AntUnit]) -> BTreeMap<String, String> {
         let mut plan = BTreeMap::new();
         if !self.settings.enabled {

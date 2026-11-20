@@ -5,6 +5,21 @@
 //! bits) followed by the row-major int8 payloads, each row padded to a
 //! multiple of four bytes so packed words decode four lanes at a time.
 //!
+//! ```text
+//! offset  0                head: rows × 4 B — f32 scale per OUTPUT row
+//!                          (little-endian f32 bits, one word per row;
+//!                          the shader reads word `row` directly)
+//! offset  rows*4           payloads: rows rows of `row_bytes` bytes each,
+//!                          row_bytes = (cols + 3) / 4 * 4 — one i8 per
+//!                          weight, the tail padded with zero bytes so the
+//!                          shader's u32 word indexing stays in bounds
+//! ```
+//!
+//! Numerics: per-row symmetric quantization — `scale = max|w| / 127`, codes
+//! clamped to ±127, dequant `scale * code`. The error is bounded by half a
+//! code (±scale/2 = ±max|w|/254). A zero row keeps `scale = 1.0` (codes all
+//! zero, dequant exactly 0) instead of dividing by zero.
+//!
 //! Compute contract: operators work from the quantized representation —
 //! codes are unpacked as int8 and multiplied by the row scale; the weights
 //! are never bulk-dequantized into another storage width.
@@ -52,6 +67,21 @@ impl PrecisionBuffer for Q8Matrix {
 }
 
 /// Row-wise symmetric int8 quantization: scale = max|w| / 127 per row.
+///
+/// The input is the row-major weight matrix in f32 — the executor flattens
+/// whatever storage precision the checkpoint carries through
+/// `WeightData::value` before calling (the quantize step itself is the only
+/// place precision is intentionally lost). Steps per row:
+/// 1. scan the row for `max|w|`;
+/// 2. `scale = max|w| / 127` (or 1.0 for an all-zero row) — one code step
+///    equals `scale`, so the quantized range covers exactly ±max|w|;
+/// 3. write the scale's f32 bits into the head at `row * 4`;
+/// 4. round every value to a code: `(w / scale).round()` clamped to ±127,
+///    stored as the raw i8 bit pattern in the padded payload row.
+///
+/// The padding bytes stay zero from the `vec!` initialization — the shader
+/// reads whole u32 words and the gemv reads only `cols` codes, so the tail
+/// is never interpreted.
 pub(crate) fn quantize(
     values: &[f32],
     rows: usize,
@@ -91,6 +121,14 @@ pub(crate) fn quantize(
 /// Upload the quantized buffer into the Ant resident bucket; `None` keeps the
 /// per-step streaming path (e.g. an oversized upload). `row_bytes` is the
 /// padded per-row stride the resident matmul validates against.
+///
+/// The C side (`cheetah_vulkan_weight_upload_q8`) copies the buffer once
+/// into device-local memory (or a persistent host-coherent allocation when
+/// the device has no host-visible device-local heap) and records the format
+/// code (q8 = 4) plus the stride in the resident record; the resident
+/// matmul later binds the record's buffer directly as descriptor 1. A
+/// `None` here is silent by contract — the executor logs the fallback and
+/// the per-step streaming path takes over.
 #[cfg(feature = "vulkan")]
 pub(crate) fn upload(buffer: &[u8], row_bytes: usize) -> Option<u64> {
     cheetah::native::vulkan::weight_upload_q8(buffer, row_bytes as u32)
@@ -99,6 +137,12 @@ pub(crate) fn upload(buffer: &[u8], row_bytes: usize) -> Option<u64> {
 /// Host-streaming q8 matmul: the whole quantized buffer (scale head + packed
 /// rows) stages in one pass — roughly half the traffic of the BF16 streaming
 /// path — so no column tiling is needed.
+///
+/// `k` is the reduction width (the input feature count) and `n` the output
+/// feature count; the buffer must be exactly the q8 layout for `n × k`
+/// (checked here AND inside the C entry point — the two length formulas
+/// drifting apart is guarded by a unit test). The weight bytes arrive
+/// row-padded, so the C kernel computes the stride itself from `k`.
 #[cfg(feature = "vulkan")]
 pub(crate) fn matmul_streaming(
     input: &[f32],
@@ -121,6 +165,12 @@ pub(crate) fn matmul_streaming(
 /// Ant resident q8 matmul: the quantized weight buffer stays bound on the
 /// GPU behind `handle` (from `upload`); only activations and outputs pass
 /// through the pool.
+///
+/// The C side looks the resident record up by handle, binds its buffer as
+/// descriptor 1 and dispatches the same q8 shader — identical math to the
+/// streaming path, minus the per-call weight staging. `m × k` activations
+/// and `m × n` outputs still flow through the pool because the executor
+/// tiles `m` (MAX_ROW_TILE) to bound the pool usage.
 #[cfg(feature = "vulkan")]
 pub(crate) fn matmul_resident(
     handle: u64,
@@ -134,6 +184,10 @@ pub(crate) fn matmul_resident(
 
 /// `y = W·x` over the quantized buffer: int8 codes × per-row scale, f32
 /// accumulate — the same math the q8 shader performs.
+///
+/// Thin forward to `kernels::gemv_q8`; kept as a named operator so the q8
+/// registration wires one symbol per backend and the decoder's quantized
+/// path needs no knowledge of the kernel module layout.
 pub(crate) fn gemv(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     crate::chat::models::native::kernels::gemv_q8(weight, rows, cols, x, y);
 }

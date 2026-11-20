@@ -3,6 +3,15 @@
 //! bf16 pipeline, the resident path uploads and multiplies the bf16 bits, and
 //! the CPU gemv uses the fused bf16 kernel. No conversion into another
 //! storage width.
+//!
+//! BF16 is the most complete original precision in the registry: it is the
+//! only one with a resident upload (the C substrate stores u16 payloads,
+//! so `cheetah_vulkan_weight_upload_bf16` serves it directly) and the only
+//! one with a fused CPU kernel that reads the bits without a dequant
+//! scratch (`dot_row_bf16_fused` — the `bf16 << 16` widening is exact, and
+//! the FMA accumulation matches the dequant+dot reference bit for bit).
+//! Registered facts: shared-ops format code 3, shader override
+//! `CHEETAH_MATMUL_BF16_SPV`.
 
 #[cfg(feature = "vulkan")]
 use super::bytes::u16_view;

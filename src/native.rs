@@ -1,4 +1,74 @@
 //! Safe Rust adapters for C APIs declared by the root-level C headers.
+//!
+//! This module is the single Rust-side boundary for the project's native
+//! translation units. It exposes three groups of wrappers:
+//!
+//! * Model preparation, implemented in `cheetah_init.c` / `cheetah_init.h`.
+//!   `init_model` and `init_model_with_metadata` convert a source directory
+//!   of safetensors files into the prepared layout consumed by the runtime,
+//!   while a C-to-Rust progress callback drives `indicatif` bars. After a
+//!   successful native run the manifest can be patched with chat metadata
+//!   known only to the Rust model registry.
+//! * The "Ant" memory manager, implemented in `cheetah_memory.c` /
+//!   `cheetah_memory.h`. These wrappers cover its lifecycle, tuning
+//!   settings, model loading, residency queries, pinning, eviction, and
+//!   page-in operations. `AntFfiSettings` mirrors the C `CheetahAntSettings`
+//!   struct field for field.
+//! * The optional Vulkan compute backend (feature `vulkan`), implemented in
+//!   `cheetah_vulkan.c` / `cheetah_vulkan.h` together with the SPIR-V
+//!   compute shaders (`matmul*.comp`, `shared_ops.comp`). The nested
+//!   `vulkan` module wraps device setup, matrix multiplication in several
+//!   storage formats, resident weight uploads, and the Qwen2 building-block
+//!   operators.
+//!
+//! # Ownership and lifetimes
+//!
+//! Every native object is represented by a raw pointer or an integer handle
+//! and remains owned by C. The Rust wrappers deliberately do not implement
+//! `Drop` for native handles: callers must invoke the matching destructor
+//! (`ant_delete`, `weight_release`, or `shutdown`) exactly once and only
+//! after all dependent operations have finished. `ant_new` returns a pointer
+//! that is freed only by `ant_delete`; an Ant pointer must not be used after
+//! that call. Resident weight handles returned by the upload functions are
+//! borrowed tokens into a process-wide C table and are invalidated by
+//! `weight_release` or by backend shutdown.
+//!
+//! `CString` values created in these wrappers live only until the foreign
+//! call returns. The C side is expected to copy anything it keeps; none of
+//! the wrappers retain a pointer to a temporary Rust allocation. Input
+//! slices are borrowed for the duration of a call and are never freed or
+//! resized by C. Outputs are always freshly allocated `Vec`s whose length is
+//! validated or derived before the call, so the native code writes only
+//! within the buffer Rust provides. `ModelMetadata` uses `'static` strings,
+//! which keeps manifest updates independent of any shorter-lived caller
+//! borrow.
+//!
+//! # Threading model
+//!
+//! The C libraries keep process-global state (Vulkan device objects, resident
+//! weight tables, and progress reporting resources), so the Rust API
+//! serializes entry points with module-private mutexes:
+//! `INIT_LOCK` covers model preparation and `VULKAN_LOCK` covers every
+//! Vulkan operation, including initialization and shutdown. The locks guard
+//! the foreign calls rather than Rust data, therefore lock poisoning does
+//! not imply that native memory is corrupted; most wrappers recover the
+//! inner guard so a panic elsewhere cannot permanently disable FFI. Model
+//! preparation and Vulkan calls are synchronous with respect to the caller,
+//! but the locks are what make sharing the module across threads safe at the
+//! wrapper level. The progress callback is invoked synchronously by the C
+//! initializer and must never unwind across the FFI boundary, so its body
+//! avoids panicking operations and ignores malformed null arguments.
+//!
+//! # Error reporting
+//!
+//! C functions use `0` for success and nonzero (typically `-1`) for failure,
+//! and most print the detailed diagnostic to stderr themselves. The wrappers
+//! translate only the status code into a short `Err(String)`; the native
+//! diagnostic is intentionally left on stderr so callers can log both. A few
+//! helper APIs return `bool` or `Option` where the C contract makes failure
+//! non-fatal (for example, a resident upload that cannot be served). String
+//! conversion errors (interior NUL bytes, non-UTF-8 paths) are reported
+//! before any foreign call is made.
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::ffi::{CStr, CString};
@@ -7,15 +77,44 @@ use std::os::raw::{c_char, c_void};
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Process-wide serialization for native model-preparation runs.
+///
+/// The C initializer emits progress through a callback that borrows a stack
+/// allocated [`InitProgress`], and it also touches shared native bookkeeping.
+/// Holding this mutex for the whole call keeps two preparation sessions from
+/// interleaving their bars or racing in the C code. The guard is acquired
+/// after the source and destination paths have been converted, so a bad path
+/// fails early without contention. A poisoned lock is treated as an error
+/// because the initializer must not run with partially observed state.
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Progress UI state shared with the C initializer for one invocation.
+///
+/// The C callback receives a pointer to this value as its opaque `user_data`.
+/// Only one initializer call can own the value at a time because
+/// [`INIT_LOCK`] is held for the duration of the foreign call. All methods
+/// are driven from the initializer thread; the `indicatif` handles themselves
+/// are internally synchronized, but this struct is not shared beyond the
+/// callback contract.
 struct InitProgress {
+    /// Container that renders all active bars together, keeping ordering
+    /// stable when a phase switch adds a new bar.
     bars: MultiProgress,
+    /// Bar for the "parsing" phase. It is taken out of the option while a
+    /// bar is being mutated and put back afterwards, which is the pattern
+    /// used throughout the callback to avoid borrowing conflicts.
     parse_bar: Option<ProgressBar>,
+    /// Bar for the "writing" phase, created when the C side transitions from
+    /// parsing to writing prepared shards.
     write_bar: Option<ProgressBar>,
 }
 
+/// Construction and display helpers for the initializer's progress bars.
 impl InitProgress {
+    /// Create empty progress state with no bars installed yet.
+    ///
+    /// Bars are created lazily on the first callback for a phase so that the
+    /// UI reflects the phases the native code actually enters.
     fn new() -> Self {
         Self {
             bars: MultiProgress::new(),
@@ -24,12 +123,24 @@ impl InitProgress {
         }
     }
 
+    /// Return the shared template used by every preparation bar.
+    ///
+    /// The template shows a right-aligned completed/total counter, a cyan
+    /// bar, and the phase message. The style string is a compile-time
+    /// constant, so failure to parse it would be a programming error and is
+    /// reported with `expect`.
     fn style() -> ProgressStyle {
         ProgressStyle::with_template("{pos:>7}/{len:<7} [{bar:40.cyan}] {msg}")
             .expect("valid indicatif style")
             .progress_chars("##-")
     }
 
+    /// Register a new bar of `total` units and set its initial message.
+    ///
+    /// `total` is widened to `u64` because that is what `indicatif` uses;
+    /// the C callback reports `size_t` counts, which fit on all supported
+    /// targets. The bar starts at position 0 and is displayed even before
+    /// the first progress update.
     fn start_bar(&mut self, total: usize, message: &'static str) -> ProgressBar {
         let bar = self.bars.add(ProgressBar::new(total as u64));
         bar.set_style(Self::style());
@@ -39,7 +150,21 @@ impl InitProgress {
     }
 }
 
+/// Raw declarations from `cheetah_init.c`.
+///
+/// These are the only preparation symbols linked from the Rust side. The
+/// foreign signatures use C ABI types (`*const c_char`, `usize`, `void*`) and
+/// return `i32` status codes. Wrappers below add path/string conversion,
+/// locking, and progress management; they never change pointer ownership.
 unsafe extern "C" {
+    /// Prepare a model with periodic progress callbacks.
+    ///
+    /// `src_dir` and `dst_dir` are NUL-terminated UTF-8 paths owned by the
+    /// caller for the whole call. `progress_fn` is a non-null function
+    /// pointer that the C code invokes synchronously for each phase update;
+    /// `user_data` is passed through unchanged and only needs to remain valid
+    /// for the duration of the call. Returns 0 on success and -1 on failure,
+    /// printing a diagnostic to stderr.
     fn cheetah_init_model_with_progress(
         src_dir: *const c_char,
         dst_dir: *const c_char,
@@ -48,63 +173,158 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+/// FFI mirror of the C `CheetahAntSettings` structure.
+///
+/// The `#[repr(C)]` attribute is mandatory: the native code reads this struct
+/// by raw layout, so field order and types must stay identical to
+/// `cheetah_memory.h`. Boolean-like fields are `i32` because C uses `int`
+/// there. All pointer fields are borrowed only for the duration of
+/// [`ant_set_settings`]; the C side copies or interprets them synchronously
+/// and does not take ownership. Build these values with pointers obtained
+/// from live `CString`s and keep those owners alive across the call.
 #[repr(C)]
 pub struct AntFfiSettings {
+    /// Nonzero to enable the Ant memory manager, zero to disable it.
     pub enabled: i32,
+    /// Size in bytes of the VRAM pool the manager may use.
     pub vram_pool_bytes: u64,
+    /// Size in bytes of the host RAM budget.
     pub ram_budget_bytes: u64,
+    /// NUL-terminated directory used for disk-resident units. May be null if
+    /// the native implementation does not need a disk tier for this model.
     pub disk_dir: *const std::os::raw::c_char,
+    /// Array of `resident_units_count` NUL-terminated unit identifiers that
+    /// should be kept resident regardless of eviction pressure. The array and
+    /// every pointed-to string are borrowed only for the settings call.
     pub resident_units: *const *const std::os::raw::c_char,
+    /// Number of entries in `resident_units`.
     pub resident_units_count: usize,
+    /// NUL-terminated eviction-policy selector understood by the native
+    /// manager (for example a policy name such as LRU). Interpreted
+    /// synchronously and not retained.
     pub eviction_policy: *const std::os::raw::c_char,
+    /// Number of prefetch stages the manager may run ahead of demand.
     pub prefetch_stages: i32,
+    /// Nonzero to allow the manager to place overflow units in VRAM swap
+    /// space instead of failing or evicting to RAM.
     pub allow_vram_swap: i32,
 }
 
+/// Raw declarations from `cheetah_memory.c` for the Ant memory manager.
+///
+/// Every `ant` parameter is an opaque pointer previously returned by
+/// `cheetah_ant_new`; passing null or a pointer that has already been deleted
+/// is undefined behavior. The wrappers in this module preserve that contract
+/// and expose safe-looking Rust signatures, but they cannot validate pointer
+/// provenance. Status-returning functions use 0 for success and negative
+/// values for failure, matching the C header. Functions taking `*const`
+/// handles are logically read-only but may still update internal caches.
 unsafe extern "C" {
+    /// Allocate a new Ant memory manager.
+    ///
+    /// Returns an opaque pointer owned by the caller, or null when allocation
+    /// fails. The returned handle must eventually be passed to
+    /// `cheetah_ant_delete` exactly once.
     fn cheetah_ant_new() -> *mut std::os::raw::c_void;
+    /// Destroy an Ant manager and release all of its native resources.
+    ///
+    /// `ant` must be a live handle from `cheetah_ant_new`; after this call
+    /// every other pointer returned by or associated with the manager is
+    /// invalid. No Rust wrapper can enforce the single-use rule, so callers
+    /// must own the lifetime explicitly.
     fn cheetah_ant_delete(ant: *mut std::os::raw::c_void);
+    /// Apply memory-manager settings.
+    ///
+    /// `settings` is borrowed only for the call; the C side validates and
+    /// copies the values it needs. Returns 0 on success and nonzero on
+    /// failure.
     fn cheetah_ant_set_settings(
         ant: *mut std::os::raw::c_void,
         settings: *const AntFfiSettings,
     ) -> i32;
+    /// Load the prepared model rooted at `dst_dir` into the manager.
+    ///
+    /// `dst_dir` is a NUL-terminated path to a directory previously produced
+    /// by the initializer. The native code reads the manifest/index during
+    /// this call and may fail if the layout is incomplete.
     fn cheetah_ant_load_model(
         ant: *mut std::os::raw::c_void,
         dst_dir: *const std::os::raw::c_char,
     ) -> i32;
+    /// Query the current tier of one unit.
+    ///
+    /// `dst_dir` selects the loaded model and `unit_id` identifies a tensor
+    /// unit. On success the native tier enum (0 = VRAM, 1 = RAM, 2 = disk) is
+    /// written to `tier_out`; the pointer must be valid and writable. The
+    /// function returns 0 on success.
     fn cheetah_ant_unit_tier(
         ant: *const std::os::raw::c_void,
         dst_dir: *const std::os::raw::c_char,
         unit_id: *const std::os::raw::c_char,
         tier_out: *mut i32,
     ) -> i32;
+    /// Pin or unpin a unit so the eviction logic keeps it resident.
+    ///
+    /// `pin` is interpreted as a C boolean: nonzero pins, zero unpins. The
+    /// handle is `const` because pinning changes residency bookkeeping, not
+    /// the manager's identity.
     fn cheetah_ant_unit_pin(
         ant: *const std::os::raw::c_void,
         unit_id: *const std::os::raw::c_char,
         pin: i32,
     ) -> i32;
+    /// Evict a unit from its current tier according to the active policy.
+    ///
+    /// `dst_dir` identifies the model whose unit table should be consulted.
+    /// Returns 0 on success or a negative status when the unit cannot be
+    /// evicted (for example because it is pinned).
     fn cheetah_ant_evict_unit(
         ant: *const std::os::raw::c_void,
         dst_dir: *const std::os::raw::c_char,
         unit_id: *const std::os::raw::c_char,
     ) -> i32;
+    /// Page a unit into the requested tier.
+    ///
+    /// `tier` uses the native enum values (0 = VRAM, 1 = RAM, 2 = disk). The
+    /// manager may reject the request when the target tier lacks capacity.
     fn cheetah_ant_page_in(
         ant: *const std::os::raw::c_void,
         unit_id: *const std::os::raw::c_char,
         tier: i32,
     ) -> i32;
+    /// Report whether the model at `dst_dir` has been initialized.
+    ///
+    /// Returns 1 when initialized, 0 when not initialized or when the query
+    /// cannot be answered. This is a tri-state-free C convention, which the
+    /// Rust wrapper maps to `bool`.
     fn cheetah_ant_model_is_initialized(
         ant: *const std::os::raw::c_void,
         dst_dir: *const std::os::raw::c_char,
     ) -> i32;
+    /// Report whether the manager still requires an explicit initialization
+    /// step before it can manage a model. Nonzero means initialization is
+    /// required.
     fn cheetah_ant_requires_init(ant: *const std::os::raw::c_void) -> i32;
+    /// Emit the standard "model not initialized" warning.
+    ///
+    /// This is a diagnostic-only call: it returns nothing and is used to keep
+    /// the user-facing message consistent between Rust and C. Both strings
+    /// are read synchronously; no ownership is transferred.
     fn cheetah_ant_model_not_initialized_warning(
         model_id: *const std::os::raw::c_char,
         dst_dir: *const std::os::raw::c_char,
     );
 }
 
+/// Create a new Ant memory manager.
+///
+/// On success the returned pointer is an opaque native handle. The caller
+/// owns it and must pass it to [`ant_delete`] exactly once when done; Rust
+/// provides no automatic cleanup because the handle may outlive this module's
+/// call stack. A null return from C is translated into an `Err` so callers
+/// never receive a dangling null handle wrapped in `Ok`.
 pub fn ant_new() -> Result<*mut std::os::raw::c_void, String> {
+    // The C constructor reports failure only through a null pointer.
     let ptr = unsafe { cheetah_ant_new() };
     if ptr.is_null() {
         Err("Failed to create the Ant memory manager.".to_string())
@@ -113,14 +333,30 @@ pub fn ant_new() -> Result<*mut std::os::raw::c_void, String> {
     }
 }
 
+/// Destroy an Ant manager previously returned by [`ant_new`].
+///
+/// This is the sole owner-side cleanup point for the C object. The pointer
+/// must be live and non-null; the native destructor frees all manager state,
+/// after which the handle is dangling. Callers must ensure no other thread is
+/// still using the manager (the module's wrappers do not add lifetime
+/// tracking), and must not call this function twice for the same pointer.
 pub fn ant_delete(ant: *mut std::os::raw::c_void) {
+    // Ownership is transferred back to C here; nothing else remains to free.
     unsafe { cheetah_ant_delete(ant) };
 }
 
+/// Apply tuning and residency settings to an Ant manager.
+///
+/// The settings value is passed by reference and borrowed only for the
+/// duration of the call; any pointers inside it must reference live
+/// NUL-terminated strings. A nonzero native status is reported as a generic
+/// error because the C layer has already printed the specific diagnostic.
 pub fn ant_set_settings(
     ant: *mut std::os::raw::c_void,
     settings: &AntFfiSettings,
 ) -> Result<(), String> {
+    // `settings` is a Rust reference to a `#[repr(C)]` value, so its address
+    // is directly consumable by C without copying.
     let status = unsafe { cheetah_ant_set_settings(ant, settings) };
     if status != 0 {
         return Err("Cheetah Ant set settings failed.".to_string());
@@ -128,7 +364,15 @@ pub fn ant_set_settings(
     Ok(())
 }
 
+/// Load a prepared model into the Ant manager.
+///
+/// `dst_dir` must point at an initialized model directory (the same layout
+/// produced by [`init_model`]). The path is converted to a temporary
+/// `CString`; failure to represent the path as UTF-8 or the presence of an
+/// interior NUL is reported before entering C, so no partial native state is
+/// created on conversion errors.
 pub fn ant_load_model(ant: *mut std::os::raw::c_void, dst_dir: &Path) -> Result<(), String> {
+    // Keep `dst_dir_c` alive until the C call returns; C does not retain it.
     let dst_dir_c = path_to_cstring(dst_dir)?;
     let status = unsafe { cheetah_ant_load_model(ant, dst_dir_c.as_ptr()) };
     if status != 0 {
@@ -137,15 +381,25 @@ pub fn ant_load_model(ant: *mut std::os::raw::c_void, dst_dir: &Path) -> Result<
     Ok(())
 }
 
+/// Query the tier currently holding a unit.
+///
+/// Both the model directory and the unit identifier are converted to
+/// temporary C strings for the call. `tier_out` is initialized to zero before
+/// the call; the native function only writes it on success, and the initial
+/// value makes the failure path deterministic. On success the native tier enum
+/// is returned as `i32` (0 = VRAM, 1 = RAM, 2 = disk).
 pub fn ant_unit_tier(
     ant: *mut std::os::raw::c_void,
     dst_dir: &Path,
     unit_id: &str,
 ) -> Result<i32, String> {
     let dst_dir_c = path_to_cstring(dst_dir)?;
+    // Unit ids are UTF-8 strings with no interior NUL by construction; reject
+    // anything that cannot be passed to C verbatim.
     let unit_id_c =
         CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
     let mut tier_out: std::os::raw::c_int = 0;
+    // The out-pointer aliases the local integer, which outlives the call.
     let status = unsafe {
         cheetah_ant_unit_tier(ant, dst_dir_c.as_ptr(), unit_id_c.as_ptr(), &mut tier_out)
     };
@@ -155,6 +409,12 @@ pub fn ant_unit_tier(
     Ok(tier_out as i32)
 }
 
+/// Pin or unpin a unit in the eviction policy.
+///
+/// `pin` is a Rust `bool` marshalled as the C convention 1/0. The unit id is
+/// validated for interior NUL bytes before the call. Pinning is advisory to
+/// the eviction logic; the native layer decides whether the request can be
+/// honored and reports failure through its status code.
 pub fn ant_unit_pin(
     ant: *mut std::os::raw::c_void,
     unit_id: &str,
@@ -162,6 +422,7 @@ pub fn ant_unit_pin(
 ) -> Result<(), String> {
     let unit_id_c =
         CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
+    // Explicit 1/0 keeps the ABI independent of Rust's `bool` layout.
     let status =
         unsafe { cheetah_ant_unit_pin(ant, unit_id_c.as_ptr(), if pin { 1i32 } else { 0i32 }) };
     if status != 0 {
@@ -170,6 +431,12 @@ pub fn ant_unit_pin(
     Ok(())
 }
 
+/// Evict one unit from its current tier.
+///
+/// `dst_dir` identifies the loaded model's unit table. The native code may
+/// refuse to evict pinned or in-use units, which surfaces as an `Err`; the
+/// wrapper does not retry or change policy, so callers can decide how to
+/// react to pressure.
 pub fn ant_evict_unit(
     ant: *mut std::os::raw::c_void,
     dst_dir: &Path,
@@ -178,6 +445,7 @@ pub fn ant_evict_unit(
     let dst_dir_c = path_to_cstring(dst_dir)?;
     let unit_id_c =
         CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
+    // Both temporaries remain in scope across the call.
     let status = unsafe { cheetah_ant_evict_unit(ant, dst_dir_c.as_ptr(), unit_id_c.as_ptr()) };
     if status != 0 {
         return Err("Cheetah Ant unit evict failed.".to_string());
@@ -185,6 +453,12 @@ pub fn ant_evict_unit(
     Ok(())
 }
 
+/// Page a unit into the requested tier.
+///
+/// `tier` uses the native enum values (0 = VRAM, 1 = RAM, 2 = disk) and is
+/// passed through without translation. The manager may reject the request if
+/// the target tier has no capacity; that condition is reported as an error and
+/// leaves the unit in its previous tier.
 pub fn ant_page_in(ant: *mut std::os::raw::c_void, unit_id: &str, tier: i32) -> Result<(), String> {
     let unit_id_c =
         CString::new(unit_id).map_err(|_| "Unit id contains a NUL byte.".to_string())?;
@@ -195,24 +469,47 @@ pub fn ant_page_in(ant: *mut std::os::raw::c_void, unit_id: &str, tier: i32) -> 
     Ok(())
 }
 
+/// Return whether the model at `dst_dir` is initialized for Ant management.
+///
+/// This helper is intentionally infallible: a path that cannot be represented
+/// as a C string is mapped to a null pointer, and the native query then
+/// reports "not initialized". That matches the caller's intent (the model
+/// cannot be managed without a valid directory) and avoids introducing an
+/// error type into a yes/no probe.
 pub fn ant_model_is_initialized(ant: *mut std::os::raw::c_void, dst_dir: &Path) -> bool {
+    // Preserve the distinction between conversion failure and a real path:
+    // only a successful conversion contributes a non-null pointer.
     let dst_dir_c = path_to_cstring(dst_dir);
     let dst_ptr = dst_dir_c
         .as_ref()
         .map(|c| c.as_ptr())
         .unwrap_or(std::ptr::null());
     let status = unsafe { cheetah_ant_model_is_initialized(ant, dst_ptr) };
+    // The C API returns 1 for initialized; every other value is treated as
+    // "not initialized".
     status == 1
 }
 
+/// Return whether the manager still needs an explicit initialization step.
+///
+/// The native function returns a C boolean-style integer; any nonzero value
+/// means initialization is required.
 pub fn ant_requires_init(ant: *mut std::os::raw::c_void) -> bool {
     let status = unsafe { cheetah_ant_requires_init(ant) };
     status != 0
 }
 
+/// Emit the standard warning for an uninitialized model.
+///
+/// This is best-effort diagnostics: if either string cannot be converted to a
+/// C string, the warning is silently skipped rather than panicking or
+/// inventing a different message. Both temporary `CString`s live through the
+/// call, and the native function retains neither pointer.
 pub fn ant_model_not_initialized_warning(model_id: &str, dst_dir: &Path) {
     let model_id_c = CString::new(model_id).ok();
     let dst_dir_c = path_to_cstring(dst_dir).ok();
+    // Only call C when both arguments are representable; a partial warning
+    // would be misleading.
     if let (Some(model_id_c), Some(dst_dir_c)) = (model_id_c, dst_dir_c) {
         unsafe {
             cheetah_ant_model_not_initialized_warning(model_id_c.as_ptr(), dst_dir_c.as_ptr())
@@ -220,51 +517,84 @@ pub fn ant_model_not_initialized_warning(model_id: &str, dst_dir: &Path) {
     }
 }
 
+/// C progress callback used by [`init_model_with_metadata`].
+///
+/// The native initializer calls this synchronously with a NUL-terminated
+/// phase name, the current and total counts for that phase, and the opaque
+/// pointer supplied as `user_data`. Here that pointer always comes from a
+/// stack-local [`InitProgress`] that outlives the C call, so the cast back to
+/// `&mut InitProgress` is valid. The function is `extern "C"`: it must not
+/// unwind, and a panic would cross the FFI boundary and abort the process.
+/// Null phase or user data is ignored defensively because the callback
+/// contract assumes both are non-null but a malformed native build should not
+/// cause undefined behavior in Rust.
 extern "C" fn report_init_progress(
     phase: *const c_char,
     current: usize,
     total: usize,
     user_data: *mut c_void,
 ) {
+    // Both pointers are required by the protocol; bail out before forming
+    // references if either is missing.
     if phase.is_null() || user_data.is_null() {
         return;
     }
 
+    // The pointer is known to refer to the `InitProgress` owned by the
+    // initializer call that registered this callback. No other callback can
+    // run concurrently because `INIT_LOCK` serializes preparation.
     let progress = unsafe { &mut *user_data.cast::<InitProgress>() };
+    // Copy the phase name into an owned, lossily decoded string so the C
+    // buffer only needs to remain valid for this instant.
     let phase = unsafe { CStr::from_ptr(phase) }.to_string_lossy();
 
     match phase.as_ref() {
-        // 解析源 safetensors：按源文件数更新。
+        // Parsing source safetensors: update by source-file count.
         "parsing" => {
+            // The bar is taken out of the option so the mutable borrow ends
+            // before the field is assigned again.
             let mut parse_bar = progress.parse_bar.take();
             if parse_bar.is_none() {
+                // First update for this phase: create the bar with the total
+                // supplied by C.
                 parse_bar = Some(progress.start_bar(total, "Parsing safetensors files..."));
             }
             if let Some(bar) = parse_bar.as_mut() {
+                // `current` is a byte/object count, always within `total` as
+                // far as this UI is concerned; no extra clamping is needed.
                 bar.set_position(current as u64);
             }
             progress.parse_bar = parse_bar;
         }
-        // 写入预处理分片：结束解析条，再创建写入条。
+        // Writing prepared shards: finish the parse bar, then create the
+        // write bar.
         "writing" => {
+            // Close the previous phase first so the two bars do not appear
+            // active at the same time.
             let mut parse_bar = progress.parse_bar.take();
             if let Some(bar) = parse_bar.as_mut() {
                 bar.finish_with_message("Parsing complete");
             }
+            // The native callback emits this transition once; a fresh bar is
+            // created each time the phase is entered.
             let write_bar = progress.start_bar(total, "Writing prepared shards...");
             progress.write_bar = Some(write_bar);
             if let Some(bar) = progress.write_bar.as_mut() {
                 bar.set_position(current as u64);
             }
         }
-        // 权重准备：保持当前条的状态，避免 1/1 短暂闪烁。
+        // Preparing weights: keep the current bar state to avoid a brief 1/1
+        // flicker.
         "preparing" => {
+            // There is no separate bar for this short phase. If parsing never
+            // transitioned to writing, finish that bar with a phase label
+            // instead of leaving it running.
             let mut parse_bar = progress.parse_bar.take();
             if let Some(bar) = parse_bar.as_mut() {
                 bar.finish_with_message("Preparing weights...");
             }
         }
-        // 完成：结束写入条并给出最终状态。
+        // Complete: finish the write bar and show the final status.
         "complete" => {
             let mut write_bar = progress.write_bar.take();
             if let Some(bar) = write_bar.as_mut() {
@@ -272,6 +602,8 @@ extern "C" fn report_init_progress(
             }
             progress.write_bar = write_bar;
 
+            // Fallback for very small runs that never entered the writing
+            // phase: finish whichever parse bar may still be open.
             if progress.write_bar.is_none() {
                 let mut parse_bar = progress.parse_bar.take();
                 if let Some(bar) = parse_bar.as_mut() {
@@ -280,41 +612,91 @@ extern "C" fn report_init_progress(
                 progress.parse_bar = parse_bar;
             }
         }
+        // Unknown phase names are ignored so a newer C initializer can add
+        // phases without breaking this UI.
         _ => {}
     }
 }
 
+/// Convert a filesystem path into a NUL-terminated C string.
+///
+/// C APIs in this module expect UTF-8 paths with no interior NUL. Rust paths
+/// are not guaranteed to be UTF-8 on Unix, so non-UTF-8 paths are rejected
+/// with a message that includes the lossy display form (useful for diagnosis,
+/// although that form is not round-trippable). The returned `CString` owns its
+/// allocation and must be kept alive by the caller for as long as C may read
+/// it; all wrappers here do so only for the duration of a single call.
 fn path_to_cstring(path: &Path) -> Result<CString, String> {
     let path = path
         .to_str()
         .ok_or_else(|| format!("Path is not valid UTF-8: {}", path.display()))?;
+    // `CString::new` rejects embedded NULs, which would otherwise truncate the
+    // path silently inside C.
     CString::new(path).map_err(|_| "Path contains an interior NUL byte.".to_string())
 }
 
+/// Chat metadata that the Rust registry can contribute after native
+/// preparation.
+///
+/// The native initializer derives most of the manifest, but chat templates and
+/// stop markers are model-family knowledge owned by the Rust registry. These
+/// fields are `'static` so they can be stored in registry tables and passed to
+/// [`init_model_with_metadata`] without lifetime plumbing. They are copied into
+/// the manifest, so the C layer and the resulting file never borrow them.
 pub struct ModelMetadata {
+    /// Jinja-style chat template to write into `chat_template` in the
+    /// manifest, replacing any value produced natively.
     pub chat_template: &'static str,
+    /// Additional stop markers to merge into the manifest's `stop_markers`
+    /// array. Existing markers are preserved and duplicates are skipped.
     pub stop_markers: &'static [&'static str],
 }
 
 /// Run the C static model-preparation stage and write its result to `dst_dir`.
+///
+/// This is the metadata-free entry point: it forwards to
+/// [`init_model_with_metadata`] with `None`, so the native manifest is left
+/// untouched after preparation. Progress is rendered through the module's
+/// `indicatif` UI. Returns a short error on native failure; the detailed
+/// diagnostic is printed by C to stderr.
 pub fn init_model(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     init_model_with_metadata(src_dir, dst_dir, None)
 }
 
-/// Run native preparation, then override chat metadata when the Rust registry recognizes the model.
+/// Run native preparation, then override chat metadata when the Rust registry
+/// recognizes the model.
+///
+/// The two paths are converted to C strings before the global initializer
+/// lock is acquired, so path errors fail fast. The lock is held for the whole
+/// native call and the subsequent manifest patch: this keeps the progress
+/// callback's stack-local state private and prevents a second initializer from
+/// rewriting the same destination while the manifest is being updated.
+///
+/// On success, if `metadata` is present, `cheetah_manifest.json` is updated in
+/// place (via a temporary file and atomic rename). Progress bars are always
+/// finalized or abandoned before returning so the terminal is left in a clean
+/// state on every path, including manifest-update failures.
 pub fn init_model_with_metadata(
     src_dir: &Path,
     dst_dir: &Path,
     metadata: Option<ModelMetadata>,
 ) -> Result<(), String> {
+    // Keep an owned copy of the destination path: the `CString` conversion
+    // below consumes the borrowed path, but the manifest update needs the
+    // original directory afterwards.
     let dst_dir_path = dst_dir.to_path_buf();
     let src_dir = path_to_cstring(src_dir)?;
     let dst_dir = path_to_cstring(dst_dir)?;
+    // Serialize the entire native run plus manifest patch. A poisoned lock
+    // means a previous initializer panicked while holding it, which may have
+    // left the native side inconsistent; refuse to continue.
     let _guard = INIT_LOCK
         .lock()
         .map_err(|_| "Native model initializer lock is poisoned.".to_string())?;
 
     let mut progress = InitProgress::new();
+    // The callback receives a raw pointer to `progress`; `_guard` and the
+    // local binding keep both the lock and the pointee alive across the call.
     let result = unsafe {
         cheetah_init_model_with_progress(
             src_dir.as_ptr(),
@@ -333,6 +715,9 @@ pub fn init_model_with_metadata(
         }
         progress.write_bar = write_bar;
 
+        // Metadata patching is strictly post-processing: the native model is
+        // already valid, so a failure here is reported without retrying or
+        // deleting the prepared output.
         let result = if let Some(metadata) = metadata {
             update_manifest_metadata(&dst_dir_path, metadata)
         } else {
@@ -340,6 +725,9 @@ pub fn init_model_with_metadata(
         };
 
         if result.is_ok() {
+            // Defensive final sweep: `parsing` and `writing` may both have
+            // bars in unusual phase orderings. Only unfinished bars are
+            // touched so completed messages are not overwritten.
             for bar in [&mut progress.parse_bar, &mut progress.write_bar] {
                 if let Some(b) = bar
                     && !b.is_finished()
@@ -348,16 +736,26 @@ pub fn init_model_with_metadata(
                 }
             }
         } else {
+            // Manifest failure is a failure of the overall operation from the
+            // caller's perspective, so mark any remaining bars accordingly.
             abandon_bars(&mut progress);
         }
 
         result
     } else {
+        // The C diagnostic has already been printed; only the progress UI
+        // needs cleanup here.
         abandon_bars(&mut progress);
         Err("Cheetah model preparation failed; see the native diagnostic above.".into())
     }
 }
 
+/// Mark every outstanding preparation bar as failed.
+///
+/// Used on all error paths. `abandon_with_message` leaves the bar visible with
+/// a failure label rather than removing it, which preserves the user's record
+/// of how far preparation progressed. Bars that were already finished are
+/// still abandoned; `flatten` skips `None` slots safely.
 fn abandon_bars(progress: &mut InitProgress) {
     for b in [&mut progress.parse_bar, &mut progress.write_bar]
         .into_iter()
@@ -367,15 +765,37 @@ fn abandon_bars(progress: &mut InitProgress) {
     }
 }
 
+/// Merge registry-provided chat metadata into a prepared model manifest.
+///
+/// The native initializer writes `cheetah_manifest.json` with model facts it
+/// can discover from the weights. This function loads that JSON, preserves all
+/// unrelated fields, appends any new stop markers without duplicating existing
+/// ones, and replaces `chat_template` with the registry's authoritative value.
+/// The manifest is then written to a sibling temporary file and renamed into
+/// place. Keeping the temporary file in the same directory ensures the final
+/// rename stays on one filesystem, which is what makes the replacement atomic
+/// and prevents readers from observing a partially written manifest.
+///
+/// Any I/O or JSON error is returned with enough path/context for diagnosis.
+/// On rename failure the temporary file is removed on a best-effort basis so
+/// repeated attempts do not accumulate stale files.
 fn update_manifest_metadata(dst_dir: &Path, metadata: ModelMetadata) -> Result<(), String> {
     let manifest_path = dst_dir.join("cheetah_manifest.json");
+    // Reading the whole manifest is safe: preparation just produced it and the
+    // initializer lock prevents concurrent updates through this module.
     let bytes = fs::read(&manifest_path)
         .map_err(|error| format!("Failed to read {}: {error}", manifest_path.display()))?;
     let mut manifest: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Invalid Cheetah manifest: {error}"))?;
+    // A JSON object is required for field insertion; arrays or scalars are
+    // structurally invalid manifests.
     let object = manifest
         .as_object_mut()
         .ok_or_else(|| "Cheetah manifest root must be a JSON object.".to_string())?;
+    // Start from the markers already in the manifest. Missing or non-array
+    // fields simply contribute no initial entries; non-string elements are
+    // ignored rather than causing a hard failure, which keeps the updater
+    // tolerant of forward-compatible manifest additions.
     let mut stop_markers = object
         .get("stop_markers")
         .and_then(serde_json::Value::as_array)
@@ -385,10 +805,14 @@ fn update_manifest_metadata(dst_dir: &Path, metadata: ModelMetadata) -> Result<(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     for marker in metadata.stop_markers {
+        // Preserve native/discovered markers and append only new ones. The
+        // order is native markers first, then registry order.
         if !stop_markers.iter().any(|existing| existing == marker) {
             stop_markers.push((*marker).to_owned());
         }
     }
+    // Insertion replaces any previous values for these two keys while leaving
+    // every other manifest field untouched.
     object.insert(
         "chat_template".into(),
         serde_json::Value::String(metadata.chat_template.into()),
@@ -399,12 +823,16 @@ fn update_manifest_metadata(dst_dir: &Path, metadata: ModelMetadata) -> Result<(
             .map_err(|error| format!("Failed to encode model stop markers: {error}"))?,
     );
 
+    // The process id keeps concurrent processes from colliding on the
+    // temporary name; the sibling directory keeps the final rename atomic.
     let temporary_path = manifest_path.with_extension(format!("json.tmp.{}", std::process::id()));
     let updated = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("Failed to encode Cheetah manifest: {error}"))?;
     fs::write(&temporary_path, updated)
         .map_err(|error| format!("Failed to write {}: {error}", temporary_path.display()))?;
     if let Err(error) = fs::rename(&temporary_path, &manifest_path) {
+        // Best-effort cleanup: the original manifest is still intact, and the
+        // caller only needs the rename error.
         let _ = fs::remove_file(&temporary_path);
         return Err(format!(
             "Failed to replace {}: {error}",

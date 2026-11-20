@@ -2,6 +2,14 @@
 //! stored IEEE half weights directly — the streaming matmul runs the 16-bit
 //! pipeline in fp16 decode mode and the CPU gemv decodes half per row. No
 //! conversion into another storage width.
+//!
+//! Pipeline sharing: the C substrate keeps ONE 16-bit matmul pipeline
+//! (`g_matmul_bf16_pipeline`); a push constant selects the decode rule
+//! (bf16 bit-shift vs `unpackHalf2x16`). That is why this registration
+//! reports `CHEETAH_MATMUL_BF16_SPV` as its shader override and format
+//! code 2 (the shared_ops encoding; bf16 uses 3). On the native side the
+//! gemv decodes IEEE half per row into f32 scratch and accumulates in f32 —
+//! the standard mixed-precision dot, not a storage conversion.
 
 #[cfg(feature = "vulkan")]
 use super::bytes::u16_view;

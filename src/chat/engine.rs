@@ -1,3 +1,80 @@
+//! Generation engine for Cheetah's chat and CLI inference path.
+//!
+//! This module is the orchestration layer between the command-line entry
+//! points and the model backends. It owns the logic that is common to every
+//! architecture: resolving model files, loading the configuration and
+//! tokenizer, selecting a backend, rendering chat prompts, running the
+//! prefill and decode loop, sampling tokens, applying stop conditions, and
+//! streaming decoded text through a `TextSink`.
+//!
+//! # Model loading
+//!
+//! `Engine::load` resolves the model directory (or a single Safetensors
+//! shard), reads the Hugging Face-style `config.json`, and falls back to the
+//! snapshot stored in `cheetah_manifest.json` when the config was not copied
+//! into a prepared directory. Weight shards are discovered from the manifest,
+//! from a Safetensors index, or from a lone `model.safetensors`. Actual
+//! backend construction is delegated to `chat::models`: the native,
+//! mmap-backed CPU backend is preferred when it is registered and enabled,
+//! while non-CPU `CHEETAH_DEVICE` values such as Vulkan route through the
+//! accelerator loader. An Ant residency plan is computed during loading and
+//! can narrow the set of weight files that the loader maps.
+//!
+//! # Tokenization and prompt rendering
+//!
+//! The tokenizer is a Hugging Face `tokenizers` instance loaded from
+//! `tokenizer.json`. Chat messages are rendered into a model-specific prompt
+//! by a function selected from the architecture family. For Llama 3-style
+//! architectures the header-based renderer is used when the vocabulary and
+//! manifest stop markers indicate that the special header tokens exist;
+//! otherwise the classic instruction renderer is used.
+//!
+//! # Prefill and decode
+//!
+//! `Engine::generate_inner` performs one prefill call over the full prompt,
+//! then runs an autoregressive decode loop that feeds a single token back into
+//! the model together with its absolute position. The backend owns the KV
+//! cache between calls; the engine clears that cache before prefill and after
+//! generation. Each step samples from the returned logits, checks the
+//! end-of-sequence token and textual stop markers, and emits only the newly
+//! decoded text so streaming callers observe incremental deltas.
+//!
+//! # Sampling
+//!
+//! Sampling supports greedy decoding (temperature zero), temperature scaling,
+//! a repetition penalty over recent history, top-k truncation, and nucleus
+//! (top-p) filtering. A seeded `StdRng` makes runs reproducible; when the
+//! caller does not supply a seed, a wall-clock seed is used instead.
+//!
+//! # Context handling
+//!
+//! `Engine::prepare` renders and tokenizes the conversation, then drops the
+//! oldest turns until the prompt plus the reserved generation budget fits the
+//! effective context limit. That limit is the smallest of the configured
+//! context size, the model's `max_position_embeddings`, and the architecture
+//! family's cap. The interactive loop keeps a `ContextArchive` of completed
+//! turns so conversations can be saved and reloaded.
+//!
+//! # Streaming callbacks
+//!
+//! Callers provide a `TextSink`. The engine pushes incremental decoded text
+//! into it, polls it for cancellation between tokens, and calls `finish` once
+//! at the end. The CLI uses `StdoutSink`; other front ends can implement the
+//! trait to forward text to an HTTP stream, a logger, or a user interface.
+//!
+//! # Ant tiering
+//!
+//! When Ant is enabled, the engine tracks which atomic weight units are
+//! resident in VRAM or RAM, promotes queued RAM units into VRAM, pages evicted
+//! units back in before a request, and enforces the configured pool budget.
+//! On the native backend these transitions also fault or release the real
+//! mmap pages; on host-resident or accelerator backends only the bookkeeping
+//! is updated.
+
+// Engine orchestration depends on the chat model registry (backend selection
+// and prompt templates), Ant's residency manager, terminal color and progress
+// helpers, the context archive used by the interactive loop, and the shared
+// chat options.
 use super::models::{Device, ModelRuntime};
 use crate::ant::{Ant, AntLayerResidency, AntSettings, AntUnit, ant_swap_fit};
 use crate::color::{self, Color};
@@ -18,15 +95,33 @@ use tokenizers::Tokenizer;
 
 /// Generic fallback context length when no architecture family declares one
 /// (unregistered architectures / missing family metadata).
+///
+/// This value is only used while synthesizing a configuration from a manifest
+/// snapshot. Real loads prefer the model's `max_position_embeddings` and then
+/// clamp it against the family cap and the user's `--ctx-size`.
 const DEFAULT_MAX_POSITION_EMBEDDINGS: usize = 4096;
 
+/// One turn of a chat conversation, independent of the wire format used by
+/// the CLI, HTTP server, or tool-calling front end.
+///
+/// The role is a plain string ("system", "user", "assistant", ...) because
+/// prompt templates are architecture-specific and may need arbitrary roles.
+/// Message content is already flattened to text by the time a renderer sees
+/// it; tool-only payloads are converted before reaching this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
+    /// Conversation role, such as "system", "user", or "assistant".
     pub role: String,
+    /// Textual message body. Multi-part content is concatenated by the caller.
     pub content: String,
 }
 
 impl ChatMessage {
+    /// Builds a message from any string-like role and content.
+    ///
+    /// Taking `impl Into<String>` keeps call sites ergonomic for both string
+    /// literals and owned strings without requiring an extra allocation when
+    /// an owned `String` is already available.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
@@ -35,6 +130,12 @@ impl ChatMessage {
     }
 }
 
+/// Formats the current wall-clock time as a bracketed seconds-since-epoch
+/// timestamp for CLI log lines.
+///
+/// The fractional part has millisecond precision. If the system clock is set
+/// before the Unix epoch, the duration conversion fails and a stable zero is
+/// used instead, because logging must never fail the process.
 fn log_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -43,6 +144,12 @@ fn log_timestamp() -> String {
     format!("[{:.3}]", now)
 }
 
+/// Creates the progress spinner shown while a model is loading.
+///
+/// When stdout is not a terminal (for example in tests or when piping output)
+/// the draw target is hidden so escape sequences do not pollute redirected
+/// output. The steady tick keeps the spinner animated during long weight
+/// loads without requiring the caller to drive it manually.
 fn create_spinner(message: &'static str) -> ProgressBar {
     let draw_target = if std::io::stdout().is_terminal() {
         ProgressDrawTarget::stdout()
@@ -59,12 +166,21 @@ fn create_spinner(message: &'static str) -> ProgressBar {
     bar
 }
 
+/// Loads an engine while showing CLI progress and a post-load summary.
+///
+/// This is the CLI-facing wrapper around `Engine::load`. It deliberately keeps
+/// user-interface concerns (timestamps, colored output, spinner lifecycle) out
+/// of the loading code so tests and other callers can load an engine without
+/// touching the terminal. On failure the spinner is abandoned rather than
+/// finished, and the original error string is returned unchanged.
 pub(crate) fn load_engine_with_progress(
     path: &Path,
     threads: Option<usize>,
     ctx_size: usize,
     ant: Option<&AntSettings>,
 ) -> Result<Engine, String> {
+    // Announce the path before the long blocking load so the user sees which
+    // model is being opened even if loading later fails.
     println!(
         "{} {}",
         log_timestamp(),
@@ -75,17 +191,26 @@ pub(crate) fn load_engine_with_progress(
     let result = Engine::load(path, threads, ctx_size, ant);
     match result {
         Ok(engine) => {
+            // Replace the animated spinner with a one-line success message;
+            // the detailed device/backend summary follows immediately.
             spinner.finish_with_message(format!("loaded: {}", engine.model_id()));
             print_model_info(&engine);
             Ok(engine)
         }
         Err(error) => {
+            // Keep the terminal readable: mark the spinner as failed and let
+            // the caller decide how to report the returned error text.
             spinner.abandon_with_message("model load failed");
             Err(error)
         }
     }
 }
 
+/// Prints the human-readable load summary: architecture, backends, device,
+/// and (when Ant is active) residency and budget information.
+///
+/// This function is purely diagnostic; failures to lock runtime state are
+/// ignored so that printing cannot turn a successful load into an error.
 fn print_model_info(engine: &Engine) {
     println!();
     println!(
@@ -93,20 +218,27 @@ fn print_model_info(engine: &Engine) {
         log_timestamp(),
         color::stdout(&format!("model loaded: {}", engine.model_id()), Color::Cyan,),
     );
+    // Architecture is optional for unregistered models, in which case only
+    // the device line is printed below.
     if let Some(architecture) = engine.model_architecture() {
         println!("  architecture: {architecture}");
+        // Backend names come from the registry rather than from a hard-coded
+        // list, so newly registered native/Vulkan backends show up here.
         println!(
             "  backends:     {}",
             super::models::registered_backend_names(architecture).join(", ")
         );
     }
     println!("  device:       {}", engine.device_name());
+    // Ant-specific lines only make sense when a residency plan was built.
     if !engine.ant_plan.is_empty() {
         println!("  ant plan:     {} resident unit(s)", engine.ant_plan.len());
         println!(
             "  ant resident: {} bytes within budget {}",
             engine.ant_resident_bytes, engine.ant_budget_bytes
         );
+        // Layer residency is a coarser, per-layer view derived from the
+        // atomic-unit plan; count each state for a compact summary.
         if !engine.ant_layer_summary.is_empty() {
             let state_of = |wanted: &str| {
                 engine
@@ -123,6 +255,9 @@ fn print_model_info(engine: &Engine) {
                 state_of("full_disk")
             );
         }
+        // try_lock keeps the summary best-effort: at this point no generation
+        // is running, but avoiding a blocking lock guarantees diagnostics
+        // can never hang the load path.
         if let Ok(state) = engine.ant_runtime.try_lock() {
             println!(
                 "  ant swap:     {} queued for VRAM promotion, {} evicted at load",
@@ -130,6 +265,8 @@ fn print_model_info(engine: &Engine) {
                 state.evicted.len()
             );
         }
+        // Surface budget overruns even though they are usually resolved by a
+        // later prefetch/promotion pass; this warns operators early.
         if !engine.ant_within_budget() {
             println!(
                 "  ant warning:  resident bytes {} exceed vram budget {}",
@@ -139,29 +276,57 @@ fn print_model_info(engine: &Engine) {
     }
 }
 
+/// Receives streamed generation output and provides cancellation feedback.
+///
+/// The engine is deliberately sink-agnostic: the CLI writes to stdout, while
+/// server front ends may forward chunks over HTTP/SSE or collect them into a
+/// buffer. Implementations must be cheap to call once per token because the
+/// generation loop is latency-sensitive.
 pub trait TextSink {
+    /// Receives the next incremental slice of decoded text.
+    ///
+    /// The slice only contains characters that have not been emitted before.
+    /// Returning an error aborts generation and propagates the message to the
+    /// caller; implementors should reserve errors for real I/O failures.
     fn push(&mut self, text: &str) -> Result<(), String>;
 
+    /// Called once after the loop ends, whether by EOS, stop marker, length,
+    /// or cancellation. The default is a no-op.
     fn finish(&mut self) -> Result<(), String> {
         Ok(())
     }
 
+    /// Whether the engine should accumulate the full answer in
+    /// `Generation::text`.
+    ///
+    /// Streaming callers that discard the final text can return false to
+    /// avoid growing a large `String`; the default keeps the text because
+    /// most callers need it for history or non-streaming responses.
     fn capture_text(&self) -> bool {
         true
     }
 
+    /// Polled before each decode step to request cooperative cancellation.
+    ///
+    /// Returning true ends generation with `FinishReason::Stop` after the
+    /// previously emitted text has been delivered. The default never
+    /// interrupts.
     fn interrupted(&mut self) -> bool {
         false
     }
 }
 
+/// Why the decode loop stopped producing tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
+    /// A natural end: an EOS token, a textual stop marker, or cancellation.
     Stop,
+    /// The reserved generation budget (`--max-tokens`) was exhausted.
     Length,
 }
 
 impl FinishReason {
+    /// Returns the API-facing string used in responses and logs.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Stop => "stop",
@@ -170,16 +335,26 @@ impl FinishReason {
     }
 }
 
+/// Result of one generation request, including text and timing metadata.
 #[derive(Debug, Clone)]
 pub struct Generation {
+    /// Full generated text. Empty when the sink disabled text capture.
     pub text: String,
+    /// Number of prompt tokens fed through prefill.
     pub prompt_tokens: usize,
+    /// Number of tokens produced by the decode loop.
     pub generated_tokens: usize,
+    /// Time spent in the decode loop, excluding prefill and cleanup.
     pub decode_duration: Duration,
+    /// Why the loop terminated.
     pub finish_reason: FinishReason,
 }
 
 impl Generation {
+    /// Decode throughput in tokens per second.
+    ///
+    /// Returns `None` for empty generations or a zero measured duration, so
+    /// callers can distinguish "no measurable speed" from a real zero rate.
     pub fn tokens_per_second(&self) -> Option<f64> {
         let seconds = self.decode_duration.as_secs_f64();
         if self.generated_tokens == 0 || seconds == 0.0 {
@@ -189,67 +364,137 @@ impl Generation {
     }
 }
 
+/// Tool-calling policy requested by an OpenAI-compatible API call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolChoice {
+    /// Let the model decide whether a tool call is needed.
     Auto,
+    /// Forbid tool calls and answer directly.
     None,
+    /// Require the model to call one of the provided tools.
     Required,
 }
 
+/// Extra per-request parameters attached to an already-tokenized prompt.
+///
+/// The struct is intentionally JSON-friendly so HTTP handlers can pass
+/// template metadata through without depending on engine internals.
 #[derive(Debug, Clone, Default)]
 pub struct ChatParams {
+    /// JSON array of additional stop markers contributed by the chat template.
     pub additional_stops_json: String,
 }
 
 impl ChatParams {
+    /// Validates and returns the model's raw text output for non-streaming
+    /// tool-call responses.
+    ///
+    /// Tool-call parsing is currently a pass-through: the `_partial` flag is
+    /// accepted for API compatibility but does not change behavior.
     pub fn parse(&self, text: &str, _partial: bool) -> Result<String, String> {
         Ok(text.to_owned())
     }
 }
 
+/// Owns the dynamically dispatched backend model and records the device it
+/// was loaded on.
+///
+/// The device field is kept for diagnostics and future routing decisions even
+/// when the backend itself reports its device name; the attribute suppresses
+/// dead-code warnings without affecting layout or behavior.
 struct LoadedModel {
+    /// Backend model implementation shared behind the engine mutex.
     model: Box<dyn ModelRuntime>,
+    /// Device selected during backend construction.
     #[allow(dead_code)]
     device: Device,
 }
 
+/// Opaque per-request inference session placeholder.
+///
+/// KV-cache state currently lives inside the backend and is cleared by the
+/// engine around each generation, so the context carries no fields yet. The
+/// type exists to keep the public API stable if per-request state is added.
 pub struct InferenceContext;
 
+/// Loaded model plus everything needed to turn chat messages into tokens and
+/// tokens back into streamed text.
+///
+/// The engine is shared (`&self`) by request handlers. The backend model is
+/// protected by a mutex because it may contain a mutable KV cache; tokenization
+/// and prompt rendering are immutable and can run concurrently with unrelated
+/// work. Ant bookkeeping uses a second mutex so residency checks do not
+/// contend with the model lock while a request is being prepared.
 pub struct Engine {
+    /// Backend model and its selected device, guarded because decoding
+    /// mutates the KV cache.
     model: Mutex<LoadedModel>,
+    /// Hugging Face tokenizer used for both prompt encoding and output
+    /// decoding.
     tokenizer: Tokenizer,
+    /// Human-readable model identifier (usually the directory or file name).
     model_id: String,
+    /// Architecture name used for backend and template lookup.
     architecture: Option<String>,
+    /// Function that renders `ChatMessage`s into the model's prompt format.
     prompt_renderer: super::models::PromptRenderer,
+    /// Effective context cap: model limit, family cap, and `--ctx-size`
+    /// combined.
     max_position_embeddings: usize,
+    /// Token ids that terminate generation, including stop-marker tokens
+    /// resolved through the vocabulary.
     eos_token_ids: HashSet<u32>,
+    /// Textual markers stripped from output when encountered.
     stop_markers: Vec<String>,
+    /// Planned residency tier ("vram", "ram", or "disk") per atomic unit.
     ant_plan: std::collections::BTreeMap<String, String>,
+    /// Bytes counted as resident immediately after loading.
     ant_resident_bytes: u64,
+    /// VRAM pool budget used by Ant decisions.
     ant_budget_bytes: u64,
+    /// Original Ant configuration, retained so runtime swaps can re-create a
+    /// manager with the same settings.
     ant_settings: Option<AntSettings>,
+    /// Atomic weight units discovered for this model.
     ant_units: Vec<AntUnit>,
+    /// Model directory, needed by Ant for paging files in and out.
     ant_model_dir: Option<PathBuf>,
+    /// Whether the selected device is an accelerator, which gates budget
+    /// enforcement behavior.
     ant_device_accelerator: bool,
+    /// Per-layer residency summary used for diagnostics.
     ant_layer_summary: Vec<AntLayerResidency>,
+    /// Static per-unit metadata resolved at load time.
     ant_unit_index: std::collections::BTreeMap<String, AntUnitRuntime>,
+    /// Mutable cross-request Ant bookkeeping.
     ant_runtime: Mutex<AntRuntimeState>,
 }
 
+/// Deserialized subset of a Hugging Face `config.json` needed by the engine.
 #[derive(Debug, Deserialize)]
 struct ModelConfig {
+    /// Model family identifier, used as the architecture fallback.
     model_type: String,
+    /// Explicit architecture class names, when present.
     architectures: Option<Vec<String>>,
+    /// EOS token id(s), which may be a single number or an array.
     #[serde(default)]
     eos_token_id: Option<serde_json::Value>,
+    /// Maximum trained context length; defaults when the field is absent.
     #[serde(default = "default_context_size")]
     max_position_embeddings: usize,
 }
 
+/// Serde default for models whose config omits `max_position_embeddings`.
 fn default_context_size() -> usize {
     4096
 }
 
+/// Ranks a residency tier for eviction ordering.
+///
+/// Lower values are more valuable (VRAM before RAM); unknown tiers sort last
+/// so they are evicted first. The numeric order is inverted by callers that
+/// sort descending when choosing victims.
 fn ant_tier_priority(tier: &str) -> u64 {
     match tier {
         "vram" => 0,
@@ -258,14 +503,26 @@ fn ant_tier_priority(tier: &str) -> u64 {
     }
 }
 
+/// Selects the weight shards that the loader should map for the current Ant
+/// plan.
+///
+/// A shard is kept when at least one atomic unit sourced from it is neither
+/// disk-tier nor evicted at load time. Several units normally share a shard,
+/// so the result is a de-duplicated set of shard paths derived from the
+/// original ordered weight list. Disk-only and evicted units are excluded so
+/// the backend does not fault their pages in during loading.
 fn ant_resident_weight_paths(
     weight_paths: &[PathBuf],
     units: &[AntUnit],
     plan: &std::collections::BTreeMap<String, String>,
     evicted: &[String],
 ) -> Vec<PathBuf> {
+    // Collect source file names (not full paths) because the manifest stores
+    // shard-relative names while the loader receives parent-joined paths.
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     for unit in units {
+        // Units missing from the plan are treated as VRAM residents, matching
+        // the loader's default assumption elsewhere.
         let tier = plan
             .get(&unit.unit_id)
             .map(|tier| tier.as_str())
@@ -275,6 +532,9 @@ fn ant_resident_weight_paths(
         }
         keep.insert(unit.source_file.clone());
     }
+    // Preserve the caller's shard order; only the membership test is
+    // name-based. `file_name` guards against a manifest entry that embeds a
+    // directory, and non-UTF-8 names simply cannot match a manifest entry.
     let mut paths = weight_paths.to_vec();
     paths.retain(|path| {
         path.file_name()
@@ -284,6 +544,16 @@ fn ant_resident_weight_paths(
     paths
 }
 
+/// Applies the VRAM budget to the initial residency plan and evicts units that
+/// do not fit.
+///
+/// Only accelerator devices enforce the budget here: on CPU the "VRAM" pool
+/// is conceptual and real memory pressure is handled by the OS. Eviction
+/// walks the lowest-value tiers first (RAM before VRAM, and higher layer ids
+/// before lower ones within a tier). Evictions are best-effort; a failed
+/// `evict_unit` leaves the unit resident and keeps counting against the
+/// budget. Returns the remaining resident byte count and the successfully
+/// evicted unit ids so callers can update their bookkeeping.
 fn ant_apply_budget(
     manager: &Ant,
     dst_dir: &Path,
@@ -294,6 +564,8 @@ fn ant_apply_budget(
 ) -> (u64, Vec<String>) {
     let mut resident_bytes = 0u64;
     let mut evicted: Vec<String> = Vec::new();
+    // Tuple layout: (tier priority, byte size, unit id). Priority is kept so
+    // the sort can order victims without looking the unit up again.
     let mut resident: Vec<(u64, u64, String)> = Vec::new();
     for unit in units {
         let tier = plan
@@ -301,6 +573,8 @@ fn ant_apply_budget(
             .map(|tier| tier.as_str())
             .unwrap_or("vram");
         if tier != "disk" {
+            // Saturating arithmetic avoids overflow on adversarial manifests
+            // with absurdly large declared sizes.
             resident_bytes = resident_bytes.saturating_add(unit.byte_size());
             resident.push((
                 ant_tier_priority(tier),
@@ -309,7 +583,9 @@ fn ant_apply_budget(
             ));
         }
     }
+    // A zero budget means "unlimited" and skips the eviction pass entirely.
     if device_is_accelerator && budget_bytes > 0 && resident_bytes > budget_bytes {
+        // Descending priority evicts RAM-tier units before VRAM-tier ones.
         resident.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, bytes, unit_id) in resident {
             if resident_bytes <= budget_bytes {
@@ -325,11 +601,20 @@ fn ant_apply_budget(
 }
 
 /// Runtime residency facts for one atomic unit, resolved once at load time.
+///
+/// Keeping these values in a map indexed by unit id avoids re-parsing the
+/// manifest or re-querying metadata during the hot generation path, while
+/// still allowing swaps to update byte accounting cheaply.
 #[derive(Debug, Clone)]
 struct AntUnitRuntime {
+    /// Serialized size of the unit in bytes.
     bytes: u64,
+    /// Transformer layer the unit belongs to; -1 typically marks embeddings
+    /// or other non-layer tensors.
     layer_id: i32,
+    /// Planned tier at load time ("vram", "ram", or "disk").
     tier: String,
+    /// Pinned units are exempt from eviction (for example the output head).
     pinned: bool,
 }
 
@@ -337,10 +622,17 @@ struct AntUnitRuntime {
 /// units evicted at runtime, and the in-memory (RAM-tier) units that are next
 /// in line for promotion into VRAM, so every swap re-checks the budget before
 /// it executes and only swaps in as memory becomes available.
+///
+/// The state is protected by `Engine::ant_runtime` rather than living inside
+/// the model lock, which lets a request plan its residency changes before it
+/// needs exclusive access to the backend.
 #[derive(Default)]
 struct AntRuntimeState {
+    /// Bytes currently accounted to the VRAM pool.
     vram_used_bytes: u64,
+    /// Bytes currently accounted to the RAM pool.
     ram_used_bytes: u64,
+    /// Units that were evicted and are therefore not resident.
     evicted: HashSet<String>,
     /// Disk-tier units paged in at runtime; they are resident although the
     /// plan places them on disk.
@@ -348,30 +640,56 @@ struct AntRuntimeState {
     /// RAM-tier resident units, in layer order: the in-memory portion next in
     /// line for promotion / swapping into VRAM.
     promotion_queue: Vec<String>,
+    /// Number of successful swap-ins since load, for diagnostics.
     swaps_in: u64,
+    /// Number of successful swap-outs since load, for diagnostics.
     swaps_out: u64,
+    /// Number of swap attempts rejected because the budget did not fit.
     swap_skips: u64,
 }
 
+/// Construction, residency management, prompt preparation, and generation for
+/// a loaded model.
+///
+/// Methods that only inspect immutable metadata take `&self`; decoding takes
+/// `&self` as well and relies on the model mutex for interior mutability so a
+/// single `Engine` can be shared across threads or requests.
 impl Engine {
+    /// Loads a model directory or Safetensors file and prepares it for chat.
+    ///
+    /// The method performs the following phases in order: validate thread and
+    /// context arguments, read configuration (falling back to the manifest
+    /// snapshot), load the tokenizer, resolve weight shards, choose a prompt
+    /// renderer, build the Ant residency plan, select and construct the
+    /// backend, then derive EOS ids, stop markers, and the effective context
+    /// limit. All failures are reported as human-readable strings because
+    /// this API is consumed directly by CLI and server error paths.
     pub fn load(
         path: &Path,
         threads: Option<usize>,
         ctx_size: usize,
         ant: Option<&AntSettings>,
     ) -> Result<Self, String> {
+        // A zero context cannot hold even an empty prompt, and downstream
+        // token budget arithmetic would underflow semantically.
         if ctx_size == 0 {
             return Err("--ctx-size must be greater than 0.".into());
         }
+        // Fall back to the number of physical cores for the Rayon pool. The
+        // `.max(1)` protects unusual platforms that report zero CPUs.
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical().max(1));
         if threads == 0 {
             return Err("--threads must be greater than 0.".into());
         }
         // Reuse the existing global pool when one is already initialized
-        // (e.g. in-process callers such as the test harness).
+        // (e.g. in-process callers such as the test harness). A second
+        // `build_global` fails, but that is expected and intentionally ignored
+        // so repeated engine loads share one pool instead of panicking.
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build_global();
+        // Both a directory and a direct shard path are accepted; for a file we
+        // use its parent as the root for config, tokenizer, and manifest.
         let model_dir = if path.is_dir() {
             path
         } else {
@@ -387,10 +705,14 @@ impl Engine {
                 synth_config_from_manifest(model_dir, &read_error)?
             }
         };
+        // Keep both a raw JSON tree (passed to backends that need extra
+        // architecture-specific fields) and a typed view for the common fields.
         let raw_config: serde_json::Value = serde_json::from_slice(&config_bytes)
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
         let config: ModelConfig = serde_json::from_value(raw_config.clone())
             .map_err(|error| format!("Invalid model configuration: {error}"))?;
+        // Prefer the first declared architecture class name; fall back to the
+        // model_type (for example "llama" or "qwen2") when the list is absent.
         let architecture = config
             .architectures
             .as_ref()
@@ -398,9 +720,13 @@ impl Engine {
             .map(String::as_str)
             .unwrap_or(config.model_type.as_str())
             .to_owned();
+        // Template lookup doubles as the architecture support check: an
+        // unregistered architecture cannot be rendered or loaded.
         let template = super::models::chat_template_for_architecture(&architecture)
             .ok_or_else(|| format!("Unsupported model architecture '{architecture}'."))?;
 
+        // Tokenizer loading is independent of weight loading and fails early
+        // with a path-specific message to make setup errors easy to diagnose.
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer_bytes = fs::read(&tokenizer_path).map_err(|error| {
             format!(
@@ -414,8 +740,14 @@ impl Engine {
                 tokenizer_path.display()
             )
         })?;
+        // Weight discovery also returns manifest-provided stop markers, which
+        // are more authoritative than the architecture defaults.
         let (weight_paths, manifest_stop_markers) = resolve_model_files(path)?;
         let vocabulary = tokenizer.get_vocab(true);
+        // Llama 3-style header templates must not be used with a tokenizer
+        // that lacks the special header tokens, or the model would see literal
+        // text instead of control tokens. Manifest markers take precedence;
+        // without a manifest we probe the vocabulary directly.
         let use_header_renderer = template.header_renderer.is_some()
             && (manifest_stop_markers
                 .as_ref()
@@ -424,10 +756,15 @@ impl Engine {
                     && vocabulary.contains_key("<|start_header_id|>")
                     && vocabulary.contains_key("<|eot_id|>"));
         let prompt_renderer = if use_header_renderer {
+            // `header_renderer` was checked for `Some` above; `unwrap_or`
+            // merely avoids an unwrap and keeps the classic renderer as a
+            // defensive fallback.
             template.header_renderer.unwrap_or(template.render)
         } else {
             template.render
         };
+        // Any non-CPU device string is treated as an accelerator request. The
+        // exact backend is resolved later by the model registry.
         let device_is_accelerator =
             std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into()) != "cpu";
         let mut effective_weight_paths = weight_paths.to_vec();
