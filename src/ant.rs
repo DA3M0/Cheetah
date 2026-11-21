@@ -23,7 +23,7 @@
 //!    observable fact.
 //!
 //! The *execution* side (real `madvise`/page-in of mapped weight memory)
-//! lives in the native backend (`chat/models/native/{store,decoder}.rs`)
+//! lives in the native backend (`chat/native/{store,ops}.rs`)
 //! and the C manager (`cheetah_memory.c`), wrapped here by thin FFI calls
 //! on [`Ant`].
 

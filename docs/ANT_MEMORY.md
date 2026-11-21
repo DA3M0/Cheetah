@@ -48,9 +48,13 @@ Candle's owned-tensor design cannot keep weights mmap-backed.
 - **Residency plan** — map `unit_id → tier` produced by the planner.
 - **Family** — a model family (llama, qwen2, …) with its own fallback
   inference constants (`ModelFamily`) and native backend support.
-- **Runner** — the native forward implementation
-  (`DecoderNative` in `src/chat/models/native/decoder.rs`); it serves the whole
-  decoder family (llama / mixtral / qwen2 / qwen3 shape, with MoE routing for mixtral, plus the dense delta families mistral / gemma / phi via `DenseFeatures`).
+- **Runner** — a family's native forward implementation: one
+  `ModelForward` struct per registration file
+  (`src/chat/registrations/<family>.rs`, e.g. `LlamaNative`,
+  `MixtralNative`, `PhiNative`) that composes the shared `OpsToolbox`
+  (`src/chat/native/ops.rs`) in its architecture's order. The toolbox
+  carries the operators and inference state; the runner carries the layer
+  stacking.
 
 ---
 
@@ -259,14 +263,23 @@ The full sequence, in order:
 
 ## 7. Native backend architecture
 
-Files (all under `src/chat/models/native/`):
+Files (all under `src/chat/native/`):
 
 | File | Role |
 |------|------|
 | `store.rs` | `MmapWeightStore`: shard mapping + unit index + tier table + madvise control |
-| `kernels.rs` | compute kernels: gemv, rmsnorm (+ gemma offset), layernorm, rope, softmax, silu, gelu (tanh), dequant |
-| `decoder.rs` | the decoder runner (`DecoderNative`; serves llama / mixtral / qwen2 / qwen3 shape, MoE for mixtral, dense delta families mistral / gemma / phi via `DenseFeatures`) + `DecoderConfig` resolution |
-| `mod.rs` | `NativeCpuRuntime` (ModelRuntime + AntTierControl bridge), native family loader, native forward tests (mixtral = mixture-of-experts with router + per-token expert routing via `num_experts_per_tok`) |
+| `ops.rs` | the OpsToolbox: compute kernels (gemv, rmsnorm (+ gemma offset), layernorm, rope, softmax, silu, gelu (tanh), dequant) + the shared inference state (KV caches, quantized linear dispatch, routing-aware expert residency, Ant tier plumbing, debug capture). No family branches |
+| `decoder.rs` | `DecoderConfig` resolution (config.json → units manifest → family constants) + the declarative delta tags (`DenseFeatures`, `MoEExpertLayout`) + the native forward test suite |
+| `kernels.rs` | compatibility alias re-exporting `ops` (the precision registry reaches `gemv_q8`/`gemv_q4` through this path) |
+| `mod.rs` | module glue and docs |
+
+The per-family runners live outside this directory, in the registration files
+(`src/chat/registrations/<family>.rs`): each one implements
+`ModelForward` (+ `AntTierControl`) by composing toolbox ops —
+`LlamaNative` / `Qwen2Native` / `Qwen3Native` / `MistralNative` /
+`MixtralNative` (sparse MoE with router + per-token expert routing via
+`num_experts_per_tok`) / `GemmaNative` (offset norms + embedding scale +
+GeGLU) / `PhiNative` (LayerNorm + parallel residual + fused projections).
 
 ### 7.1 `MmapWeightStore`
 
@@ -290,7 +303,7 @@ Files (all under `src/chat/models/native/`):
   - `run_lm_head` sweeps the embedding in 16k-row chunks and drops each chunk
     (the 272 MB embedding is the largest transient).
 
-### 7.2 Forward pipeline (`DecoderNative::forward`)
+### 7.2 Forward pipeline (registration-owned, OpsToolbox-driven)
 
 Per position (looped over the token sequence):
 
@@ -321,9 +334,10 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
 - **KV cache**: per layer `Vec<f32>` flattened as
   `[position * kv_heads * head_dim + index]`, f32.
 - **Optional units** are resolved by `store.contains` — attention biases and
-  q/k norms are family-optional; tied-vs-untied embeddings likewise. This is
-  what lets one runner serve llama (no bias, untied), qwen2 (bias, tied) and
-  qwen3 (no bias, q/k norms, tie varies).
+  q/k norms are family-optional; tied-vs-untied embeddings likewise. Each
+  family's runner expresses its own shape (llama: no bias, untied; qwen2:
+  bias, tied; qwen3: q/k norms, tie varies) and the unit-optional ops
+  (`add_bias`, `qk_norm`) keep the composition branch-free.
 - **`DecoderConfig::resolve`** implements the parameter chain (§4).
 - **Sparse (sliding-window) attention**: `DecoderConfig.sliding_window`
   resolves from `use_sliding_window` (default `true`) × `sliding_window`;
@@ -339,9 +353,9 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
   carry the full tensor name including the `.weight` suffix
   (`MoEExpertLayout::router_unit` / `expert_unit`).
 - `forward` returns the final-position logits only (`Vec<f32>`), matching the
-  backend-agnostic `ModelRuntime::forward(&[u32], usize)` boundary.
+  backend-agnostic `ModelForward::forward(&[u32], usize)` boundary.
 
-### 7.3 Compute kernels
+### 7.3 Compute kernels (native/ops.rs)
 
 - `gemv(weight_bytes, dtype, rows, cols, x, y)` — rows ≤ `GEMV_CHUNK_ROWS`
   (128) run sequentially (rayon fork/join would exceed the compute); larger
@@ -536,14 +550,14 @@ runs compute shaders only (measured: GT 730M 0.3 tok/s vs 8 tok/s native CPU
 
 ## 9. Testing infrastructure
 
-- **Chat template / stop-marker tests** (`src/chat/models/mod.rs`,
+- **Chat template / stop-marker tests** (`src/chat/registry.rs`,
   `src/chat/mod.rs` tests): instruction prompts for llama / mistral / qwen
   render correctly, stop markers resolve per architecture, and unsupported
   architectures surface clear resolution errors.
-- **Backend capability tests** (`src/chat/models/registry.rs` tests): the
+- **Backend capability tests** (`src/chat/registry.rs` tests): the
   native/vulkan backend tables, backend lookup, and the no-native guidance
   error.
-- **Kernel isolation tests** (`kernels.rs`): `dot_row_bf16_fused` vs
+- **Kernel isolation tests** (`native/ops.rs`): `dot_row_bf16_fused` vs
   dequant+dot on exact bf16 integers (8 and 896 lanes — the full-width test
   exercises AVX2 tail handling). These caught the acc[1]/acc[3] word-mapping
   bug immediately.
@@ -589,29 +603,29 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 
 ## 11. Adding a new family — checklist
 
-1. **Declare the deltas in `DenseFeatures`** (native/decoder.rs) if they are
-   new — the struct carries the dense-architecture deltas over the
-   llama-shaped baseline (norm kind, activation, projection naming, residual
-   topology, partial rope). Known deltas (offset norms, embedding scale,
-   GeGLU, LayerNorm, parallel residual, fused projections, partial rotary)
-   already branch in the runner; a family only flips flags. Sliding-window
-   attention and the MoE router/experts block are built into the runner now —
-   a sparse family only needs the config fields
-   (`use_sliding_window` / `sliding_window`, `num_local_experts`,
-   `num_experts_per_tok`) to resolve, and gets router + per-token expert
-   routing (`num_experts_per_tok`) plus route-weighted expert mixing for
-   free.
-1a. **Implement the forward differences** in the native runner only when no
-   existing `DenseFeatures` flag covers them (e.g. a brand-new residual
-   topology). Reuse everything else.
-2. **Extend `DecoderConfig::resolve`** if the family carries new config fields.
-3. **Add the declarative registration file** `src/chat/models/registrations/<family>.rs`
+1. **Add the registration file** `src/chat/registrations/<family>.rs`
    (build.rs picks it up and regenerates the registry; see
-   [REGISTRY.md](REGISTRY.md) §2). It carries the family constants + profiles
-   — `(hidden, vocab, q, kv, head_dim)` for every published size; hidden alone
-   is ambiguous within a family.
-4. **Extend the native runner / forward tests** for the family's structural
-   deltas and add the forward tests.
+   [REGISTRY.md](REGISTRY.md) §2). It carries the declarative capability
+   (architectures / template / stops / backends) + family constants and
+   profiles — `(hidden, vocab, q, kv, head_dim)` for every published size;
+   hidden alone is ambiguous within a family.
+2. **Implement the family's `ModelForward` in that same file**: the layer
+   stacking composes the `OpsToolbox` ops (`linear`, `rmsnorm` /
+   `rmsnorm_offset` / `layernorm`, `qk_norm`, `add_bias`, `rope_heads`,
+   `cache_append`, `attention`, `lm_head_into`, `drop_disk_units_of_layer`)
+   in the architecture's order. Reuse the existing ops — anything genuinely
+   new as a *math operator* goes into `native/ops.rs` family-free; anything
+   structural (residual topology, projection naming, activation) stays in
+   the registration file. Sliding-window attention and the MoE
+   router/experts block are shared ops already — a sparse family only needs
+   the config fields (`use_sliding_window` / `sliding_window`,
+   `num_local_experts`, `num_experts_per_tok`) to resolve.
+3. **Extend `DecoderConfig::resolve`** (native/decoder.rs) if the family
+   carries new config fields, and declare the delta tags in `DenseFeatures`
+   when the resolution probes need them (fused projection naming, partial
+   rotary).
+4. **Add the forward tests** for the family's structural deltas (reference
+   math + residency parity, same pattern as the gemma / phi suites).
 5. **Run the comparison** — native forward output must match the reference
    before the family is announced.
 6. Update the backend capability tests and this document.

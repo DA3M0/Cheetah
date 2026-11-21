@@ -442,7 +442,7 @@ pub(crate) struct VulkanTransformerExecutor {
     expert_residency: HashMap<(usize, usize), bool>,
 }
 
-impl crate::chat::models::ModelRuntime for VulkanTransformerExecutor {
+impl crate::chat::registry::ModelForward for VulkanTransformerExecutor {
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         VulkanTransformerExecutor::forward(self, tokens, offset)
     }
@@ -455,7 +455,7 @@ impl crate::chat::models::ModelRuntime for VulkanTransformerExecutor {
         "Vulkan"
     }
 
-    fn as_ant_tier_control(&mut self) -> Option<&mut dyn crate::chat::models::AntTierControl> {
+    fn as_ant_tier_control(&mut self) -> Option<&mut dyn crate::chat::registry::AntTierControl> {
         Some(self)
     }
 }
@@ -544,7 +544,7 @@ impl VulkanTransformerExecutor {
     }
 }
 
-impl crate::chat::models::AntTierControl for VulkanTransformerExecutor {
+impl crate::chat::registry::AntTierControl for VulkanTransformerExecutor {
     fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
         self.page_weight(unit_id, true)
     }

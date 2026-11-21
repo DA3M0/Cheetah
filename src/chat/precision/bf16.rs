@@ -14,7 +14,7 @@
 //! `CHEETAH_MATMUL_BF16_SPV`.
 
 #[cfg(feature = "vulkan")]
-use super::bytes::u16_view;
+use super::u16_view;
 
 /// Host-streaming bf16 matmul (dedicated bf16 pipeline; weights stay bf16).
 #[cfg(feature = "vulkan")]
@@ -52,6 +52,63 @@ pub(crate) fn matmul_resident(
 
 /// `y = W·x` over stored bf16 rows (fused bf16 kernel, f32 accumulate).
 pub(crate) fn gemv(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
-    use crate::chat::models::native::{kernels, store::WeightDType};
+    use crate::chat::native::{kernels, store::WeightDType};
     kernels::gemv(weight, WeightDType::Bf16, rows, cols, x, y);
+}
+
+// ---------------------------------------------------------------------------
+// Declarative registration — this format's entry in the generated REGISTRY
+// (build.rs scans src/chat/precision/ and splices every file there as a
+// `<name>` module; adding a weight precision is adding one such file).
+// ---------------------------------------------------------------------------
+
+use super::{PrecisionBackend, PrecisionKind, PrecisionRegistration};
+
+pub(crate) const REGISTRATION: PrecisionRegistration = PrecisionRegistration {
+    id: "bf16",
+    label: "BF16 (original precision)",
+    kind: PrecisionKind::Original,
+    // Original precisions are always available; no selector.
+    selector_env: None,
+    backends: precision_backends(),
+};
+
+/// Backends registered for this precision: the native CPU fused bf16 gemv
+/// and, when compiled in, the Vulkan executor's bf16 matmul pipeline
+/// (streaming plus the bf16 resident upload / resident matmul pair). Original
+/// precisions never quantize.
+const fn precision_backends() -> &'static [(&'static str, PrecisionBackend)] {
+    #[cfg(feature = "vulkan")]
+    {
+        &[
+            (
+                "native",
+                PrecisionBackend::Native(super::NativeOps {
+                    quantize: None,
+                    gemv: gemv,
+                }),
+            ),
+            (
+                "vulkan",
+                PrecisionBackend::Vulkan(super::VulkanOps {
+                    quantize: None,
+                    matmul_streaming: matmul_streaming,
+                    upload: Some(upload),
+                    matmul_resident: Some(matmul_resident),
+                    weight_format: 3,
+                    shader_env: "CHEETAH_MATMUL_BF16_SPV",
+                }),
+            ),
+        ]
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        &[(
+            "native",
+            PrecisionBackend::Native(super::NativeOps {
+                quantize: None,
+                gemv: gemv,
+            }),
+        )]
+    }
 }

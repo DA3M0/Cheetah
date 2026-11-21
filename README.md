@@ -12,7 +12,7 @@
 
 ```
                  ┌─────────────────────────────────────────────┐
-  CLI / OpenAI ──▶ Engine (chat/serve) ──▶ ModelRuntime boundary ──▶ ┐
+  CLI / OpenAI ──▶ Engine (chat/serve) ──▶ ModelForward boundary ──▶ ┐
                  └─────────────────────────────────────────────┘      │
                                                                       ▼
                     ┌──────────────────────┬──────────────────────────┐
@@ -422,11 +422,11 @@ Model inference requires enough system or GPU memory for the weights, context, a
 
 Contributions are welcome — the codebase is structured so the common tasks are mechanical:
 
-- **Add a native model family** (highest value): declare the family's deltas in `DenseFeatures` (offset norms, embedding scale, GeGLU, LayerNorm, parallel residual, fused projections, partial rotary — existing flags cover all published dense deltas), add a declarative registration file in `src/chat/models/registrations/` (build.rs picks it up and regenerates the registry), and extend the native forward-parity tests. Step-by-step: [docs/REGISTRY.md](docs/REGISTRY.md) §4 and [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11. Reference migrations: llama (optional bias, untied lm_head), qwen3 (per-head q/k RMSNorm), mistral (sliding window), gemma (offset norms + embedding scale + GeGLU), phi (LayerNorm + parallel residual + fused projections).
-- **Kernels / memory control**: the hot path is the fused BF16 gemv in `src/chat/models/native/kernels.rs` (AVX2 intrinsics with a portable fallback); Ant page control lives in `native/store.rs`. Isolation tests and the native forward-parity checks guard correctness.
+- **Add a native model family** (highest value): declare the family's deltas in `DenseFeatures` (offset norms, embedding scale, GeGLU, LayerNorm, parallel residual, fused projections, partial rotary — existing flags cover all published dense deltas), add a declarative registration file in `src/chat/registrations/` (build.rs picks it up and regenerates the registry), and extend the native forward-parity tests. Step-by-step: [docs/REGISTRY.md](docs/REGISTRY.md) §4 and [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11. Reference migrations: llama (optional bias, untied lm_head), qwen3 (per-head q/k RMSNorm), mistral (sliding window), gemma (offset norms + embedding scale + GeGLU), phi (LayerNorm + parallel residual + fused projections).
+- **Kernels / memory control**: the hot path is the fused BF16 gemv in `src/chat/native/kernels.rs` (AVX2 intrinsics with a portable fallback); Ant page control lives in `native/store.rs`. Isolation tests and the native forward-parity checks guard correctness.
 - **Server / CLI work**: `src/serve/` and `src/cli.rs` are self-contained.
 
-Start with [CONTRIBUTING.md](CONTRIBUTING.md) (workflows, debugging toolbox, error-message cheat sheet, review checklist) and the [repository map](docs/CODEBASE.md). Model-specific Vulkan compute shaders (optional `src/chat/models/<name>.comp`) are discovered at build time and exposed through the generated shader registry.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) (workflows, debugging toolbox, error-message cheat sheet, review checklist) and the [repository map](docs/CODEBASE.md). Model-specific Vulkan compute shaders (optional `src/chat/registrations/<name>.comp`) are discovered at build time and exposed through the generated shader registry.
 
 ## FAQ
 

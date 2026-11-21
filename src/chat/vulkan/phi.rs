@@ -183,7 +183,7 @@ pub(crate) struct VulkanPhiExecutor {
     lm_head: Linear,
 }
 
-impl crate::chat::models::ModelRuntime for VulkanPhiExecutor {
+impl crate::chat::registry::ModelForward for VulkanPhiExecutor {
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         VulkanPhiExecutor::forward(self, tokens, offset)
     }

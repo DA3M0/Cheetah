@@ -4,7 +4,8 @@ A navigation map of the repository: every source file, what it owns, its key
 entry points, the request data flows, the environment surface, and the test
 map. Read this first when landing in the codebase; the deep guides
 ([ANT_MEMORY.md](ANT_MEMORY.md), [REGISTRY.md](REGISTRY.md)) pick up where
-this file points.
+this file points, and the conventions + per-function reference live in
+[CODING_STANDARDS.md](CODING_STANDARDS.md).
 
 Line numbers are approximate (they drift); function names are the anchors.
 
@@ -25,26 +26,28 @@ cheetah/
 │   ├── cli.rs                  argument parsing for every subcommand (+ Ant options, --setup)
 │   ├── ant.rs                  AntSettings/AntUnit/Ant manager, residency planner, FFI wrappers
 │   ├── chat/
-│   │   ├── mod.rs              chat entry (chat()), model_metadata_for_init
+│   │   ├── mod.rs              chat entry (chat()), model_metadata_for_init, generated REGISTRY include
 │   │   ├── engine.rs           ★ Engine: load pipeline, generation loop, Ant hooks, sampling
 │   │   ├── context.rs          conversation archive/store (persistence)
 │   │   ├── moe.rs              shared MoE routing (`select_experts`: softmax → top-k → renormalize)
-│   │   └── models/
-│   │       ├── mod.rs          ModelRuntime trait + BackendLoader enum + ModelRegistration + REGISTRY include
-│   │       ├── registrations/  ★ declarative capability per family (build.rs → generated REGISTRY)
-│   │       ├── registry.rs     derived lookups (loader/family/backends) + device dispatch
-│   │       ├── templates.rs    chat template renderers
-│   │       └── native/         ★ the native mmap backend
-│   │           ├── store.rs    MmapWeightStore + madvise tier control
-│   │           ├── kernels.rs  gemv (AVX2 + portable), rmsnorm, layernorm, rope, softmax, silu/gelu
-│   │           ├── decoder.rs    decoder runner (DecoderNative) + DecoderConfig::resolve
-│   │           └── mod.rs      NativeCpuRuntime + native family loader + native tests
-│   ├── vulkan/                ★ the Vulkan backend
-│   │       ├── mod.rs         one generic Vulkan loader; features derive from config model_type
-│   │       ├── transformer.rs generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
-│   │       ├── phi.rs         phi executor (parallel residual, fused projections)
-│   │       └── weights.rs     shared weight layer + precision-registry dispatch
-│   ├── precision/              ★ weight-precision operator registry (f32/f16/bf16/q8 → native+vulkan ops)
+│   │   ├── registry.rs         ★ ModelForward trait + BackendLoader + ModelRegistration + derived lookups
+│   │   ├── templates.rs        chat template renderers
+│   │   ├── registrations/      ★ one file per family: declarative capability (build.rs → generated REGISTRY)
+│   │   │                       ★ AND the family's ModelForward assembly (layer stacking) + its loaders
+│   │   ├── native/             ★ the native mmap backend's shared infra (family-free)
+│   │   │   ├── ops.rs          ★ OpsToolbox: math kernels (gemv/rmsnorm/rope/...) + store/KV-cache/
+│   │   │   │                   quant/expert-residency/Ant plumbing — no family branches
+│   │   │   ├── store.rs        MmapWeightStore + madvise tier control
+│   │   │   ├── kernels.rs      compatibility alias re-exporting ops (precision registry path)
+│   │   │   ├── decoder.rs      DecoderConfig::resolve + DenseFeatures/MoEExpertLayout + native tests
+│   │   │   └── mod.rs          module glue
+│   │   ├── precision.rs        ★ weight-precision registry: shared types, lookups, typed byte views
+│   │   ├── precision/          ★ one file per format: operators + the format's declarative registration
+│   │   │                       (f32/f16/bf16/q4/q8 → native+vulkan ops; build.rs → generated REGISTRY)
+│   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
+│   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
+│   │       ├── phi.rs          phi executor (parallel residual, fused projections)
+│   │       └── weights.rs      shared weight layer + precision-registry dispatch
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue)
 │   ├── inspect.rs              model inspection (load/inspect command)
@@ -73,15 +76,18 @@ main.rs::run (dispatch)                      src/main.rs
                   ant_apply_budget → ant_evicted
                   layer_residency_summary + AntRuntimeState seed
                   backend_loader_for_architecture(arch, backend)   ← architecture capability lookup
-                      → native::native_family_loader   src/chat/models/native/mod.rs
-                          MmapWeightStore::open        native/store.rs
-                          DecoderConfig::resolve         native/decoder.rs (config→units→family)
-                          apply_tiers(plan)            madvise per unit
+                      → <family>_native_loader         src/chat/registrations/<family>.rs
+                          OpsToolbox::open             native/ops.rs
+                              MmapWeightStore::open      native/store.rs
+                              DecoderConfig::resolve     native/decoder.rs (config→units→family)
+                              apply_tiers(plan)          madvise per unit
+                          <Family>Native::new          the family's ModelForward (layer stacking)
           → chat_loop                        engine.rs:1500 (REPL)
               → generate_inner               engine.rs:1188
                   apply_ant_request_overrides → prefetch → promote → enforce
-                  model.forward(&tokens, offset)     ← backend-agnostic boundary
-                      (native: DecoderNative::forward  native/decoder.rs)
+                  model.forward(&tokens, offset)     ← backend-agnostic boundary (Box<dyn ModelForward>)
+                      (native: <Family>Native in registrations/<family>.rs,
+                       composing the native/ops.rs OpsToolbox)
                   sample_token                   engine.rs:1527
 ```
 
@@ -128,22 +134,28 @@ run_init_command      src/main.rs:90
 | `sample_token` | 1527 | temperature/top-p/top-k/repeat-penalty sampling |
 | `chat_loop` | ~1560 | REPL (slash commands, streaming) |
 
-### `src/chat/models/native/` — the native backend
+### `src/chat/native/` — the native backend's shared infra (family-free)
 
 | Item | File | Role |
 |------|------|------|
+| `OpsToolbox` | ops.rs | shared inference state + operators: weight store access, KV caches, quantized linear dispatch (`linear`), GQA attention (`attention`, sliding-window aware), norms (`rmsnorm`/`rmsnorm_offset`/`layernorm`/`qk_norm`), `add_bias`, `embedding_row_into`, `rope_heads`, `lm_head_into` (chunked Ant sweep), expert residency, `apply_tiers`/`page_in_unit`/`evict_unit` |
 | `MmapWeightStore` | store.rs | shard mmap + unit index + tier Mutex + `page_in`/`drop_pages`/`drop_range`/`drop_disk_units_of_layer` |
-| `gemv` | kernels.rs | row-parallel matrix-vector; AVX2 vs portable dispatch |
-| `dot_row_bf16_avx2` | kernels.rs | `cvtepu16_epi32 + slli_epi32(16)` widening + FMA |
-| `dot_row_bf16_fused(_portable)` | kernels.rs | fused bit-widening dot (portable fallback) |
-| `rmsnorm` / `rope_in_place` / `silu_multiply` / `softmax` | kernels.rs | elementwise/attention helpers |
+| `gemv` | ops.rs | row-parallel matrix-vector; AVX2 vs portable dispatch (names frozen; `kernels.rs` re-exports the module for the precision registry) |
+| `dot_row_bf16_avx2` | ops.rs | `cvtepu16_epi32 + slli_epi32(16)` widening + FMA |
+| `dot_row_bf16_fused(_portable)` | ops.rs | fused bit-widening dot (portable fallback) |
+| `rmsnorm` / `rope_in_place` / `rope_heads` / `silu_multiply` / `softmax` | ops.rs | elementwise/attention helpers |
 | `DecoderConfig::resolve` | decoder.rs | the parameter chain (config → units → family) |
-| `DecoderNative::forward` | decoder.rs | the decoder forward (see ANT_MEMORY §7.2) |
-| `forward_moe_block` / `forward_dense_mlp` | decoder.rs | sparse block: router → top-k experts mixed by route weight; dense gated MLP (silu / gelu) or phi plain `fc1`/`fc2` otherwise |
-| `forward_attention` / `apply_norm_to` / `DenseFeatures` | decoder.rs | family deltas: fused `qkv_proj` + `dense` naming (phi), partial rotary, offset RMSNorm (gemma) vs LayerNorm (phi), output written pre-residual so phi can sum attention + MLP in one update |
-| sliding-window attention (`window_start`) | decoder.rs | masks keys older than `sliding_window` (0 = full attention), same rule as `shared_ops.comp` |
-| `apply_tiers` / `page_in_unit` / `evict_unit` | decoder.rs | Ant tier application on real pages |
-| `native_family_loader` | mod.rs | native family loader (llama / mixtral / qwen2 / qwen3 / mistral / gemma / phi) |
+| `DenseFeatures` / `MoEExpertLayout` | decoder.rs | declarative delta/layout tags the resolution probes read |
+| native forward tests | decoder.rs | reference-math + residency-parity suites driving the registration types |
+
+### `src/chat/registrations/` — one family, one file (capability + assembly)
+
+| Item | File | Role |
+|------|------|------|
+| `<Family>Native` (e.g. `LlamaNative`, `MixtralNative`, `PhiNative`) | registrations/<family>.rs | the family's `ModelForward` implementation: the complete layer stacking (Attention → Norm → FFN → residual) composed from OpsToolbox ops; `forward_moe_block` lives in mixtral.rs, phi's parallel residual in phi.rs, gemma's GeGLU in gemma.rs |
+| `<family>_native_loader` | registrations/<family>.rs | `OpsToolbox::open` → family struct → `Box<dyn ModelForward>` |
+| `<family>_vulkan_loader` / `<family>_vulkan_config` | registrations/<family>.rs | `#[cfg(feature = "vulkan")]`: the family's own executor entry (no central `model_type` dispatch) |
+| family Vulkan feature tests | registrations/<family>.rs | `#[cfg(all(test, feature = "vulkan"))]` modules moved out of the former central loader |
 
 ### `src/ant.rs` — the planner
 
@@ -156,31 +168,30 @@ run_init_command      src/main.rs:90
 | `ant_filter_known_units` | wizard unit-id validation |
 | `run_interactive_setup` | the `--setup` wizard |
 
-### `src/chat/models/` — runtime & backend resolution
+### `src/chat/` — runtime boundary & backend resolution
 
 | Item | File | Role |
 |------|------|------|
-| `ModelRuntime` / `AntTierControl` | mod.rs | backend-agnostic boundary: `forward(&[u32], usize) -> Vec<f32>` + Ant tier control |
-| `BackendLoader` / `ModelFamily` / `ModelRegistration` | mod.rs | backend enum + family constants + declarative registration entry |
-| `registrations/<family>.rs` | registrations/ | declarative capability (architectures / template / stops / backends / family); build.rs → generated `REGISTRY` |
-| `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | mod.rs / registry.rs | lookups derived from the generated `REGISTRY` |
+| `ModelForward` / `AntTierControl` | registry.rs | backend-agnostic boundary: `forward(&[u32], usize) -> Result<Vec<f32>, String>` + Ant tier control; the registry's loader table returns `Box<dyn ModelForward>` |
+| `BackendLoader` / `ModelFamily` / `ModelRegistration` | registry.rs | backend enum + family constants + declarative registration entry |
+| generated `REGISTRY` include | mod.rs | build.rs → `OUT_DIR/model_registry.rs`; the `<family>_registration` modules are children of `chat`, so registration files reach the boundary types via `super::` |
+| `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | registry.rs | lookups derived from the generated `REGISTRY` |
 | `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
 | `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan/transformer.rs, vulkan/phi.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
-| generic Vulkan `load` | vulkan/mod.rs | the one loader every registration references; executor features derive from `model_type` |
 | `WeightData` / `Linear` / `take_linear` / resident upload | vulkan/weights.rs | shared weight layer; streaming/resident matmuls dispatch through the precision registry |
 
-### `src/chat/precision/` — weight-precision operator registry
+### `src/chat/precision.rs` + `src/chat/precision/` — weight-precision operator registry
 
 | Item | File | Role |
 |------|------|------|
-| `PrecisionRegistration` / `PrecisionKind` / `PrecisionBackend` | mod.rs | declarative per-precision entries (`registrations/{f32,f16,bf16,q4,q8}.rs`): kind (Original / Quantized), optional selector env, per-backend operator tables; build.rs → generated `REGISTRY` |
-| `VulkanOps` | mod.rs | per-format Vulkan operators: load-time `quantize`, streaming matmul, resident upload / resident matmul, shared-ops format code, shader-override env |
-| `NativeOps` | mod.rs | per-format native operators: `quantize` (quantized kinds) + `gemv` computed in the format's own precision domain |
-| `PrecisionBuffer` | mod.rs | quantized buffer abstraction (q8 layout: f32 scale head + packed int8 rows) |
-| `selected_format` / `selected_vulkan_ops` / `selected_native_ops` | mod.rs | selector-env driven lookups (`CHEETAH_QUANT_Q8` selects q8) |
-| `bytes::f32_view` / `u16_view` | bytes.rs | typed views over the registry's uniform byte payloads (no copy) |
-| `gemv_q8` / `gemv_q4` / `dequant_values` | native/kernels.rs | int8/int4 ×scale per-row gemv (same math as `matmul_q8.comp` / `matmul_q4.comp`) + f32 dequant feeding the quantize operators |
-| `QuantState::gemv_linear` | native/decoder.rs | native linear dispatch: quantize-at-first-use + registered gemv; original precisions dispatch by dtype format id |
+| `PrecisionRegistration` / `PrecisionKind` / `PrecisionBackend` | precision.rs | shared registration types; the per-format entries live in `precision/{f32,f16,bf16,q4,q8}.rs`, each file carrying its operators AND its declarative registration; build.rs scans `src/chat/precision/` → generated `REGISTRY` |
+| `VulkanOps` | precision.rs | per-format Vulkan operator table: load-time `quantize`, streaming matmul, resident upload / resident matmul, shared-ops format code, shader-override env |
+| `NativeOps` | precision.rs | per-format native operator table: `quantize` (quantized kinds) + `gemv` computed in the format's own precision domain |
+| `PrecisionBuffer` | precision.rs | quantized buffer abstraction (q8 layout: f32 scale head + packed int8 rows) |
+| `selected_format` / `selected_vulkan_ops` / `selected_native_ops` | precision.rs | selector-env driven lookups (`CHEETAH_QUANT_Q8` selects q8) |
+| `f32_view` / `u16_view` | precision.rs | typed views over the registry's uniform byte payloads (no copy; vulkan-only) |
+| `gemv_q8` / `gemv_q4` / `dequant_values` | native/ops.rs (re-exported by `native/kernels.rs`) | int8/int4 ×scale per-row gemv (same math as `matmul_q8.comp` / `matmul_q4.comp`) + f32 dequant feeding the quantize operators |
+| `OpsToolbox::linear` | native/ops.rs | native linear dispatch: quantize-at-first-use + registered gemv; original precisions dispatch by dtype format id |
 
 ### CLI/serve
 
@@ -244,8 +255,8 @@ cargo build --release --features vulkan   # + shader compilation (needs glslc) +
 cargo build --release --features cuda     # Candle CUDA (needs CUDA toolkit)
 cargo build --release --features metal    # Candle Metal (macOS)
 
-cargo test                           # default feature tests (135)
-cargo test --features vulkan         # + Vulkan executor/shader tests (151 passed, 5 device-gated ignored)
+cargo test                           # default feature tests (161)
+cargo test --features vulkan         # + Vulkan executor/shader tests (180 passed, 3 device-gated ignored)
 cargo test native_                   # all native-backend tests
 cargo test -- --test-threads=4       # parallel (some tests are timing-sensitive)
 ```
@@ -260,12 +271,18 @@ self-contained and runs anywhere.
 
 ## 6. Invariants (do not break)
 
-1. **The runtime boundary carries no backend types**:
-   `ModelRuntime::forward(&[u32], usize) -> Result<Vec<f32>, String>`.
-2. **Architecture resolution contains no runtime code**; the declarative
-   registration files in `src/chat/models/registrations/` are the single
-   source of truth, build.rs generates `REGISTRY` from them, and every lookup
-   (backends, chat metadata, family constants) derives from that table.
+1. **The runtime boundary carries no backend or family types**:
+   `ModelForward::forward(&[u32], usize) -> Result<Vec<f32>, String>`;
+   the registry's loader table returns `Box<dyn ModelForward>`.
+2. **Registration files are the single source of truth** for architecture
+   capability AND family forward structure: the declarative entries in
+   `src/chat/registrations/` feed the generated `REGISTRY` (every
+   lookup derives from it), and each family's `ModelForward` lives in its own
+   file. The main program (`native/ops.rs`, executors, engine) contains **no
+   family branches** — control flow vs. operators split; the low-level math
+   stays statically dispatched free functions with frozen names
+   (`gemv`, `rmsnorm`, `rope_in_place`, ...; `native/kernels.rs` re-exports
+   them for the precision registry).
 3. **`Disk`-tier means real released pages** on the native backend — any change
    that keeps disk-tier bytes resident breaks the Ant contract.
 4. **Every swap re-checks the budget before it executes** (`ant_swap_in_unit`,
@@ -293,7 +310,13 @@ self-contained and runs anywhere.
 `native+vulkan` means both `backend_loader_for_architecture(arch, "native")` and
 the Vulkan load path (`vulkan_backends()` + `vulkan_loader_for_architecture`)
 resolve; the two Vulkan tables are asserted to agree by
-`vulkan_capability_table_and_loader_table_agree`.
+`vulkan_capability_table_and_loader_table_agree`, and every registered
+Vulkan loader is exercised by `vulkan_loaders_reach_family_feature_selection`.
+
+Each row's native forward is the registration file's own `ModelForward`
+assembly (`src/chat/registrations/<family>.rs`) driving the shared
+`OpsToolbox`; the `DenseFeatures` column of the family constants remains as
+the resolution metadata the parameter fallback chain probes.
 
 Sparse (sliding-window) attention and MoE routing are backend-agnostic: both
 runners resolve `use_sliding_window` / `sliding_window` the same way (`false`

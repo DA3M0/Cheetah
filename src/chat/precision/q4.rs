@@ -219,7 +219,7 @@ pub(crate) fn matmul_resident(
 /// q8::gemv) so the decoder's quantized path and the registration table
 /// stay decoupled from the kernel module layout.
 pub(crate) fn gemv(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
-    crate::chat::models::native::kernels::gemv_q4(weight, rows, cols, x, y);
+    crate::chat::native::kernels::gemv_q4(weight, rows, cols, x, y);
 }
 
 #[cfg(test)]
@@ -318,5 +318,64 @@ mod tests {
             Ok(_) => panic!("a size mismatch must be rejected"),
         };
         assert!(error.contains("expected 15 elements"), "{error}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declarative registration — this format's entry in the generated REGISTRY
+// (build.rs scans src/chat/precision/ and splices every file there as a
+// `<name>` module; adding a weight precision is adding one such file).
+// ---------------------------------------------------------------------------
+
+use super::{PrecisionBackend, PrecisionKind, PrecisionRegistration};
+
+pub(crate) const REGISTRATION: PrecisionRegistration = PrecisionRegistration {
+    id: "q4",
+    label: "Q4 (row-wise int4)",
+    kind: PrecisionKind::Quantized,
+    // `CHEETAH_QUANT_Q4=1` quantizes linear projections to row-wise int4 at
+    // load time (a quarter of the BF16 footprint, half of q8). Norms, biases
+    // and the embedding stay in original precision.
+    selector_env: Some("CHEETAH_QUANT_Q4"),
+    backends: precision_backends(),
+};
+
+/// Backends registered for this format: both the native CPU operators
+/// (load-time quantize + int4×scale gemv) and, when compiled in, the Vulkan
+/// executor operators (quantize at load, resident upload, streaming and
+/// resident matmul).
+const fn precision_backends() -> &'static [(&'static str, PrecisionBackend)] {
+    #[cfg(feature = "vulkan")]
+    {
+        &[
+            (
+                "native",
+                PrecisionBackend::Native(super::NativeOps {
+                    quantize: Some(quantize),
+                    gemv: gemv,
+                }),
+            ),
+            (
+                "vulkan",
+                PrecisionBackend::Vulkan(super::VulkanOps {
+                    quantize: Some(quantize),
+                    matmul_streaming: matmul_streaming,
+                    upload: Some(upload),
+                    matmul_resident: Some(matmul_resident),
+                    weight_format: 5,
+                    shader_env: "CHEETAH_MATMUL_Q4_SPV",
+                }),
+            ),
+        ]
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        &[(
+            "native",
+            PrecisionBackend::Native(super::NativeOps {
+                quantize: Some(quantize),
+                gemv: gemv,
+            }),
+        )]
     }
 }

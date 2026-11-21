@@ -1,97 +1,22 @@
-//! CPU decoder forward pass over the mmap-backed weight store.
+//! Decoder configuration resolution for the native backend.
 //!
-//! This module is the reference execution path for the native backend. It runs
-//! a decoder-only transformer one token at a time against weights that stay in
-//! their stored precision: weight bytes are sliced straight out of the process
-//! memory mapping and consumed in place (no dequantize-to-f32 staging copy for
-//! the bulk tensors), while every activation buffer is f32. Disk-tier units are
-//! dropped from the resident set at the end of every step, so a generation holds
-//! only the planned resident bytes rather than the whole model.
+//! The model-specific forward assemblies live in the registration files
+//! (`src/chat/registrations/<family>.rs`); the shared math and the
+//! inference plumbing they compose live in [`super::ops`] (the OpsToolbox).
+//! What remains here is the *resolution* layer every family's loader uses:
 //!
-//! ## Tensor layouts
-//!
-//! Quantities follow Hugging Face naming. Linear weights are row-major
-//! `[rows, cols]`: a matvec computes `y[r] = sum_c W[r * cols + c] * x[c]`, so
-//! `rows` is the output width and `cols` the input width. The embedding and the
-//! lower-cased lm head share the `[vocab_size, hidden_size]` shape; norm
-//! weights are 1-D `[hidden_size]`; optional biases are 1-D over the projection
-//! output. All tensors are addressed through unit ids in the units manifest, so
-//! a single store can back several architectures with different tensor names.
-//!
-//! The residual stream lives in `Scratch::hidden` (length `hidden_size`). The
-//! KV cache is per layer and flat: `[position * kv_heads * head_dim + head *
-//! head_dim + dim]`, with a parallel vector for keys and values. Query heads are
-//! contiguous per head, `[q_heads * head_dim]`, and grouped-query attention maps
-//! query head `h` onto KV head `h / (q_heads / kv_heads)`.
-//!
-//! ## Forward pass structure
-//!
-//! `forward` validates token ids, walks every token through `forward_position`,
-//! and returns only the final position's logits. One position is: embedding row
-//! lookup (optionally scaled by `sqrt(hidden_size)` for gemma), then per layer
-//! an input norm, the attention block, a residual add, a post-attention norm
-//! (unless the family uses phi's parallel residual), the feed-forward block, and
-//! a residual add. After the last layer the final norm runs and `run_lm_head`
-//! produces the vocabulary logits. Dense feed-forward blocks are SwiGLU/GeGLU
-//! (`gate`/`up`/`down`) or phi's `fc1`/`fc2` GELU pair; sparse blocks replace
-//! them with a router plus the top-k experts.
-//!
-//! ## Attention and KV cache
-//!
-//! Attention projects q/k/v (fused `qkv_proj` for phi), applies qwen-style
-//! per-head RMSNorm when those units exist, and rotates the leading
-//! `rotary_dim` dims of each head with NeoX-style rotate-half rope. Keys and
-//! values are appended to the layer's cache for the current position, then each
-//! query head scores every visible cached key with a `1/sqrt(head_dim)` scale.
-//! A nonzero `sliding_window` masks keys older than the window out of the
-//! softmax before it runs; an all-masked row is impossible because the window
-//! start is clamped to the newest key. GQA lets several query heads read the
-//! same KV head, and the attention output goes through `o_proj` (or phi's
-//! `dense`).
-//!
-//! ## MoE routing
-//!
-//! Sparse layers run the router unit over the normed hidden state, then defer to
-//! `crate::chat::moe::select_experts` for the softmax/top-k/renormalize rule
-//! shared with the other backends. Each selected expert runs its gate, up, and
-//! down projections (Mixtral-style `w1`/`w3`/`w2` by default), with SiLU gating,
-//! and the outputs accumulate into the MLP buffer weighted by the route
-//! probability. The router selection also drives per-expert residency: experts
-//! that leave the top-k are demoted to the disk tier and newly selected ones are
-//! paged in.
-//!
-//! ## Quantization
-//!
-//! Linear matmuls dispatch through the precision operator registry
-//! (`crate::chat::precision`). Without a selected quantization format, each
-//! unit's stored dtype is looked up in `native_ops_for_format` and its
-//! registered gemv runs directly over the mapped bytes. With a selected format,
-//! the first use of a linear unit dequantizes its source bytes to f32, runs the
-//! registered quantize operator, caches the resulting `PrecisionBuffer`, and
-//! drops the source pages; later steps compute from the quantized buffer.
-//! Norms, biases, and the embedding table never take that path. The lm head also
-//! keeps its stored precision because the chunked row sweep is already
-//! memory-optimal for the largest tensor.
-//!
-//! ## Ant residency and prefetch integration
-//!
-//! Residency is owned by `MmapWeightStore` and expressed as a `Tier` per unit.
-//! `apply_tiers` installs an Ant plan (every unit not marked `disk` becomes
-//! resident), while the forward pass itself keeps the transient footprint
-//! small: `drop_disk_units_of_layer` releases each layer's disk-tier pages right
-//! after the layer runs, `forward` drops layer 0 again after the lm head, and
-//! `run_lm_head` drops each row chunk's pages as it sweeps. Dropped pages simply
-//! re-fault from the OS page cache on their next access, so correctness is
-//! independent of the tier state. `page_in_unit`/`evict_unit` expose the same
-//! control for tests and external planners.
+//! - [`DecoderConfig`] — the fully resolved hyper-parameters, produced by
+//!   [`DecoderConfig::resolve`] through the parameter fallback chain
+//!   (config.json → units manifest → registered family constants);
+//! - [`DenseFeatures`] — the declarative per-family deltas over the
+//!   llama-shaped baseline (norm kind, activation, projection naming,
+//!   residual topology, partial rope) that drive the resolution probes;
+//! - [`MoEExpertLayout`] — the sparse expert naming layout;
+//! - the native forward test suite (below), which drives the registration
+//!   files' runtime types against mmap fixtures and reference math.
 
-use super::kernels;
-use super::store::{MmapWeightStore, Tier, WeightDType};
-use crate::chat::precision::{self, PrecisionBuffer};
+use super::store::MmapWeightStore;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Fully resolved decoder hyper-parameters for the CPU forward pass.
 ///
@@ -136,7 +61,7 @@ pub struct DecoderConfig {
     /// `use_sliding_window: false` resolves to.
     pub sliding_window: usize,
     /// Number of experts in every sparse feed-forward block. Zero means the
-    /// model is dense and `forward_mlp` takes the gated/plain MLP path.
+    /// model is dense and the family's dense MLP path runs.
     pub num_local_experts: usize,
     /// Experts routed per token by the sparse router (top-k). Zero means dense;
     /// it is required to be nonzero whenever `num_local_experts` is nonzero,
@@ -152,6 +77,10 @@ pub struct DecoderConfig {
     pub moe_layout: MoEExpertLayout,
     /// Dense-architecture deltas over the llama-shaped baseline (norm kind,
     /// activation, projection naming, residual topology, partial rope).
+    /// Resolution metadata: the forward assemblies read their family's
+    /// constants directly, so this is consumed by the tests (and any
+    /// inspector) rather than by the hot path.
+    #[allow(dead_code)]
     pub features: DenseFeatures,
 }
 
@@ -220,8 +149,8 @@ impl MoEExpertLayout {
 /// qwen3 / mixtral): RMSNorm without weight offset, rotate-half rope over the
 /// full head, SwiGLU MLP over `gate/up/down_proj`, sequential residuals, and
 /// split `q/k/v_proj` projections with an `o_proj` output projection. Every
-/// dense family declares its deltas from this baseline through one struct, so
-/// the forward pass branches on features instead of architecture names.
+/// dense family declares its deltas from this baseline through one struct,
+/// which the config resolution reads to probe the right unit names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenseFeatures {
     /// gemma: RMSNorm output is `x / rms * (1 + weight)` — the affine weight
@@ -331,7 +260,7 @@ impl DecoderConfig {
     pub(crate) fn resolve(
         raw: Option<&Value>,
         store: &MmapWeightStore,
-        family: Option<crate::chat::models::ModelFamily>,
+        family: Option<crate::chat::registry::ModelFamily>,
     ) -> Result<Self, String> {
         // JSON accessors. Each returns `None` for an absent config object, a
         // missing key, or a value of the wrong JSON type, letting `unwrap_or`
@@ -354,7 +283,7 @@ impl DecoderConfig {
         // (rope theta 1e6, epsilon 1e-6, untied head, Mixtral expert naming,
         // baseline dense features). This is the same shape as a family whose
         // config lists no extras.
-        let family = family.unwrap_or(crate::chat::models::ModelFamily {
+        let family = family.unwrap_or(crate::chat::registry::ModelFamily {
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
             tie_word_embeddings: false,
@@ -584,1066 +513,18 @@ fn count_layer_experts(store: &MmapWeightStore, layout: &MoEExpertLayout) -> usi
         .unwrap_or(0)
 }
 
-/// Reusable activation buffers for one decoder.
-///
-/// Buffers are allocated once with their maximum capacity in `with_store` and
-/// then cleared/resized on every use: `Resize` keeps the capacity, so the hot
-/// path does no allocator work. Most values are overwritten wholesale, but
-/// `hidden` is the persistent residual stream across layers and positions.
-///
-/// Slice borrows come from `store` (a field of `DecoderNative`) while
-/// activations live in `scratch` (another field) — the borrow checker accepts
-/// the disjoint paths, which is why the nested struct exists at all.
-struct Scratch {
-    /// Residual stream for the token currently being decoded; length
-    /// `hidden_size`. Seeded from the embedding row and updated by each block.
-    hidden: Vec<f32>,
-    /// Output of the most recent norm (input norm, post-attention norm, or
-    /// phi's shared input norm). Attention and MLP both read this.
-    normed: Vec<f32>,
-    /// Query states after projection, optional q_norm, and rope; flattened as
-    /// `[q_heads * head_dim]`. For phi's fused path it temporarily holds the
-    /// stacked q/k/v rows before they are split.
-    q: Vec<f32>,
-    /// Key states after projection, optional k_norm, and rope, flattened as
-    /// `[kv_heads * head_dim]`. Appended to the layer's KV cache.
-    k: Vec<f32>,
-    /// Value states after projection, flattened as `[kv_heads * head_dim]`.
-    v: Vec<f32>,
-    /// Attention output before the output projection, flattened as
-    /// `[q_heads * head_dim]`. This is the softmax-weighted value mix.
-    attn_out: Vec<f32>,
-    /// Attention output after `o_proj`/`dense` (plus optional bias), length
-    /// `hidden_size`. The caller adds it to the residual stream.
-    attn_projected: Vec<f32>,
-    /// Softmax scores for one query head, length = number of visible cached
-    /// keys. Reused per head; masked entries stay at negative infinity.
-    scores: Vec<f32>,
-    /// Gate projection / fc1 output, length `intermediate_size`. Also holds
-    /// the activated intermediate (`act(gate) * up`) that feeds the down
-    /// projection.
-    gate: Vec<f32>,
-    /// Up projection output, length `intermediate_size`, consumed by the
-    /// gated activation.
-    up: Vec<f32>,
-    /// Feed-forward output of the current block, length `hidden_size`. Also
-    /// the per-expert scratch buffer inside the MoE loop.
-    mlp_out: Vec<f32>,
-    /// MoE accumulator: each selected expert's scaled output lands here
-    /// before swapping into `mlp_out`.
-    mlp_out_weighted: Vec<f32>,
-    /// Router logits for the sparse block, length `num_local_experts`; turned
-    /// into a softmax top-k selection by `select_experts`.
-    router: Vec<f32>,
-    /// Final vocabulary logits, length `vocab_size`. `forward` moves this out
-    /// with `mem::take`, leaving an empty vector that is resized next time.
-    logits: Vec<f32>,
-}
-
-/// A native (CPU) decoder bound to one mmap-backed weight store.
-///
-/// The decoder owns no weights of its own: `store` is an `Arc` shared by every
-/// clone, and all parameter access goes through unit ids resolved at call time.
-/// What it does own is the mutable generation state — the KV cache, reusable
-/// activation scratch, the expert residency bookkeeping, and the quantized
-/// linear buffers. Construction preallocates all activation capacity, so a
-/// forward pass performs no per-token allocation beyond the returned logits.
-pub struct DecoderNative {
-    /// Resolved hyper-parameters; `pub(super)` so the native module's tests
-    /// and sibling code can inspect without exposing it crate-wide.
-    pub(super) cfg: DecoderConfig,
-    /// Shared handle to the mapped weight store. Clones share the same
-    /// mapping, so cloning a decoder does not duplicate weight pages.
-    store: Arc<MmapWeightStore>,
-    /// Per-layer key cache, flattened as
-    /// [position * kv_heads * head_dim + head * head_dim + dim].
-    kv_k: Vec<Vec<f32>>,
-    /// Per-layer value cache with the same layout as `kv_k`.
-    kv_v: Vec<Vec<f32>>,
-    /// Reusable activation buffers (residual stream, projections, scores).
-    scratch: Scratch,
-    /// Test hook: capture layer-0's attention o_proj output (pre-residual).
-    debug_capture_layer0_attn: bool,
-    /// Filled by layer 0 when the debug hook is armed, then taken by the test
-    /// helper. `None` during normal generation, so it costs nothing.
-    debug_capture_buf: Option<DebugCapture>,
-    /// Scratch copy of head-0 scores used by the debug capture.
-    head0_scores: Vec<f32>,
-    /// Query states captured before rope (only written while the debug flag is
-    /// set).
-    q_raw_capture: Vec<f32>,
-    /// Key states captured before rope (only written while the debug flag is
-    /// set).
-    k_raw_capture: Vec<f32>,
-    /// Layer-0 input norm output captured for the debug comparison.
-    normed_capture: Vec<f32>,
-    /// RC2-B: routing-aware per-expert residency, keyed by
-    /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
-    /// router's top-k selections while a generation walks the layers.
-    expert_residency: HashMap<(usize, usize), bool>,
-    /// Selected quantization (precision registry): linear units quantize at
-    /// first use and compute from the quantized buffer.
-    quant: QuantState,
-}
-
-/// The selected quantization format's native operators (from the precision
-/// registry) plus the quantized unit buffers it has produced. `None`-free
-/// design: without a selected format both operators stay `None` and every
-/// unit keeps its stored precision.
-///
-/// The two function pointers are the format's own entry points: `quantize`
-/// converts an f32 value vector into the format's packed buffer, and `gemv`
-/// computes a matvec over that packed representation. They travel together
-/// because a format that can compute cannot be useful without the ability to
-/// produce its buffer in the first place.
-struct QuantState {
-    /// Registered quantizer: (values, rows, cols) -> packed buffer. `None`
-    /// when no quantization format is selected.
-    quantize: Option<fn(&[f32], usize, usize) -> Result<Arc<dyn PrecisionBuffer>, String>>,
-    /// Registered quantized matvec: (packed bytes, rows, cols, x, y). `None`
-    /// when no quantization format is selected.
-    gemv: Option<fn(&[u8], usize, usize, &[f32], &mut [f32])>,
-    /// Quantized linear units, keyed by unit id: first use quantizes the
-    /// source unit through the registered operator and drops its source
-    /// pages; later steps compute from the quantized buffer.
-    buffers: HashMap<String, Arc<dyn PrecisionBuffer>>,
-}
-
-/// Lazy per-unit quantization and the matvec dispatch used by every linear
-/// projection.
-impl QuantState {
-    /// The selected quantization format's native operator table (precision
-    /// registry), or an inert state when no format is selected / the format
-    /// does not serve the native backend.
-    fn selected() -> Self {
-        // `selected_native_ops` is `Option`: no selection (or a format that
-        // has no native kernels) yields `None`, which leaves both operator
-        // slots empty and makes `gemv_linear` use stored-precision paths.
-        let ops = precision::selected_native_ops();
-        Self {
-            quantize: ops.and_then(|ops| ops.quantize),
-            gemv: ops.map(|ops| ops.gemv),
-            buffers: HashMap::new(),
-        }
-    }
-
-    /// Compute one linear layer `y = W * x` for the named unit.
-    ///
-    /// Three paths, checked in this order:
-    /// 1. the unit was already quantized: run the registered quantized gemv
-    ///    over the cached buffer;
-    /// 2. a quantization format is selected: dequantize the source bytes to
-    ///    f32 once, quantize them, drop the source pages, then gemv;
-    /// 3. no format: look up the native operator table for the unit's stored
-    ///    dtype and run its gemv directly over the mapped bytes.
-    ///
-    /// `rows`/`cols` are the logical shape of W (row-major) and must match
-    /// both the buffer and the destination length (`y.len() == rows`).
-    fn gemv_linear(
-        &mut self,
-        store: &MmapWeightStore,
-        unit: &str,
-        rows: usize,
-        cols: usize,
-        x: &[f32],
-        y: &mut [f32],
-    ) -> Result<(), String> {
-        // Fast path: this unit has already been quantized at least once. The
-        // buffer owns its shape, so the caller's `rows`/`cols` are not used to
-        // compute — they only describe the expected logical shape.
-        if let Some(buffer) = self.buffers.get(unit) {
-            let gemv = self
-                .gemv
-                .expect("quantized unit present without a registered gemv operator");
-            (gemv)(buffer.buffer(), buffer.rows(), buffer.cols(), x, y);
-            return Ok(());
-        }
-        if let (Some(quantize), Some(gemv)) = (self.quantize, self.gemv) {
-            // Lazy load-time quantization: dequantize the source unit to f32
-            // values once, run the registered quantize operator, and release
-            // the source pages — the unit computes from the quantized buffer
-            // (roughly half the footprint) from then on. Norms, biases and
-            // the embedding never reach this path.
-            let (bytes, dtype, _) = store.slice(unit)?;
-            let count = rows
-                .checked_mul(cols)
-                .ok_or_else(|| format!("Linear unit '{unit}' size overflow."))?;
-            if bytes.len() != count * dtype.element_size() {
-                return Err(format!(
-                    "Linear unit '{unit}' does not match its {rows}x{cols} shape."
-                ));
-            }
-            let values = kernels::dequant_values(bytes, dtype, count);
-            let buffer = quantize(&values, rows, cols)?;
-            self.buffers.insert(unit.to_owned(), buffer);
-            // The source bytes are never read again once quantized.
-            store.drop_pages(unit);
-            let buffer = self
-                .buffers
-                .get(unit)
-                .expect("quantized buffer was just inserted");
-            (gemv)(buffer.buffer(), buffer.rows(), buffer.cols(), x, y);
-            return Ok(());
-        }
-        let (bytes, dtype, _) = store.slice(unit)?;
-        let format_id = dtype.format_id();
-        let ops = precision::native_ops_for_format(format_id).ok_or_else(|| {
-            format!(
-                "Weight precision '{format_id}' ({}) has no native operator table for unit '{unit}'.",
-                precision::format_label(format_id)
-            )
-        })?;
-        (ops.gemv)(bytes, rows, cols, x, y);
-        Ok(())
-    }
-}
-
-/// Stage-wise debug capture of layer 0 at the last input position.
-/// Test instrumentation only; individual stages are consumed by the
-/// native attention capture tests.
-#[allow(dead_code)]
-pub struct DebugCapture {
-    /// Input layernorm output feeding q/k/v.
-    pub normed: Vec<f32>,
-    /// Query states after projection+bias, BEFORE rope.
-    pub q_raw: Vec<f32>,
-    /// Key states after projection+bias, BEFORE rope.
-    pub k_raw: Vec<f32>,
-    /// Query states after rope, flattened [q_heads * head_dim].
-    pub q: Vec<f32>,
-    /// Key states after rope, flattened [kv_heads * head_dim].
-    pub k: Vec<f32>,
-    /// Softmax scores of query head 0 over all cached keys.
-    pub scores: Vec<f32>,
-    /// Attention output before o_proj, flattened [q_heads * head_dim].
-    pub attn_out: Vec<f32>,
-}
-
-impl Clone for DecoderNative {
-    fn clone(&self) -> Self {
-        // Weights are shared through the Arc'd store; only a fresh KV cache is
-        // created (the engine clears the cache before every generation anyway).
-        Self::with_store(self.cfg.clone(), Arc::clone(&self.store))
-    }
-}
-
-impl DecoderNative {
-    pub fn with_store(cfg: DecoderConfig, store: Arc<MmapWeightStore>) -> Self {
-        let kv_dim = cfg.kv_heads * cfg.head_dim;
-        Self {
-            kv_k: vec![Vec::new(); cfg.num_layers],
-            kv_v: vec![Vec::new(); cfg.num_layers],
-            scratch: Scratch {
-                router: Vec::new(),
-                hidden: Vec::with_capacity(cfg.hidden_size),
-                normed: Vec::with_capacity(cfg.hidden_size),
-                q: Vec::with_capacity(cfg.q_heads * cfg.head_dim),
-                k: Vec::with_capacity(kv_dim),
-                v: Vec::with_capacity(kv_dim),
-                attn_out: Vec::with_capacity(cfg.q_heads * cfg.head_dim),
-                attn_projected: Vec::with_capacity(cfg.hidden_size),
-                scores: Vec::with_capacity(4096),
-                gate: Vec::with_capacity(cfg.intermediate_size),
-                up: Vec::with_capacity(cfg.intermediate_size),
-                mlp_out: Vec::with_capacity(cfg.hidden_size),
-                mlp_out_weighted: Vec::with_capacity(cfg.hidden_size),
-                logits: Vec::with_capacity(cfg.vocab_size),
-            },
-            cfg,
-            store,
-            debug_capture_layer0_attn: false,
-            debug_capture_buf: None,
-            head0_scores: Vec::new(),
-            q_raw_capture: Vec::new(),
-            k_raw_capture: Vec::new(),
-            normed_capture: Vec::new(),
-            expert_residency: HashMap::new(),
-            quant: QuantState::selected(),
-        }
-    }
-
-    pub fn clear_kv(&mut self) {
-        for cache in self.kv_k.iter_mut().chain(self.kv_v.iter_mut()) {
-            cache.clear();
-        }
-    }
-
-    /// Run the full forward for tokens starting at `offset`; returns the logits
-    /// of the final position only (matching the engine's sampling contract).
-    pub fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
-        if tokens.is_empty() {
-            return Err("Native backend: empty token input.".into());
-        }
-        for &token in tokens {
-            if (token as usize) >= self.cfg.vocab_size {
-                return Err(format!(
-                    "Native backend: token id {token} exceeds the vocabulary size {}.",
-                    self.cfg.vocab_size
-                ));
-            }
-        }
-        for (index, &token) in tokens.iter().enumerate() {
-            self.forward_position(token as usize, offset + index)?;
-        }
-        self.run_lm_head()?;
-        // Ant: layer 0's bucket also holds the embedding / final norm, whose
-        // pages lm_head just swept; drop the disk-tier ones now. The pages
-        // re-fault (from the OS page cache) on their next access.
-        self.store.drop_disk_units_of_layer(0);
-        Ok(std::mem::take(&mut self.scratch.logits))
-    }
-
-    fn forward_position(&mut self, token: usize, position: usize) -> Result<(), String> {
-        self.scratch.hidden.clear();
-        {
-            let (bytes, dtype, shape) = self
-                .store
-                .slice("model.embed_tokens.weight")
-                .map_err(|error| format!("Native backend: {error}"))?;
-            if shape.len() != 2 || shape[1] != self.cfg.hidden_size {
-                return Err("Native backend: unexpected embedding shape.".into());
-            }
-            let base = token * self.cfg.hidden_size;
-            self.scratch.hidden.extend(
-                (0..self.cfg.hidden_size)
-                    .map(|index| kernels::scalar_at(bytes, base + index, dtype)),
-            );
-            // gemma scales the embedding output by sqrt(hidden_size); the
-            // lm_head later reads the same (unscaled) table directly.
-            if self.cfg.features.embedding_scale {
-                let scale = (self.cfg.hidden_size as f32).sqrt();
-                for value in self.scratch.hidden.iter_mut() {
-                    *value *= scale;
-                }
-            }
-        }
-        for layer in 0..self.cfg.num_layers {
-            self.forward_layer(layer, position)?;
-            // Ant: release this layer's disk-tier pages right away so the
-            // transient footprint stays near one layer, not the whole model.
-            self.store.drop_disk_units_of_layer(layer as i32);
-        }
-        // Final norm: phi's GPT-NeoX heritage names it `final_layernorm`; the
-        // llama-shaped families use `model.norm`. The parallel-residual flag
-        // selects the phi block shape, and the naming travels with it.
-        let final_norm_unit = if self.cfg.features.parallel_residual {
-            "model.final_layernorm"
-        } else {
-            "model.norm"
-        };
-        Self::apply_norm_to(
-            &self.store,
-            &self.cfg.features,
-            self.cfg.rms_eps,
-            final_norm_unit,
-            &mut self.scratch.hidden,
-        )?;
-        Ok(())
-    }
-
-    /// Apply one norm unit (`{unit}.weight`, plus `{unit}.bias` for
-    /// LayerNorm families) to `target`: LayerNorm for phi-shaped families,
-    /// otherwise RMSNorm with the gemma `(1 + weight)` offset when declared.
-    /// An associated function so callers can borrow `self.store` and
-    /// `self.scratch` disjointly.
-    fn apply_norm_to(
-        store: &MmapWeightStore,
-        features: &DenseFeatures,
-        eps: f32,
-        unit: &str,
-        target: &mut [f32],
-    ) -> Result<(), String> {
-        let (weight, dtype, _) = store.slice(&format!("{unit}.weight"))?;
-        match (features.layer_norm, features.norm_weight_offset) {
-            (true, _) => {
-                let (bias, bias_dtype, _) =
-                    store
-                        .slice(&format!("{unit}.bias"))
-                        .unwrap_or((&[], dtype, &[]));
-                kernels::layernorm(target, weight, dtype, bias, bias_dtype, eps);
-            }
-            (false, true) => kernels::rmsnorm_offset(target, weight, dtype, eps),
-            (false, false) => kernels::rmsnorm(target, weight, dtype, eps),
-        }
-        Ok(())
-    }
-
-    fn forward_layer(&mut self, layer: usize, position: usize) -> Result<(), String> {
-        // Copy the config values this fn needs across mutable calls (a
-        // long-lived `&self.cfg` borrow would fight the `&mut self` calls).
-        let features = self.cfg.features;
-        let rms_eps = self.cfg.rms_eps;
-        let prefix = format!("model.layers.{layer}.");
-
-        // Input norm: the attention reads it, and phi's parallel residual
-        // feeds the MLP from the same normed state.
-        self.scratch.normed.clear();
-        self.scratch.normed.extend_from_slice(&self.scratch.hidden);
-        Self::apply_norm_to(
-            &self.store,
-            &features,
-            rms_eps,
-            &format!("{prefix}input_layernorm"),
-            &mut self.scratch.normed,
-        )?;
-        if self.debug_capture_layer0_attn && layer == 0 {
-            self.normed_capture = self.scratch.normed.clone();
-        }
-
-        self.forward_attention(&prefix, layer, position)?;
-
-        if features.parallel_residual {
-            // phi: attention and MLP share the input norm; the residual is
-            // `x + attn_out + mlp_out` — one update, no post-attention norm.
-            self.forward_mlp(&prefix, layer)?;
-            let mlp_out = std::mem::take(&mut self.scratch.mlp_out);
-            for ((residual, attn), mlp) in self
-                .scratch
-                .hidden
-                .iter_mut()
-                .zip(self.scratch.attn_projected.iter())
-                .zip(mlp_out.iter())
-            {
-                *residual += attn + mlp;
-            }
-        } else {
-            for (value, residual) in self
-                .scratch
-                .attn_projected
-                .iter()
-                .zip(self.scratch.hidden.iter_mut())
-            {
-                *residual += *value;
-            }
-
-            // --- MLP block ---
-            self.scratch.normed.clear();
-            self.scratch.normed.extend_from_slice(&self.scratch.hidden);
-            Self::apply_norm_to(
-                &self.store,
-                &features,
-                rms_eps,
-                &format!("{prefix}post_attention_layernorm"),
-                &mut self.scratch.normed,
-            )?;
-            self.forward_mlp(&prefix, layer)?;
-            let mlp_out = std::mem::take(&mut self.scratch.mlp_out);
-            for (value, residual) in mlp_out.iter().zip(self.scratch.hidden.iter_mut()) {
-                *residual += value;
-            }
-        }
-        Ok(())
-    }
-
-    /// Attention block over `scratch.normed`, written to
-    /// `scratch.attn_projected` (the caller owns the residual add). Handles
-    /// the family deltas: fused `qkv_proj` + `dense` output naming (phi),
-    /// partial rotary (phi), and family-optional q/k/v/o biases.
-    fn forward_attention(
-        &mut self,
-        prefix: &str,
-        layer: usize,
-        position: usize,
-    ) -> Result<(), String> {
-        let cfg = &self.cfg;
-
-        if cfg.features.fused_qkv {
-            // phi: one `qkv_proj` unit stacks q/k/v rows; split after the
-            // projection (+ fused bias).
-            let (qkv_bias, qkv_bias_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.qkv_proj.bias"))
-                .unwrap_or((&[], WeightDType::F32, &[]));
-            let fused_rows = (cfg.q_heads + 2 * cfg.kv_heads) * cfg.head_dim;
-            self.scratch.q.clear();
-            self.scratch.q.resize(fused_rows, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &format!("{prefix}self_attn.qkv_proj.weight"),
-                fused_rows,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.q,
-            )?;
-            add_bias(&mut self.scratch.q, qkv_bias, qkv_bias_dtype);
-            let q_dim = cfg.q_heads * cfg.head_dim;
-            let kv_dim = cfg.kv_heads * cfg.head_dim;
-            self.scratch.k.clear();
-            self.scratch
-                .k
-                .extend_from_slice(&self.scratch.q[q_dim..q_dim + kv_dim]);
-            self.scratch.v.clear();
-            self.scratch
-                .v
-                .extend_from_slice(&self.scratch.q[q_dim + kv_dim..q_dim + 2 * kv_dim]);
-            self.scratch.q.truncate(q_dim);
-        } else {
-            // Biases are family-optional (qwen2 has them, llama does not).
-            let (q_bias, q_bias_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.q_proj.bias"))
-                .unwrap_or((&[], WeightDType::F32, &[]));
-            let (k_bias, k_bias_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.k_proj.bias"))
-                .unwrap_or((&[], WeightDType::F32, &[]));
-            let (v_bias, v_bias_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}self_attn.v_proj.bias"))
-                .unwrap_or((&[], WeightDType::F32, &[]));
-
-            self.scratch.q.clear();
-            self.scratch.q.resize(cfg.q_heads * cfg.head_dim, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &format!("{prefix}self_attn.q_proj.weight"),
-                cfg.q_heads * cfg.head_dim,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.q,
-            )?;
-            add_bias(&mut self.scratch.q, q_bias, q_bias_dtype);
-            // qwen3-style per-head RMSNorm on q, applied before rope when the
-            // family carries a q_norm unit.
-            if self
-                .store
-                .contains(&format!("{prefix}self_attn.q_norm.weight"))
-            {
-                let (weight, dtype, _) = self
-                    .store
-                    .slice(&format!("{prefix}self_attn.q_norm.weight"))?;
-                for head in 0..cfg.q_heads {
-                    let start = head * cfg.head_dim;
-                    kernels::rmsnorm(
-                        &mut self.scratch.q[start..start + cfg.head_dim],
-                        weight,
-                        dtype,
-                        cfg.rms_eps,
-                    );
-                }
-            }
-            if self.debug_capture_layer0_attn && layer == 0 {
-                self.q_raw_capture = self.scratch.q.clone();
-            }
-            self.scratch.k.clear();
-            self.scratch.k.resize(cfg.kv_heads * cfg.head_dim, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &format!("{prefix}self_attn.k_proj.weight"),
-                cfg.kv_heads * cfg.head_dim,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.k,
-            )?;
-            add_bias(&mut self.scratch.k, k_bias, k_bias_dtype);
-            if self
-                .store
-                .contains(&format!("{prefix}self_attn.k_norm.weight"))
-            {
-                let (weight, dtype, _) = self
-                    .store
-                    .slice(&format!("{prefix}self_attn.k_norm.weight"))?;
-                for head in 0..cfg.kv_heads {
-                    let start = head * cfg.head_dim;
-                    kernels::rmsnorm(
-                        &mut self.scratch.k[start..start + cfg.head_dim],
-                        weight,
-                        dtype,
-                        cfg.rms_eps,
-                    );
-                }
-            }
-            if self.debug_capture_layer0_attn && layer == 0 {
-                self.k_raw_capture = self.scratch.k.clone();
-            }
-            self.scratch.v.clear();
-            self.scratch.v.resize(cfg.kv_heads * cfg.head_dim, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &format!("{prefix}self_attn.v_proj.weight"),
-                cfg.kv_heads * cfg.head_dim,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.v,
-            )?;
-            add_bias(&mut self.scratch.v, v_bias, v_bias_dtype);
-        }
-
-        // Rope over the leading `rotary_dim` dims of each head: head_dim for
-        // the full-rotation families, the partial share for phi (remaining
-        // dims pass through untouched).
-        let rotary_dim = cfg.rotary_dim;
-        for head in 0..cfg.q_heads {
-            let start = head * cfg.head_dim;
-            kernels::rope_in_place(
-                &mut self.scratch.q[start..start + rotary_dim],
-                1,
-                rotary_dim,
-                position,
-                cfg.rope_theta,
-            );
-        }
-        for head in 0..cfg.kv_heads {
-            let start = head * cfg.head_dim;
-            kernels::rope_in_place(
-                &mut self.scratch.k[start..start + rotary_dim],
-                1,
-                rotary_dim,
-                position,
-                cfg.rope_theta,
-            );
-        }
-
-        // Append K/V to the cache for this position.
-        let kv_dim = cfg.kv_heads * cfg.head_dim;
-        self.kv_k[layer].extend_from_slice(&self.scratch.k);
-        self.kv_v[layer].extend_from_slice(&self.scratch.v);
-        let cache_len = self.kv_k[layer].len() / kv_dim;
-
-        // Attention: GQA — every q_heads/kv_heads query heads share one kv head.
-        let head_group = cfg.q_heads / cfg.kv_heads;
-        self.scratch.attn_out.clear();
-        self.scratch
-            .attn_out
-            .resize(cfg.q_heads * cfg.head_dim, 0.0);
-        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-        // Sparse (sliding-window) attention: the query at `position` only sees
-        // keys from `end - window` onward (`end` is one past this position),
-        // matching the Vulkan attention shader. window == 0 attends to the
-        // whole cache.
-        let window_start = if cfg.sliding_window == 0 {
-            0
-        } else {
-            (position + 1).saturating_sub(cfg.sliding_window)
-        };
-        // Never start past the cache: an all-masked softmax would be NaN.
-        let window_start = window_start.min(cache_len.saturating_sub(1));
-        for head in 0..cfg.q_heads {
-            let kv_head = head / head_group;
-            let q_base = head * cfg.head_dim;
-            let kv_base = kv_head * cfg.head_dim;
-            self.scratch.scores.clear();
-            self.scratch.scores.resize(cache_len, f32::NEG_INFINITY);
-            for pos in window_start..cache_len {
-                let k_base = pos * kv_dim + kv_base;
-                let score: f32 = self.kv_k[layer][k_base..k_base + cfg.head_dim]
-                    .iter()
-                    .zip(&self.scratch.q[q_base..q_base + cfg.head_dim])
-                    .map(|(k, q)| k * q)
-                    .sum();
-                self.scratch.scores[pos] = score * scale;
-            }
-            kernels::softmax(&mut self.scratch.scores);
-            if head == 0 && self.debug_capture_layer0_attn {
-                self.head0_scores = self.scratch.scores.clone();
-            }
-            for pos in window_start..cache_len {
-                let weight = self.scratch.scores[pos];
-                if weight == 0.0 {
-                    continue;
-                }
-                let v_base = pos * kv_dim + kv_base;
-                for (index, out) in self.scratch.attn_out[q_base..q_base + cfg.head_dim]
-                    .iter_mut()
-                    .enumerate()
-                {
-                    *out += weight * self.kv_v[layer][v_base + index];
-                }
-            }
-        }
-
-        // Output projection: phi names it `dense`, the llama-shaped families
-        // `o_proj`. The bias is family-optional (qwen2 carries one on o_proj,
-        // llama / gemma do not) — an absent unit skips the add.
-        self.scratch.attn_projected.clear();
-        self.scratch.attn_projected.resize(cfg.hidden_size, 0.0);
-        let output_unit = if cfg.features.fused_qkv {
-            format!("{prefix}self_attn.dense")
-        } else {
-            format!("{prefix}self_attn.o_proj")
-        };
-        let (o_bias, o_bias_dtype, _) = self
-            .store
-            .slice(&format!("{output_unit}.bias"))
-            .unwrap_or((&[], WeightDType::F32, &[]));
-        self.quant.gemv_linear(
-            &self.store,
-            &format!("{output_unit}.weight"),
-            cfg.hidden_size,
-            cfg.q_heads * cfg.head_dim,
-            &self.scratch.attn_out,
-            &mut self.scratch.attn_projected,
-        )?;
-        add_bias(&mut self.scratch.attn_projected, o_bias, o_bias_dtype);
-        if self.debug_capture_layer0_attn && layer == 0 {
-            self.debug_capture_layer0_attn = false;
-            self.debug_capture_buf = Some(DebugCapture {
-                normed: self.normed_capture.clone(),
-                q_raw: self.q_raw_capture.clone(),
-                k_raw: self.k_raw_capture.clone(),
-                q: self.scratch.q.clone(),
-                k: self.scratch.k.clone(),
-                scores: self.head0_scores.clone(),
-                attn_out: self.scratch.attn_out.clone(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Feed-forward dispatch over `scratch.normed`, written to
-    /// `scratch.mlp_out` — the caller owns the residual add, so phi's parallel
-    /// path can sum attention and MLP outputs in one update.
-    fn forward_mlp(&mut self, prefix: &str, layer: usize) -> Result<(), String> {
-        let cfg = &self.cfg;
-        // Dense vs MoE branch: detected by expert counts from config.
-        // This runtime check is negligible overhead and enables clean code paths
-        // for both architectures without compile-time specialization.
-        if cfg.num_local_experts > 0 && cfg.num_experts_per_tok > 0 {
-            self.forward_moe_block(prefix, layer)
-        } else {
-            self.forward_dense_mlp(prefix)
-        }
-    }
-
-    /// Forward pass for MoE blocks: router selection + top-k expert computation,
-    /// each selected expert's output accumulated into `scratch.mlp_out`,
-    /// weighted by its route weight.
-    fn forward_moe_block(&mut self, prefix: &str, layer: usize) -> Result<(), String> {
-        let cfg = &self.cfg;
-
-        // Router: compute expert scores from normalized hidden states
-        self.scratch.router.clear();
-        self.scratch.router.resize(cfg.num_local_experts, 0.0);
-        self.quant.gemv_linear(
-            &self.store,
-            &cfg.moe_layout.router_unit(prefix),
-            cfg.num_local_experts,
-            cfg.hidden_size,
-            &self.scratch.normed,
-            &mut self.scratch.router,
-        )?;
-
-        // Router selection: softmax over the router logits, top-k by score,
-        // selected weights renormalized to one — the shared routing rule every
-        // backend uses (`chat::moe::select_experts`).
-        let num_experts_per_tok = cfg.num_experts_per_tok.min(cfg.num_local_experts);
-        let selected = crate::chat::moe::select_experts(&self.scratch.router, num_experts_per_tok)?;
-        let picked: Vec<usize> = selected.iter().map(|(expert, _)| *expert).collect();
-
-        // RC2-B: routing-aware per-expert residency management. Evict unused experts,
-        // page in newly selected ones. State keyed by (layer, expert) persists across positions.
-        for expert in 0..cfg.num_local_experts {
-            let key = (layer, expert);
-            let was_resident = self.expert_residency.get(&key).copied().unwrap_or(false);
-            if was_resident && !picked.contains(&expert) {
-                self.set_expert_resident(layer, expert, false);
-                self.expert_residency.insert(key, false);
-            }
-        }
-        for &expert in &picked {
-            let key = (layer, expert);
-            if !self.expert_residency.get(&key).copied().unwrap_or(false) {
-                self.set_expert_resident(layer, expert, true);
-                self.expert_residency.insert(key, true);
-            }
-        }
-
-        // Compute selected experts: gate*up activation, then down projection,
-        // scaled by the router's mixing weight for this token. The weighted
-        // accumulator starts at zero every call (it swaps into `mlp_out` at
-        // the end).
-        self.scratch.mlp_out_weighted.clear();
-        self.scratch.mlp_out_weighted.resize(cfg.hidden_size, 0.0);
-        for (expert, route_weight) in selected {
-            let gate_unit = cfg
-                .moe_layout
-                .expert_unit(prefix, expert, cfg.moe_layout.gate);
-            let up_unit = cfg
-                .moe_layout
-                .expert_unit(prefix, expert, cfg.moe_layout.up);
-            let down_unit = cfg
-                .moe_layout
-                .expert_unit(prefix, expert, cfg.moe_layout.down);
-
-            self.scratch.gate.clear();
-            self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &gate_unit,
-                cfg.intermediate_size,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.gate,
-            )?;
-
-            self.scratch.up.clear();
-            self.scratch.up.resize(cfg.intermediate_size, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &up_unit,
-                cfg.intermediate_size,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.up,
-            )?;
-
-            kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
-
-            self.scratch.mlp_out.clear();
-            self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &down_unit,
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                &self.scratch.gate,
-                &mut self.scratch.mlp_out,
-            )?;
-
-            // Accumulate this expert's output, weighted by the router's
-            // probability for the token; the caller owns the residual add.
-            for (value, out) in self
-                .scratch
-                .mlp_out
-                .iter()
-                .zip(self.scratch.mlp_out_weighted.iter_mut())
-            {
-                *out += value * route_weight;
-            }
-        }
-        std::mem::swap(
-            &mut self.scratch.mlp_out,
-            &mut self.scratch.mlp_out_weighted,
-        );
-        Ok(())
-    }
-
-    /// Dense feed-forward over `scratch.normed`, written to `scratch.mlp_out`.
-    /// Gated (llama-shaped baseline / gemma): `down(act(gate·x) ⊙ up·x)` with
-    /// `act` = SiLU or the tanh GELU. Plain (phi): `fc2(gelu(fc1·x + b)) + b`.
-    fn forward_dense_mlp(&mut self, prefix: &str) -> Result<(), String> {
-        let cfg = &self.cfg;
-
-        if cfg.features.fc_mlp {
-            // phi plain MLP: fc1 (hidden -> intermediate) with bias, tanh
-            // GELU, fc2 (intermediate -> hidden) with bias.
-            let (fc1_bias, fc1_bias_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}mlp.fc1.bias"))
-                .unwrap_or((&[], WeightDType::F32, &[]));
-            self.scratch.gate.clear();
-            self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &format!("{prefix}mlp.fc1.weight"),
-                cfg.intermediate_size,
-                cfg.hidden_size,
-                &self.scratch.normed,
-                &mut self.scratch.gate,
-            )?;
-            add_bias(&mut self.scratch.gate, fc1_bias, fc1_bias_dtype);
-            kernels::gelu(&mut self.scratch.gate);
-
-            let (fc2_bias, fc2_bias_dtype, _) = self
-                .store
-                .slice(&format!("{prefix}mlp.fc2.bias"))
-                .unwrap_or((&[], WeightDType::F32, &[]));
-            self.scratch.mlp_out.clear();
-            self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-            self.quant.gemv_linear(
-                &self.store,
-                &format!("{prefix}mlp.fc2.weight"),
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                &self.scratch.gate,
-                &mut self.scratch.mlp_out,
-            )?;
-            add_bias(&mut self.scratch.mlp_out, fc2_bias, fc2_bias_dtype);
-            return Ok(());
-        }
-
-        // Gate projection
-        self.scratch.gate.clear();
-        self.scratch.gate.resize(cfg.intermediate_size, 0.0);
-        self.quant.gemv_linear(
-            &self.store,
-            &format!("{prefix}mlp.gate_proj.weight"),
-            cfg.intermediate_size,
-            cfg.hidden_size,
-            &self.scratch.normed,
-            &mut self.scratch.gate,
-        )?;
-
-        // Up projection
-        self.scratch.up.clear();
-        self.scratch.up.resize(cfg.intermediate_size, 0.0);
-        self.quant.gemv_linear(
-            &self.store,
-            &format!("{prefix}mlp.up_proj.weight"),
-            cfg.intermediate_size,
-            cfg.hidden_size,
-            &self.scratch.normed,
-            &mut self.scratch.up,
-        )?;
-
-        // SwiGLU (baseline) or GeGLU (gemma) activation: act(gate) ⊙ up
-        if cfg.features.mlp_gelu {
-            kernels::gelu_multiply(&mut self.scratch.gate, &self.scratch.up);
-        } else {
-            kernels::silu_multiply(&mut self.scratch.gate, &self.scratch.up);
-        }
-
-        // Down projection
-        self.scratch.mlp_out.clear();
-        self.scratch.mlp_out.resize(cfg.hidden_size, 0.0);
-        self.quant.gemv_linear(
-            &self.store,
-            &format!("{prefix}mlp.down_proj.weight"),
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            &self.scratch.gate,
-            &mut self.scratch.mlp_out,
-        )?;
-        Ok(())
-    }
-
-    fn run_lm_head(&mut self) -> Result<(), String> {
-        let cfg = &self.cfg;
-        // Tied families reuse the embedding as the head; untied families
-        // (e.g. llama) carry a separate lm_head.weight tensor.
-        let head_unit = if cfg.tie_word_embeddings {
-            "model.embed_tokens.weight"
-        } else {
-            "lm_head.weight"
-        };
-        if !self.store.contains(head_unit) {
-            return Err(format!(
-                "Native backend: neither tied embeddings nor a separate '{head_unit}' tensor are present."
-            ));
-        }
-        let (bytes, dtype, shape) = self
-            .store
-            .slice(head_unit)
-            .map_err(|error| format!("Native backend: {error}"))?;
-        if shape.len() != 2 || shape[1] != cfg.hidden_size {
-            return Err("Native backend: unexpected lm_head shape.".into());
-        }
-        self.scratch.logits.clear();
-        self.scratch.logits.resize(cfg.vocab_size, 0.0);
-        // lm_head keeps its stored precision (the registered quantize formats
-        // cover the layer linear projections, matching the Vulkan executor's
-        // take_linear coverage) — the chunked sweep below is already the
-        // memory-optimal path for the largest unit.
-        let format_id = dtype.format_id();
-        let ops = precision::native_ops_for_format(format_id).ok_or_else(|| {
-            format!(
-                "Weight precision '{format_id}' has no native operator table for '{head_unit}'."
-            )
-        })?;
-        // Ant: sweep the embedding (the largest tensor) in row chunks and
-        // release each chunk's pages right away when it sits on the disk tier,
-        // so the lm_head pass does not transiently hold all 272 MB resident.
-        let chunk_rows = 16384usize;
-        let row_stride = cfg.hidden_size * dtype.element_size();
-        let mut start_row = 0usize;
-        while start_row < cfg.vocab_size {
-            let end_row = (start_row + chunk_rows).min(cfg.vocab_size);
-            let byte_start = start_row * row_stride;
-            let byte_len = (end_row - start_row) * row_stride;
-            (ops.gemv)(
-                &bytes[byte_start..byte_start + byte_len],
-                end_row - start_row,
-                cfg.hidden_size,
-                &self.scratch.hidden,
-                &mut self.scratch.logits[start_row..end_row],
-            );
-            if self.store.tier(head_unit) == Tier::Disk {
-                self.store.drop_range(head_unit, byte_start, byte_len);
-            }
-            start_row = end_row;
-        }
-        Ok(())
-    }
-
-    /// Test helper: stage-wise layer-0 attention capture for the last input
-    /// position, used by the native attention capture test.
-    #[allow(dead_code)]
-    pub fn debug_attention_out(&mut self, tokens: &[u32]) -> Result<DebugCapture, String> {
-        for (index, &token) in tokens.iter().enumerate().take(tokens.len() - 1) {
-            self.forward_position(token as usize, index)?;
-        }
-        let last = tokens.len() - 1;
-        self.debug_capture_layer0_attn = true;
-        self.forward_position(tokens[last] as usize, last)?;
-        self.debug_capture_buf
-            .take()
-            .ok_or_else(|| "Native backend: layer-0 attention capture did not run.".into())
-    }
-
-    /// Apply the Ant residency plan to the mapped pages: resident tiers are
-    /// faulted in, disk tiers are dropped.
-    pub fn apply_tiers(&mut self, plan: &BTreeMap<String, String>) {
-        for unit_id in self.store.unit_ids().map(str::to_owned).collect::<Vec<_>>() {
-            let tier = match plan.get(&unit_id).map(String::as_str) {
-                Some("disk") => Tier::Disk,
-                Some(_) | None => Tier::Resident,
-            };
-            self.store.set_tier(&unit_id, tier);
-        }
-    }
-
-    /// RC2-B: apply one expert's residency transition. The router-selected
-    /// expert's gate/up/down units move together between the resident and disk
-    /// tiers; unit ids the store does not know are ignored.
-    fn set_expert_resident(&self, layer: usize, expert: usize, resident: bool) {
-        let prefix = format!("model.layers.{layer}.");
-        let layout = &self.cfg.moe_layout;
-        let gate_unit = layout.expert_unit(&prefix, expert, layout.gate);
-        let up_unit = layout.expert_unit(&prefix, expert, layout.up);
-        let down_unit = layout.expert_unit(&prefix, expert, layout.down);
-        if resident {
-            self.store.set_tier(&gate_unit, Tier::Resident);
-            self.store.set_tier(&up_unit, Tier::Resident);
-            self.store.set_tier(&down_unit, Tier::Resident);
-        } else {
-            self.store.set_tier(&gate_unit, Tier::Disk);
-            self.store.set_tier(&up_unit, Tier::Disk);
-            self.store.set_tier(&down_unit, Tier::Disk);
-        }
-    }
-
-    pub fn page_in_unit(&mut self, unit_id: &str) -> bool {
-        if self.store.unit_ids().any(|id| id == unit_id) {
-            self.store.set_tier(unit_id, Tier::Resident);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn evict_unit(&mut self, unit_id: &str) -> bool {
-        if self.store.unit_ids().any(|id| id == unit_id) {
-            self.store.set_tier(unit_id, Tier::Disk);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn add_bias(values: &mut [f32], bias_bytes: &[u8], dtype: WeightDType) {
-    if bias_bytes.is_empty() {
-        return; // families without attention biases (e.g. llama)
-    }
-    for (value, index) in values.iter_mut().zip(0..) {
-        *value += kernels::scalar_at(bias_bytes, index, dtype);
-    }
-}
-
 #[cfg(test)]
 mod forward_tests {
     use super::*;
     use crate::ant::CHEETAH_UNITS_FILENAME;
+    use crate::chat::gemma_registration::GemmaNative;
+    use crate::chat::llama_registration::LlamaNative;
+    use crate::chat::mixtral_registration::MixtralNative;
+    use crate::chat::native::ops;
+    use crate::chat::native::store::Tier;
+    use crate::chat::phi_registration::PhiNative;
+    use crate::chat::registry::ModelForward;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Feed-forward flavor of the fixture model.
@@ -1951,7 +832,7 @@ mod forward_tests {
     }
 
     fn logits_of(cfg: DecoderConfig, store: &Arc<MmapWeightStore>, tokens: &[u32]) -> Vec<f32> {
-        let mut decoder = DecoderNative::with_store(cfg, Arc::clone(store));
+        let mut decoder = LlamaNative::with_store(cfg, Arc::clone(store));
         decoder.forward(tokens, 0).unwrap()
     }
 
@@ -1961,23 +842,23 @@ mod forward_tests {
     #[test]
     fn dense_forward_is_parity_clean_across_residency_transitions() {
         let fixture = Fixture::new("dense_residency", FeedForward::Dense, false);
-        let mut decoder = DecoderNative::with_store(dense_config(0), Arc::clone(&fixture.store));
+        let mut decoder = LlamaNative::with_store(dense_config(0), Arc::clone(&fixture.store));
         let tokens: Vec<u32> = vec![3];
         let logits_first = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first.len(), 32);
         assert!(logits_first.iter().all(|value| value.is_finite()));
 
         for unit in &fixture.unit_ids {
-            decoder.evict_unit(unit);
+            decoder.ctx.evict_unit(unit);
         }
-        decoder.clear_kv();
+        decoder.clear_cache();
         let logits_evicted = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first, logits_evicted);
 
         for unit in &fixture.unit_ids {
-            decoder.page_in_unit(unit);
+            decoder.ctx.page_in_unit(unit);
         }
-        decoder.clear_kv();
+        decoder.clear_cache();
         let logits_paged_in = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first, logits_paged_in);
     }
@@ -2000,16 +881,17 @@ mod forward_tests {
         // this test (same pattern as the Vulkan q8 forward test).
         unsafe { std::env::set_var("CHEETAH_QUANT_Q8", "1") };
         let fixture = Fixture::new("native_q8_forward", FeedForward::Dense, false);
-        let mut decoder = DecoderNative::with_store(dense_config(0), Arc::clone(&fixture.store));
+        let mut decoder = LlamaNative::with_store(dense_config(0), Arc::clone(&fixture.store));
         let tokens: Vec<u32> = vec![3];
         let logits_first = decoder.forward(&tokens, 0).unwrap();
         assert!(logits_first.iter().all(|value| value.is_finite()));
         assert!(
-            !decoder.quant.buffers.is_empty(),
+            !decoder.ctx.quant.buffers.is_empty(),
             "linear units must quantize at first use"
         );
         assert!(
             !decoder
+                .ctx
                 .quant
                 .buffers
                 .contains_key("model.embed_tokens.weight"),
@@ -2018,15 +900,15 @@ mod forward_tests {
         // Deterministic across evict -> page-in: the quantized buffers are
         // owned; tier transitions only touch the source pages.
         for unit in &fixture.unit_ids {
-            decoder.evict_unit(unit);
+            decoder.ctx.evict_unit(unit);
         }
-        decoder.clear_kv();
+        decoder.clear_cache();
         let logits_evicted = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first, logits_evicted);
         for unit in &fixture.unit_ids {
-            decoder.page_in_unit(unit);
+            decoder.ctx.page_in_unit(unit);
         }
-        decoder.clear_kv();
+        decoder.clear_cache();
         let logits_paged_in = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first, logits_paged_in);
         // SAFETY: restoring the process env after the opt-in test.
@@ -2039,24 +921,24 @@ mod forward_tests {
     #[test]
     fn moe_forward_is_parity_clean_across_residency_transitions() {
         let fixture = Fixture::new("moe_residency_parity", FeedForward::SparseMoE, false);
-        let mut decoder = DecoderNative::with_store(moe_config(2), Arc::clone(&fixture.store));
+        let mut decoder = MixtralNative::with_store(moe_config(2), Arc::clone(&fixture.store));
         let tokens: Vec<u32> = vec![3];
         let logits_first = decoder.forward(&tokens, 0).unwrap();
         assert_eq!(logits_first.len(), 32);
         assert!(logits_first.iter().all(|value| value.is_finite()));
-        assert_eq!(decoder.expert_residency.get(&(0, 0)), Some(&true));
-        assert_eq!(decoder.expert_residency.get(&(0, 1)), Some(&true));
+        assert_eq!(decoder.ctx.expert_residency.get(&(0, 0)), Some(&true));
+        assert_eq!(decoder.ctx.expert_residency.get(&(0, 1)), Some(&true));
 
         for unit in &fixture.unit_ids {
-            decoder.evict_unit(unit);
+            decoder.ctx.evict_unit(unit);
         }
-        decoder.clear_kv();
+        decoder.clear_cache();
         assert_eq!(logits_first, decoder.forward(&tokens, 0).unwrap());
 
         for unit in &fixture.unit_ids {
-            decoder.page_in_unit(unit);
+            decoder.ctx.page_in_unit(unit);
         }
-        decoder.clear_kv();
+        decoder.clear_cache();
         assert_eq!(logits_first, decoder.forward(&tokens, 0).unwrap());
     }
 
@@ -2068,7 +950,7 @@ mod forward_tests {
     fn moe_block_mixes_selected_experts_by_router_weight() {
         let fixture = Fixture::new("moe_block", FeedForward::SparseMoE, true);
         let cfg = moe_config(2);
-        let mut decoder = DecoderNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let mut decoder = MixtralNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
         let input: Vec<f32> = pattern(8, 3.25);
         let base: Vec<f32> = pattern(8, -1.5);
         decoder.scratch.normed.clear();
@@ -2089,7 +971,7 @@ mod forward_tests {
         for expert in 0..cfg.num_local_experts {
             for (column, value) in input.iter().enumerate() {
                 router_logits[expert] +=
-                    kernels::scalar_at(router, expert * 8 + column, router_dtype) * value;
+                    ops::scalar_at(router, expert * 8 + column, router_dtype) * value;
             }
         }
         let max = router_logits
@@ -2207,13 +1089,13 @@ mod forward_tests {
     #[test]
     fn moe_router_drives_per_expert_residency_transitions() {
         let fixture = Fixture::new("moe_router_residency", FeedForward::SparseMoE, true);
-        let mut decoder = DecoderNative::with_store(moe_config(1), Arc::clone(&fixture.store));
+        let mut decoder = MixtralNative::with_store(moe_config(1), Arc::clone(&fixture.store));
         let mut token_for_expert: [Option<u32>; 2] = [None, None];
         for token in 0..fixture.unit_ids.len() as u32 {
-            decoder.clear_kv();
+            decoder.clear_cache();
             decoder.forward(&[token], 0).unwrap();
             for expert in 0..2 {
-                if decoder.expert_residency.get(&(0, expert)) == Some(&true) {
+                if decoder.ctx.expert_residency.get(&(0, expert)) == Some(&true) {
                     token_for_expert[expert] = Some(token);
                 }
             }
@@ -2228,27 +1110,27 @@ mod forward_tests {
         let expert0 = layout.expert_unit("model.layers.0.", 0, layout.gate);
         let expert1 = layout.expert_unit("model.layers.0.", 1, layout.gate);
 
-        decoder.clear_kv();
+        decoder.clear_cache();
         decoder.forward(&[token_expert0], 0).unwrap();
-        assert_eq!(decoder.expert_residency.get(&(0, 0)), Some(&true));
+        assert_eq!(decoder.ctx.expert_residency.get(&(0, 0)), Some(&true));
         assert_eq!(fixture.store.tier(&expert0), Tier::Resident);
 
-        decoder.clear_kv();
+        decoder.clear_cache();
         decoder.forward(&[token_expert1], 0).unwrap();
         assert_eq!(
-            decoder.expert_residency.get(&(0, 0)),
+            decoder.ctx.expert_residency.get(&(0, 0)),
             Some(&false),
             "expert 0 must be evicted once the router moves away from it"
         );
-        assert_eq!(decoder.expert_residency.get(&(0, 1)), Some(&true));
+        assert_eq!(decoder.ctx.expert_residency.get(&(0, 1)), Some(&true));
         assert_eq!(fixture.store.tier(&expert0), Tier::Disk);
         assert_eq!(fixture.store.tier(&expert1), Tier::Resident);
 
         // The evicted expert still computes: pages re-fault on read.
-        decoder.clear_kv();
+        decoder.clear_cache();
         let logits = decoder.forward(&[token_expert0], 0).unwrap();
         assert!(logits.iter().all(|value| value.is_finite()));
-        assert_eq!(decoder.expert_residency.get(&(0, 0)), Some(&true));
+        assert_eq!(decoder.ctx.expert_residency.get(&(0, 0)), Some(&true));
     }
 
     /// Sparse attention: a query only attends inside its window. At position 4
@@ -2259,7 +1141,7 @@ mod forward_tests {
         let fixture = Fixture::new("sparse_window", FeedForward::Dense, true);
         let tokens: Vec<u32> = (0..5).collect();
 
-        let mut windowed = DecoderNative::with_store(dense_config(4), Arc::clone(&fixture.store));
+        let mut windowed = LlamaNative::with_store(dense_config(4), Arc::clone(&fixture.store));
         let capture = windowed.debug_attention_out(&tokens).unwrap();
         assert_eq!(capture.scores.len(), tokens.len());
         assert_eq!(capture.scores[0], 0.0, "position 0 sits outside the window");
@@ -2267,7 +1149,7 @@ mod forward_tests {
         let total: f32 = capture.scores.iter().sum();
         assert!((total - 1.0).abs() < 1e-5);
 
-        let mut full = DecoderNative::with_store(dense_config(0), fixture.store.clone());
+        let mut full = LlamaNative::with_store(dense_config(0), fixture.store.clone());
         let capture = full.debug_attention_out(&tokens).unwrap();
         assert!(capture.scores[0] > 0.0, "no window means full attention");
     }
@@ -2555,7 +1437,7 @@ mod forward_tests {
     fn gemma_forward_matches_reference_math() {
         let fixture = Fixture::new("gemma_reference", FeedForward::Dense, true);
         let cfg = gemma_config();
-        let mut decoder = DecoderNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let mut decoder = GemmaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
         let tokens: [u32; 2] = [3, 11];
         let logits = decoder.forward(&tokens, 0).unwrap();
 
@@ -2652,7 +1534,7 @@ mod forward_tests {
     fn phi_forward_matches_reference_math() {
         let fixture = Fixture::phi("phi_reference", true);
         let cfg = phi_config();
-        let mut decoder = DecoderNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let mut decoder = PhiNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
         let tokens: [u32; 2] = [3, 11];
         let logits = decoder.forward(&tokens, 0).unwrap();
 
@@ -2762,7 +1644,7 @@ mod forward_tests {
     #[test]
     fn decoder_config_resolves_dense_family_features() {
         let phi_fixture = Fixture::phi("phi_resolve", true);
-        let family = crate::chat::models::family_for_architecture("phi").unwrap();
+        let family = crate::chat::registry::family_for_architecture("phi").unwrap();
         let raw = serde_json::json!({
             "hidden_size": 8,
             "vocab_size": 32,
@@ -2783,7 +1665,7 @@ mod forward_tests {
         // gemma resolves the offset-norm + embedding-scale deltas with full
         // rope; the config's hidden_act matches the family default.
         let gemma_fixture = Fixture::new("gemma_resolve", FeedForward::Dense, true);
-        let family = crate::chat::models::family_for_architecture("gemma").unwrap();
+        let family = crate::chat::registry::family_for_architecture("gemma").unwrap();
         let raw = serde_json::json!({
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
@@ -2797,7 +1679,7 @@ mod forward_tests {
 
         // mistral stays on the llama-shaped baseline and declares the
         // decoding-time sliding window in its family extras.
-        let family = crate::chat::models::family_for_architecture("mistral").unwrap();
+        let family = crate::chat::registry::family_for_architecture("mistral").unwrap();
         assert_eq!(
             family.features,
             DenseFeatures::default(),

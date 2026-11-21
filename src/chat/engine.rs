@@ -14,7 +14,7 @@
 //! snapshot stored in `cheetah_manifest.json` when the config was not copied
 //! into a prepared directory. Weight shards are discovered from the manifest,
 //! from a Safetensors index, or from a lone `model.safetensors`. Actual
-//! backend construction is delegated to `chat::models`: the native,
+//! backend construction is delegated to `chat::registry`: the native,
 //! mmap-backed CPU backend is preferred when it is registered and enabled,
 //! while non-CPU `CHEETAH_DEVICE` values such as Vulkan route through the
 //! accelerator loader. An Ant residency plan is computed during loading and
@@ -75,7 +75,7 @@
 // and prompt templates), Ant's residency manager, terminal color and progress
 // helpers, the context archive used by the interactive loop, and the shared
 // chat options.
-use super::models::{Device, ModelRuntime};
+use super::registry::{Device, ModelForward};
 use crate::ant::{Ant, AntLayerResidency, AntSettings, AntUnit, ant_swap_fit};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
@@ -226,7 +226,7 @@ fn print_model_info(engine: &Engine) {
         // list, so newly registered native/Vulkan backends show up here.
         println!(
             "  backends:     {}",
-            super::models::registered_backend_names(architecture).join(", ")
+            super::registry::registered_backends(architecture).join(", ")
         );
     }
     println!("  device:       {}", engine.device_name());
@@ -404,7 +404,7 @@ impl ChatParams {
 /// dead-code warnings without affecting layout or behavior.
 struct LoadedModel {
     /// Backend model implementation shared behind the engine mutex.
-    model: Box<dyn ModelRuntime>,
+    model: Box<dyn ModelForward>,
     /// Device selected during backend construction.
     #[allow(dead_code)]
     device: Device,
@@ -437,7 +437,7 @@ pub struct Engine {
     /// Architecture name used for backend and template lookup.
     architecture: Option<String>,
     /// Function that renders `ChatMessage`s into the model's prompt format.
-    prompt_renderer: super::models::PromptRenderer,
+    prompt_renderer: super::registry::PromptRenderer,
     /// Effective context cap: model limit, family cap, and `--ctx-size`
     /// combined.
     max_position_embeddings: usize,
@@ -722,7 +722,7 @@ impl Engine {
             .to_owned();
         // Template lookup doubles as the architecture support check: an
         // unregistered architecture cannot be rendered or loaded.
-        let template = super::models::chat_template_for_architecture(&architecture)
+        let template = super::registry::chat_template_for_architecture(&architecture)
             .ok_or_else(|| format!("Unsupported model architecture '{architecture}'."))?;
 
         // Tokenizer loading is independent of weight loading and fails early
@@ -884,7 +884,7 @@ impl Engine {
             if !resident_tiers.is_empty() {
                 if resident_tiers.contains(&"vram") && device_is_accelerator {
                     let selected = std::env::var("CHEETAH_DEVICE").unwrap_or_else(|_| "cpu".into());
-                    ant_resident_device = Some(super::models::backend_device(&selected)?);
+                    ant_resident_device = Some(super::registry::backend_device(&selected)?);
                 } else if !resident_tiers.contains(&"vram") {
                     ant_resident_device = Some(Device::Cpu);
                     ant_resident_device_is_accelerator = false;
@@ -899,9 +899,9 @@ impl Engine {
         let native_model = if device_is_accelerator || !native_enabled {
             None
         } else {
-            match super::models::backend_loader_for_architecture(&architecture, "native") {
-                Some(super::models::BackendLoader::Native(loader)) => {
-                    let family = super::models::family_for_architecture(&architecture)
+            match super::registry::backend_loader_for_architecture(&architecture, "native") {
+                Some(super::registry::BackendLoader::Native(loader)) => {
+                    let family = super::registry::family_for_architecture(&architecture)
                         .ok_or_else(|| {
                             format!(
                                 "Architecture '{architecture}' registers a native backend without family parameters."
@@ -918,7 +918,7 @@ impl Engine {
         let (device, model) = if let Some((device, model)) = native_model {
             (device, model)
         } else if let Some(resident_device) = ant_resident_device {
-            super::models::load_model_for_device(
+            super::registry::load_model_for_device(
                 &effective_weight_paths,
                 &config_bytes,
                 raw_config.clone(),
@@ -927,7 +927,7 @@ impl Engine {
                 &ant_plan,
             )?
         } else {
-            super::models::load_model(
+            super::registry::load_model(
                 &effective_weight_paths,
                 &config_bytes,
                 raw_config,
@@ -954,7 +954,7 @@ impl Engine {
             }
         }
         let stop_markers = manifest_stop_markers.unwrap_or_else(|| {
-            super::models::stop_markers_for_architecture(&architecture)
+            super::registry::stop_markers_for_architecture(&architecture)
                 .iter()
                 .map(|marker| (*marker).to_owned())
                 .collect()
@@ -964,7 +964,7 @@ impl Engine {
                 eos_token_ids.insert(*id);
             }
         }
-        let family_context_cap = super::models::family_for_architecture(&architecture)
+        let family_context_cap = super::registry::family_for_architecture(&architecture)
             .and_then(|family| family.max_position_embeddings)
             .unwrap_or(usize::MAX);
         Ok(Self {
@@ -1692,7 +1692,7 @@ fn synth_config_from_manifest(
         "architectures".into(),
         serde_json::Value::Array(vec![serde_json::Value::String(model_type.clone())]),
     );
-    let default_max_position_embeddings = super::models::family_for_architecture(&model_type)
+    let default_max_position_embeddings = super::registry::family_for_architecture(&model_type)
         .and_then(|family| family.max_position_embeddings)
         .unwrap_or(DEFAULT_MAX_POSITION_EMBEDDINGS);
     if !synthesized.contains_key("max_position_embeddings") {
@@ -1704,7 +1704,7 @@ fn synth_config_from_manifest(
     // Merge the family's fallback parameters and extra config fields, when
     // registered: family values fill any gap the manifest snapshot does not
     // cover (e.g. manifests written before the snapshot was extended).
-    if let Some(family) = super::models::family_for_architecture(&model_type) {
+    if let Some(family) = super::registry::family_for_architecture(&model_type) {
         if !synthesized.contains_key("rope_theta") {
             synthesized.insert("rope_theta".into(), serde_json::json!(family.rope_theta));
         }
@@ -2154,7 +2154,7 @@ mod tests {
 
     #[test]
     fn renders_qwen_chatml_prompt_with_system_message() {
-        let template = super::super::models::chat_template_for_architecture("qwen2")
+        let template = super::super::registry::chat_template_for_architecture("qwen2")
             .expect("qwen2 chat template");
         let prompt = (template.render)(&[ChatMessage::new("user", "hello")], Some("Be brief."));
         assert!(prompt.starts_with("<|im_start|>system\nBe brief.<|im_end|>\n"));
@@ -2163,7 +2163,7 @@ mod tests {
 
     #[test]
     fn renders_llama_instruction_prompt() {
-        let template = super::super::models::chat_template_for_architecture("llama")
+        let template = super::super::registry::chat_template_for_architecture("llama")
             .expect("llama chat template");
         let prompt = (template.render)(&[ChatMessage::new("user", "hello")], Some("Be brief."));
         assert!(prompt.contains("<<SYS>>\nBe brief.\n<</SYS>>"));
@@ -2172,7 +2172,7 @@ mod tests {
 
     #[test]
     fn renders_mistral_instruction_prompt() {
-        let template = super::super::models::chat_template_for_architecture("MistralForCausalLM")
+        let template = super::super::registry::chat_template_for_architecture("MistralForCausalLM")
             .expect("mistral chat template");
         let prompt = (template.render)(
             &[
@@ -2187,7 +2187,7 @@ mod tests {
 
     #[test]
     fn renders_llama3_header_prompt() {
-        let template = super::super::models::chat_template_for_architecture("llama")
+        let template = super::super::registry::chat_template_for_architecture("llama")
             .expect("llama chat template");
         let prompt = (template.header_renderer.unwrap())(
             &[ChatMessage::new("user", "hello")],

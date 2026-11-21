@@ -20,6 +20,11 @@ struct RegistrySpec {
     out_file: &'static str,
     /// The registration struct type the generated `REGISTRY` points to.
     type_name: &'static str,
+    /// Suffix appended to the generated module name for each registration
+    /// file (`llama.rs` → `mod llama_registration;`). An empty suffix gives
+    /// the file's plain stem (precision formats declare their operators and
+    /// their registration in one file under their own name).
+    module_suffix: &'static str,
     /// Where the runtime implementations for these registrations live (docs
     /// comment in the generated file).
     implementation_note: &'static str,
@@ -29,18 +34,20 @@ struct RegistrySpec {
 }
 
 const MODEL_REGISTRY: RegistrySpec = RegistrySpec {
-    source: "src/chat/models/registrations",
+    source: "src/chat/registrations",
     out_file: "model_registry.rs",
     type_name: "ModelRegistration",
-    implementation_note: "sibling modules of src/chat/models",
+    module_suffix: "_registration",
+    implementation_note: "the chat module tree (the registration file itself hosts the family's runtime)",
     index: Some(("ALL_ARCHITECTURES", "ARCHITECTURES")),
 };
 
 const PRECISION_REGISTRY: RegistrySpec = RegistrySpec {
-    source: "src/chat/precision/registrations",
+    source: "src/chat/precision",
     out_file: "precision_registry.rs",
     type_name: "PrecisionRegistration",
-    implementation_note: "sibling modules of src/chat/precision",
+    module_suffix: "",
+    implementation_note: "this same module (each format file declares its operators and its registration)",
     index: None,
 };
 
@@ -57,10 +64,9 @@ fn main() {
     println!("cargo:rerun-if-changed=matmul_q8.comp");
     println!("cargo:rerun-if-changed=matmul_q4.comp");
     println!("cargo:rerun-if-changed=shared_ops.comp");
-    println!("cargo:rerun-if-changed=src/chat/models");
-    println!("cargo:rerun-if-changed=src/chat/models/registrations");
+    println!("cargo:rerun-if-changed=src/chat");
+    println!("cargo:rerun-if-changed=src/chat/registrations");
     println!("cargo:rerun-if-changed=src/chat/precision");
-    println!("cargo:rerun-if-changed=src/chat/precision/registrations");
 
     cc::Build::new()
         .file("cheetah_init.c")
@@ -74,7 +80,7 @@ fn main() {
     generate_registry(&registration_sources, &MODEL_REGISTRY);
     let precision_sources = discover_registrations(Path::new(PRECISION_REGISTRY.source));
     generate_registry(&precision_sources, &PRECISION_REGISTRY);
-    let shader_sources = discover_shaders(Path::new("src/chat/models"));
+    let shader_sources = discover_shaders(Path::new("src/chat/registrations"));
     if env::var_os("CARGO_FEATURE_VULKAN").is_some() {
         compile_vulkan(&shader_sources);
         println!("cargo:rustc-link-lib=vulkan");
@@ -86,7 +92,7 @@ fn main() {
 fn discover_registrations(directory: &Path) -> Vec<(String, PathBuf)> {
     let mut sources = Vec::new();
     let mut names = HashSet::new();
-    for entry in fs::read_dir(directory).expect("failed to scan model registrations directory") {
+    for entry in fs::read_dir(directory).expect("failed to scan registrations directory") {
         let path = entry
             .expect("failed to read model registration entry")
             .path();
@@ -140,7 +146,8 @@ fn generate_registry(registrations: &[(String, PathBuf)], spec: &RegistrySpec) {
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
         generated.push_str(&format!(
-            "#[path = \"{source}\"] mod {name}_registration;\n"
+            "#[path = \"{source}\"] mod {name}{};\n",
+            spec.module_suffix
         ));
     }
     generated.push_str(&format!(
@@ -148,7 +155,10 @@ fn generate_registry(registrations: &[(String, PathBuf)], spec: &RegistrySpec) {
         spec.type_name
     ));
     for (name, _) in registrations {
-        generated.push_str(&format!("    &{name}_registration::REGISTRATION,\n"));
+        generated.push_str(&format!(
+            "    &{name}{}::REGISTRATION,\n",
+            spec.module_suffix
+        ));
     }
     generated.push_str("];\n");
     if let Some((index_const, file_const)) = spec.index {
@@ -158,7 +168,10 @@ fn generate_registry(registrations: &[(String, PathBuf)], spec: &RegistrySpec) {
             "pub(crate) const {index_const}: &[&[&str]] = &[\n"
         ));
         for (name, _) in registrations {
-            generated.push_str(&format!("    {name}_registration::{file_const},\n"));
+            generated.push_str(&format!(
+                "    {name}{}::{file_const},\n",
+                spec.module_suffix
+            ));
         }
         generated.push_str("];\n");
     }
