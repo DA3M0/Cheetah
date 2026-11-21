@@ -26,6 +26,15 @@ pub fn serve(
     ant_options: &AntCliOptions,
     mcp_options: &crate::cli::McpCliOptions,
 ) -> Result<(), String> {
+    // Logging: per-request timing lines land on stderr at info level; RUST_LOG
+    // overrides the filter (the subscriber init is a no-op on re-entry).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     // MCP: connect the configured servers before the engine loads, so a
     // broken server fails fast with its own diagnostic.
     let mcp = crate::mcp::registry_from_flags(&mcp_options.servers, mcp_options.config.as_deref())?;
@@ -59,6 +68,13 @@ pub fn serve(
         chat_options.ctx_size,
         Some(&ant_settings),
     )?;
+    // Warm up before the listener binds: the first request must not pay the
+    // mmap cold start.
+    eprintln!(
+        "{}",
+        color::stderr("Warming up model...", Color::Cyan)
+    );
+    engine.warmup()?;
     let api_key = resolve_api_key(&options)?;
 
     let addr = format!("{}:{}", options.host, options.port);

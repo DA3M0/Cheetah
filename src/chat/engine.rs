@@ -75,7 +75,7 @@
 // and prompt templates), Ant's residency manager, terminal color and progress
 // helpers, the context archive used by the interactive loop, and the shared
 // chat options.
-use super::registry::{Device, ModelForward};
+use super::registry::{Device, KvSnapshot, ModelForward};
 use crate::ant::{Ant, AntLayerResidency, AntSettings, AntUnit, ant_swap_fit};
 use crate::chat::toolcalls::{self, ResolvedToolChoice, ToolDefinition, ToolResponse};
 use crate::color::{self, Color};
@@ -87,11 +87,11 @@ use rand::SeedableRng;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 
@@ -428,6 +428,10 @@ pub struct Generation {
     pub prompt_tokens: usize,
     /// Number of tokens produced by the decode loop.
     pub generated_tokens: usize,
+    /// Time spent before the first decode step: Ant hooks, model setup and
+    /// the prompt forward pass — the inference-side time-to-first-token
+    /// component (queue wait and tokenization happen upstream of this).
+    pub prefill_duration: Duration,
     /// Time spent in the decode loop, excluding prefill and cleanup.
     pub decode_duration: Duration,
     /// Why the loop terminated.
@@ -509,6 +513,93 @@ pub struct InferenceContext;
 /// and prompt rendering are immutable and can run concurrently with unrelated
 /// work. Ant bookkeeping uses a second mutex so residency checks do not
 /// contend with the model lock while a request is being prepared.
+/// Cross-generation KV prefix reuse store: the engine keeps the most recent
+/// post-prefill KV snapshots keyed by their exact prompt tokens, so a request
+/// whose history extends a cached prompt (multi-turn chat, agentic tool
+/// rounds, identical retries) skips re-prefilling the shared prefix. Newest
+/// entries live at the back; eviction is LRU under both an entry-count and a
+/// total-byte budget (KV state is O(context) per entry, so unbounded caching
+/// would balloon memory).
+struct PrefixCache {
+    entries: VecDeque<PrefixCacheEntry>,
+}
+
+struct PrefixCacheEntry {
+    /// The exact prompt tokens the snapshot was captured for.
+    tokens: Vec<u32>,
+    /// KV state taken right after that prompt's prefill (before decode).
+    snapshot: Arc<KvSnapshot>,
+    /// Snapshot size in bytes, kept for the eviction budget.
+    bytes: usize,
+}
+
+/// At most this many recent prompts are cached.
+const PREFIX_CACHE_MAX_ENTRIES: usize = 4;
+/// Total snapshot bytes the cache may hold before LRU eviction kicks in.
+const PREFIX_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Prompts shorter than this are not cached — too little history to reuse.
+const PREFIX_CACHE_MIN_TOKENS: usize = 16;
+/// Reuse below this many shared positions costs more than it saves.
+const PREFIX_MIN_REUSE_POSITIONS: usize = 8;
+
+impl PrefixCache {
+    /// Longest cached prefix of `prompt`: `(positions, snapshot)` where the
+    /// entry's tokens match `prompt[..positions]` and at least one prompt
+    /// token remains to forward (a full hit has no stored logits to return,
+    /// and re-forwarding the final token is cheap). Touches the entry (LRU)
+    /// on hit.
+    fn longest_prefix(&mut self, prompt: &[u32]) -> Option<(usize, Arc<KvSnapshot>)> {
+        // (shared positions, entry index) of the best match so far.
+        let mut best: Option<(usize, usize)> = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let shared = entry
+                .tokens
+                .iter()
+                .zip(prompt.iter())
+                .take_while(|(left, right)| left == right)
+                .count()
+                .min(prompt.len().saturating_sub(1));
+            if shared >= PREFIX_MIN_REUSE_POSITIONS
+                && best.is_none_or(|(best_shared, _)| shared > best_shared)
+            {
+                best = Some((shared, index));
+            }
+        }
+        let (shared, index) = best?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        let entry = self.entries.back()?;
+        Some((shared, Arc::clone(&entry.snapshot)))
+    }
+
+    /// Inserts a post-prefill snapshot for `tokens`, evicting
+    /// least-recently-used entries until both budgets hold.
+    fn insert(&mut self, tokens: Vec<u32>, snapshot: KvSnapshot) {
+        let bytes = snapshot
+            .kv_k
+            .iter()
+            .chain(snapshot.kv_v.iter())
+            .map(|layer| layer.len() * std::mem::size_of::<f32>())
+            .sum();
+        self.entries.push_back(PrefixCacheEntry {
+            tokens,
+            snapshot: Arc::new(snapshot),
+            bytes,
+        });
+        let mut total: usize = self.entries.iter().map(|entry| entry.bytes).sum();
+        while self.entries.len() > PREFIX_CACHE_MAX_ENTRIES
+            || (total > PREFIX_CACHE_MAX_BYTES && self.entries.len() > 1)
+        {
+            let evicted = self
+                .entries
+                .pop_front()
+                .map(|entry| entry.bytes)
+                .unwrap_or(0);
+            total = total.saturating_sub(evicted);
+        }
+    }
+}
+
 pub struct Engine {
     /// Backend model and its selected device, guarded because decoding
     /// mutates the KV cache.
@@ -552,6 +643,10 @@ pub struct Engine {
     ant_unit_index: std::collections::BTreeMap<String, AntUnitRuntime>,
     /// Mutable cross-request Ant bookkeeping.
     ant_runtime: Mutex<AntRuntimeState>,
+    /// Cross-generation KV prefix cache (see [`PrefixCache`]); consulted and
+    /// refilled by `generate_inner`. Backends without KV snapshot support
+    /// simply never hit it.
+    prefix_cache: Mutex<PrefixCache>,
 }
 
 /// Deserialized subset of a Hugging Face `config.json` needed by the engine.
@@ -1077,6 +1172,9 @@ impl Engine {
             ant_layer_summary,
             ant_unit_index,
             ant_runtime: Mutex::new(ant_runtime),
+            prefix_cache: Mutex::new(PrefixCache {
+                entries: VecDeque::new(),
+            }),
         })
     }
 
@@ -1492,6 +1590,24 @@ impl Engine {
         Ok(InferenceContext)
     }
 
+    /// Warms the model up with a single-token forward pass: faults in every
+    /// weight page (mmap → OS page cache) and sweeps the LM head, so the
+    /// first real request does not pay the cold start. The KV cache is
+    /// cleared afterwards, leaving no state behind.
+    pub fn warmup(&self) -> Result<(), String> {
+        let loaded = self
+            .model
+            .lock()
+            .map_err(|_| "Model mutex was poisoned.".to_string())?;
+        let mut model = loaded.model.clone();
+        drop(loaded);
+        model
+            .forward(&[0], 0)
+            .map_err(|error| format!("Model warmup failed: {error}"))?;
+        model.clear_cache();
+        Ok(())
+    }
+
     /// Renders and tokenizes one chat turn, truncating oldest turns (with a
     /// warning) until the input plus reserved generation tokens fits the
     /// context limit; a single turn that cannot fit is a hard error.
@@ -1739,6 +1855,9 @@ impl Engine {
             ));
         }
 
+        // The prefill clock covers everything before the first decode step:
+        // Ant hooks, model setup and the prompt forward pass.
+        let started = Instant::now();
         // Ant: apply per-request residency overrides, prefetch evicted units,
         // promote queued RAM residents into VRAM while the pool has room, then
         // enforce the resolved memory budget before generation — every swap
@@ -1755,10 +1874,33 @@ impl Engine {
         let mut model = loaded.model.clone();
         drop(loaded);
         model.clear_cache();
-        let started = Instant::now();
+        // KV prefix reuse: restore a cached prefix's KV state and prefill only
+        // the suffix (multi-turn history, tool rounds, identical retries).
+        let mut reused_positions = 0usize;
+        let cached_prefix = self
+            .prefix_cache
+            .lock()
+            .map_err(|_| "Prefix cache mutex was poisoned.".to_string())?
+            .longest_prefix(prompt);
+        if let Some((positions, snapshot)) = cached_prefix
+            && model.restore_kv_prefix(&snapshot, positions)
+        {
+            reused_positions = positions;
+        }
         let mut logits_values = model
-            .forward(prompt, 0)
+            .forward(&prompt[reused_positions..], reused_positions)
             .map_err(|error| format!("Model inference failed: {error}"))?;
+        let prefill_duration = started.elapsed();
+        // Cache the post-prefill KV state (before the decode loop appends
+        // generated tokens) so future prompts sharing this history skip its
+        // prefill entirely.
+        if prompt.len() >= PREFIX_CACHE_MIN_TOKENS
+            && let Some(snapshot) = model.kv_snapshot()
+            && snapshot.positions == prompt.len()
+            && let Ok(mut cache) = self.prefix_cache.lock()
+        {
+            cache.insert(prompt.to_vec(), snapshot);
+        }
         let mut rng = StdRng::seed_from_u64(options.seed.unwrap_or_else(random_seed));
         let mut history = prompt.to_vec();
         let mut generated_tokens = Vec::new();
@@ -1830,6 +1972,7 @@ impl Engine {
             text: answer,
             prompt_tokens: prompt.len(),
             generated_tokens: generated_tokens.len(),
+            prefill_duration,
             decode_duration,
             finish_reason,
         })
@@ -2113,15 +2256,28 @@ fn sample_token(
         *score /= options.temperature as f32;
     }
     let mut order = (0..scores.len()).collect::<Vec<_>>();
-    order.sort_unstable_by(|left, right| scores[*right].total_cmp(&scores[*left]));
     // Generation sampling top-k over the full vocabulary (NOT MoE expert routing).
     if options.top_k > 0 && options.top_k < order.len() {
-        order.truncate(options.top_k);
+        // Partial selection: park the k highest-scoring indices at the front
+        // in O(V), then sort only those — a full-vocabulary sort dominated
+        // per-token sampling cost at Qwen-scale vocabularies.
+        let k = options.top_k;
+        order.select_nth_unstable_by(k, |left, right| {
+            scores[*right].total_cmp(&scores[*left])
+        });
+        order[..k].sort_unstable_by(|left, right| scores[*right].total_cmp(&scores[*left]));
+        order.truncate(k);
+    } else if options.top_p < 1.0 {
+        // top-p over the whole vocabulary: only this rare branch needs the
+        // full descending order.
+        order.sort_unstable_by(|left, right| scores[*right].total_cmp(&scores[*left]));
     }
-    let max = order
-        .first()
-        .map(|index| scores[*index])
-        .ok_or_else(|| "Model returned an empty vocabulary.".to_string())?;
+    // else (top_k == 0 && top_p >= 1.0): every token is a candidate anyway
+    // and the weighted draw is order-independent, so no sort at all.
+    if scores.is_empty() {
+        return Err("Model returned an empty vocabulary.".to_string());
+    }
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let weights = order
         .iter()
         .map(|index| (scores[*index] - max).exp())
@@ -2160,6 +2316,8 @@ pub(super) fn chat(
         ));
     }
     let engine = load_engine_with_progress(path, options.threads, options.ctx_size, ant)?;
+    // Warm up so the first turn does not pay the mmap cold start.
+    engine.warmup()?;
     println!(
         "{}",
         color::stdout(
@@ -2191,19 +2349,19 @@ impl TextSink for StdoutSink {
     }
 }
 
-/// Formats the post-turn stats line (tokens + tok/s, or "speed unavailable"
-/// when the decode window could not be measured).
+/// Formats the post-turn stats line (tokens + tok/s, plus the prefill window,
+/// or "speed unavailable" when the decode window could not be measured).
 fn format_generation_stats(generation: &Generation) -> String {
-    match generation.tokens_per_second() {
-        Some(tokens_per_second) => format!(
-            "Generated {} tokens ({tokens_per_second:.2} tokens/s).",
-            generation.generated_tokens
-        ),
-        None => format!(
-            "Generated {} tokens (speed unavailable).",
-            generation.generated_tokens
-        ),
-    }
+    let speed = match generation.tokens_per_second() {
+        Some(tokens_per_second) => format!("{tokens_per_second:.2} tokens/s"),
+        None => "speed unavailable".to_string(),
+    };
+    format!(
+        "Generated {} tokens ({speed}). Prefill {} tokens in {} ms.",
+        generation.generated_tokens,
+        generation.prompt_tokens,
+        generation.prefill_duration.as_millis()
+    )
 }
 
 /// The interactive REPL: slash commands (`/exit`, `/help`, `/clear`,
@@ -2585,13 +2743,14 @@ mod tests {
             text: String::new(),
             prompt_tokens: 0,
             generated_tokens: 6,
+            prefill_duration: Duration::from_millis(1500),
             decode_duration: Duration::from_secs(2),
             finish_reason: FinishReason::Stop,
         };
         assert_eq!(generation.tokens_per_second(), Some(3.0));
         assert_eq!(
             format_generation_stats(&generation),
-            "Generated 6 tokens (3.00 tokens/s)."
+            "Generated 6 tokens (3.00 tokens/s). Prefill 0 tokens in 1500 ms."
         );
 
         let no_tokens = Generation {
@@ -2601,7 +2760,7 @@ mod tests {
         assert_eq!(no_tokens.tokens_per_second(), None);
         assert_eq!(
             format_generation_stats(&no_tokens),
-            "Generated 0 tokens (speed unavailable)."
+            "Generated 0 tokens (speed unavailable). Prefill 0 tokens in 1500 ms."
         );
 
         let zero_duration = Generation {
@@ -2609,6 +2768,101 @@ mod tests {
             ..generation
         };
         assert_eq!(zero_duration.tokens_per_second(), None);
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::*;
+
+    /// Builds a synthetic snapshot covering `positions` positions on
+    /// `layers` layers, one f32 per (position, dim) with dim = 4.
+    fn snapshot(positions: usize, layers: usize) -> KvSnapshot {
+        KvSnapshot {
+            positions,
+            kv_k: (0..layers)
+                .map(|layer| (0..positions * 4).map(|i| (layer * 1000 + i) as f32).collect())
+                .collect(),
+            kv_v: (0..layers)
+                .map(|layer| {
+                    (0..positions * 4)
+                        .map(|i| -((layer * 1000 + i) as f32))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    fn entry_cache(tokens: &[u32], positions: usize) -> PrefixCache {
+        let mut cache = PrefixCache {
+            entries: VecDeque::new(),
+        };
+        cache.insert(tokens.to_vec(), snapshot(positions, 2));
+        cache
+    }
+
+    /// Longest-prefix selection: an entry that strictly prefixes the prompt
+    /// matches at its full length; a longer entry clamps to prompt.len()-1 so
+    /// at least one token stays to forward.
+    #[test]
+    fn longest_prefix_matches_entry_prefix_and_clamps_full_hits() {
+        // Strict prefix entry (16 tokens) against a 20-token prompt.
+        let tokens: Vec<u32> = (1..=16).collect();
+        let mut cache = entry_cache(&tokens, 16);
+        let prompt: Vec<u32> = (1..=20).collect();
+        let (shared, snap) = cache.longest_prefix(&prompt).expect("extended history must hit");
+        assert_eq!(shared, 16);
+        assert_eq!(snap.positions, 16);
+
+        // Identical repeat (full hit): clamped so the last token re-forwards.
+        let (shared, _) = cache
+            .longest_prefix(&tokens)
+            .expect("identical prompt must hit");
+        assert_eq!(shared, 15, "full hits keep one token to forward");
+
+        // Disjoint history must not match.
+        assert!(cache.longest_prefix(&(100..104).collect::<Vec<u32>>()).is_none());
+    }
+
+    /// Short shared prefixes and below-threshold prompts are rejected: reuse
+    /// must not churn the cache for nearly-disjoint conversations.
+    #[test]
+    fn reuse_requires_meaningful_prefix() {
+        let tokens: Vec<u32> = (1..=16).collect();
+        let mut cache = entry_cache(&tokens, 16);
+        // Only 2 shared positions (< PREFIX_MIN_REUSE_POSITIONS).
+        assert!(cache.longest_prefix(&[1, 2, 9, 10]).is_none());
+        // Short prompt (entry prefix match, but too few shared positions).
+        assert!(cache.longest_prefix(&[1, 2, 3]).is_none());
+    }
+
+    /// LRU + budgets: the oldest entry is evicted beyond the entry cap, and
+    /// a single oversized snapshot is still retained (budget evicts only
+    /// while more than one entry exists).
+    #[test]
+    fn insert_evicts_lru_within_entry_budget() {
+        let mut cache = PrefixCache {
+            entries: VecDeque::new(),
+        };
+        let rounds = (PREFIX_CACHE_MAX_ENTRIES + 2) as u32;
+        for round in 0..rounds {
+            let tokens: Vec<u32> = (0..PREFIX_CACHE_MIN_TOKENS as u32)
+                .map(|i| i + round * 100)
+                .collect();
+            cache.insert(tokens, snapshot(4, 2));
+        }
+        assert_eq!(
+            cache.entries.len(),
+            PREFIX_CACHE_MAX_ENTRIES,
+            "entry count must be capped"
+        );
+        // Only the newest PREFIX_CACHE_MAX_ENTRIES rounds survive; the front
+        // holds the oldest of those.
+        assert_eq!(
+            cache.entries.front().unwrap().tokens[0],
+            (rounds - PREFIX_CACHE_MAX_ENTRIES as u32) * 100,
+            "oldest entries must be evicted first"
+        );
     }
 }
 

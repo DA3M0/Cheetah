@@ -519,10 +519,13 @@ mod forward_tests {
     use crate::ant::CHEETAH_UNITS_FILENAME;
     use crate::chat::gemma_registration::GemmaNative;
     use crate::chat::llama_registration::LlamaNative;
+    use crate::chat::mistral_registration::MistralNative;
     use crate::chat::mixtral_registration::MixtralNative;
     use crate::chat::native::ops;
     use crate::chat::native::store::Tier;
     use crate::chat::phi_registration::PhiNative;
+    use crate::chat::qwen2_registration::Qwen2Native;
+    use crate::chat::qwen3_registration::Qwen3Native;
     use crate::chat::registry::ModelForward;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1783,4 +1786,246 @@ mod forward_tests {
             "原机在位置 5 续算必须等价于从头 prefill 全序列（KV 连续性）"
         );
     }
+
+    /// 快照/恢复 parity：A 机 prefill [1..8] 后取 `kv_snapshot`，B 机
+    /// `restore_kv_prefix(snapshot, 6)` 再以 offset=6 续算 [7,8]，最终 logits
+    /// 必须与"从头全量 prefill [1..8]"逐比特一致——这是引擎跨代前缀复用
+    /// （快照 → 截断恢复 → 续算）路径的正确性基石。
+    #[test]
+    fn kv_snapshot_restore_continuation_matches_full_prefill_bit_exact() {
+        let fixture = Fixture::new("kv_snapshot_restore", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+
+        // 快照路径：A 机全量 prefill [1..8]，取快照；B 机只恢复前 6 个位置。
+        let mut source = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        source.forward(&[1, 2, 3, 4, 5, 6, 7, 8], 0).unwrap();
+        let snapshot = source.ctx.kv_snapshot();
+        assert_eq!(snapshot.positions, 8, "快照应覆盖全部 8 个位置");
+
+        let mut restored = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        restored.ctx.restore_kv_prefix(&snapshot, 6);
+        assert_eq!(restored.ctx.kv_len(0), 6, "恢复应截断到前 6 个位置");
+        let logits_continued = restored.forward(&[7, 8], 6).unwrap();
+
+        // 全量基准：全新 decoder 一次 prefill [1..8]。
+        let mut fresh = LlamaNative::with_store(cfg, Arc::clone(&fixture.store));
+        let logits_full = fresh.forward(&[1, 2, 3, 4, 5, 6, 7, 8], 0).unwrap();
+
+        assert_eq!(
+            logits_continued, logits_full,
+            "快照恢复 + 续算必须与全量 prefill 比特一致"
+        );
+    }
+
+    /// qwen2 批量 prefill parity：GEMM 分块的 forward 必须与逐位置路径
+    /// （单 token forward 累积 KV）逐比特一致；含非零 offset 续算（前缀
+    /// 复用路径的真实形态）。
+    #[test]
+    fn qwen2_chunked_prefill_matches_per_position_bit_exact() {
+        let fixture = Fixture::new("qwen2_chunk", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+        // 53 个互异 token（vocab 32）：覆盖多 chunk、不平整尾块与所有位置。
+        let tokens: Vec<u32> = (0..53u32).map(|i| (i * 7 + 3) % 32).collect();
+
+        // 批量路径：chunk=16（尾块 5）一次 prefill。
+        let mut batched = Qwen2Native::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let logits_batched = batched.forward_with_chunk(&tokens, 0, 16).unwrap();
+
+        // 逐位置基准：同一台 decoder 上单 token forward 累积 KV。
+        let mut per_position = Qwen2Native::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let mut logits_per_position = Vec::new();
+        for (index, &token) in tokens.iter().enumerate() {
+            logits_per_position = per_position.forward(&[token], index).unwrap();
+        }
+
+        assert_eq!(
+            logits_batched, logits_per_position,
+            "批量 prefill 必须与逐位置 prefill 比特一致"
+        );
+
+        // 非零 offset：前 5 个位置逐位置 prefill 后，其余以 chunk=8 批量续算，
+        // 最终 logits 必须与全量逐位置一致。
+        let mut prefix_then_chunk =
+            Qwen2Native::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        for (index, &token) in tokens[..5].iter().enumerate() {
+            prefix_then_chunk.forward(&[token], index).unwrap();
+        }
+        let logits_mixed = prefix_then_chunk
+            .forward_with_chunk(&tokens[5..], 5, 8)
+            .unwrap();
+        assert_eq!(
+            logits_mixed, logits_per_position,
+            "前缀逐位置 + 批量续算必须与全量逐位置比特一致"
+        );
+    }
+
+    /// llama/qwen3/mistral/gemma/phi 共用的批量 prefill parity 断言：GEMM
+    /// 分块的 forward（53 token 单块、chunk 尾部不平整由 256/53 覆盖）必须
+    /// 与逐位置路径逐比特一致，含非零 offset 续算（前缀复用的真实形态）。
+    fn assert_chunked_prefill_matches_per_position(
+        fixture: &Fixture,
+        make: impl Fn(DecoderConfig, Arc<crate::chat::native::store::MmapWeightStore>) -> Box<dyn crate::chat::registry::ModelForward>,
+        cfg: impl Fn() -> DecoderConfig,
+    ) {
+        let tokens: Vec<u32> = (0..53u32).map(|i| (i * 7 + 3) % 32).collect();
+
+        // 批量路径：53 token 一次 prefill（默认 chunk 256 内，尾块即整块）。
+        let mut batched = make(cfg(), Arc::clone(&fixture.store));
+        let logits_batched = batched.forward(&tokens, 0).unwrap();
+
+        // 逐位置基准：同一台 decoder 上单 token forward 累积 KV。
+        let mut per_position = make(cfg(), Arc::clone(&fixture.store));
+        let mut logits_per_position = Vec::new();
+        for (index, &token) in tokens.iter().enumerate() {
+            logits_per_position = per_position.forward(&[token], index).unwrap();
+        }
+
+        assert_eq!(
+            logits_batched, logits_per_position,
+            "批量 prefill 必须与逐位置 prefill 比特一致"
+        );
+
+        // 非零 offset：前 5 个位置逐位置 prefill 后，其余批量续算。
+        let mut prefix_then = make(cfg(), Arc::clone(&fixture.store));
+        for (index, &token) in tokens[..5].iter().enumerate() {
+            prefix_then.forward(&[token], index).unwrap();
+        }
+        let logits_mixed = prefix_then.forward(&tokens[5..], 5).unwrap();
+        assert_eq!(
+            logits_mixed, logits_per_position,
+            "前缀逐位置 + 批量续算必须与全量逐位置比特一致"
+        );
+    }
+
+    #[test]
+    fn llama_chunked_prefill_matches_per_position_bit_exact() {
+        let fixture = Fixture::new("llama_chunk", FeedForward::Dense, true);
+        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
+            Box::new(LlamaNative::with_store(cfg, store))
+        }, || dense_config(0));
+    }
+
+    #[test]
+    fn qwen3_chunked_prefill_matches_per_position_bit_exact() {
+        let fixture = Fixture::new("qwen3_chunk", FeedForward::Dense, true);
+        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
+            Box::new(Qwen3Native::with_store(cfg, store))
+        }, || dense_config(0));
+    }
+
+    #[test]
+    fn mistral_chunked_prefill_matches_per_position_bit_exact() {
+        let fixture = Fixture::new("mistral_chunk", FeedForward::Dense, true);
+        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
+            Box::new(MistralNative::with_store(cfg, store))
+        }, || dense_config(0));
+    }
+
+    #[test]
+    fn gemma_chunked_prefill_matches_per_position_bit_exact() {
+        let fixture = Fixture::new("gemma_chunk", FeedForward::Dense, true);
+        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
+            Box::new(GemmaNative::with_store(cfg, store))
+        }, || dense_config(0));
+    }
+
+    #[test]
+    fn phi_chunked_prefill_matches_per_position_bit_exact() {
+        let fixture = Fixture::phi("phi_chunk", true);
+        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
+            Box::new(PhiNative::with_store(cfg, store))
+        }, phi_config);
+    }
+    // --- 一次性性能分解基准（`cargo test --release bench_prefill -- --ignored --nocapture`）---
+
+    /// 分别计时 FFN 形状的 gemm、逐 token gemv 批次与 1400 上下文的
+    /// attention，用于定位批量 prefill 的剩余瓶颈。默认忽略。
+    #[test]
+    #[ignore]
+    fn bench_prefill_hotspots() {
+        let fixture = Fixture::new("bench_hotspot", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+        // Qwen2-0.5B 的真实形状（FFN 4864×896 / 14 q-heads × 64 / 2 kv-heads）。
+        let rows = 4864usize;
+        let cols = 896usize;
+        let n = 256usize;
+        let mut weight = Vec::with_capacity(rows * cols * 2);
+        let mut state = 0x12345678u32;
+        for _ in 0..rows * cols {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let value = ((state >> 16) as f32 / u16::MAX as f32 - 0.5) / 16.0;
+            let bits = (value.to_bits() >> 16) as u16;
+            weight.extend_from_slice(&bits.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..n * cols)
+            .map(|index| ((index % 31) as f32 - 15.0) / 32.0)
+            .collect();
+        let mut y = vec![0f32; n * rows];
+
+        let rounds = 20;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            ops::gemm(&weight, crate::chat::native::store::WeightDType::Bf16, rows, cols, &x, n, &mut y);
+        }
+        let gemm_s = started.elapsed().as_secs_f64() / rounds as f64;
+        println!(
+            "gemm {rows}x{cols} n={n}: {gemm_s:.4}s per call = {:.1} GMACs/s effective",
+            (rows * cols * n) as f64 / gemm_s / 1e9
+        );
+
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for token in 0..n {
+                ops::gemv(
+                    &weight,
+                    crate::chat::native::store::WeightDType::Bf16,
+                    rows,
+                    cols,
+                    &x[token * cols..(token + 1) * cols],
+                    &mut y[token * rows..(token + 1) * rows],
+                );
+            }
+        }
+        let gemv_s = started.elapsed().as_secs_f64() / rounds as f64;
+        println!(
+            "gemv 256x({rows}x{cols}): {gemv_s:.4}s per batch = {:.1} GMACs/s effective",
+            (rows * cols * n) as f64 / gemv_s / 1e9
+        );
+
+        // 真实 GQA 形状的 attention：q 14×64，kv 2×64，缓存 1400 位置。
+        // attention 只读 cfg 与 KV 缓存，不读权重 —— 直接手工填充缓存即可。
+        let mut real_cfg = cfg.clone();
+        real_cfg.q_heads = 14;
+        real_cfg.kv_heads = 2;
+        real_cfg.head_dim = 64;
+        real_cfg.hidden_size = 896;
+        real_cfg.intermediate_size = 4864;
+        let mut toolbox = crate::chat::native::ops::OpsToolbox::with_store(
+            real_cfg.clone(),
+            Arc::clone(&fixture.store),
+        );
+        let kv_dim = real_cfg.kv_heads * real_cfg.head_dim;
+        for layer in 0..real_cfg.num_layers {
+            for pos in 0..1400usize {
+                let kv: Vec<f32> = (0..kv_dim)
+                    .map(|i| ((pos * 7 + i) % 13) as f32 * 0.01)
+                    .collect();
+                toolbox.cache_append(layer, &kv, &kv);
+            }
+        }
+        let q = vec![0.1f32; real_cfg.q_heads * real_cfg.head_dim];
+        let mut out = vec![0f32; real_cfg.q_heads * real_cfg.head_dim];
+        let started = std::time::Instant::now();
+        let attention_rounds = 200;
+        for _ in 0..attention_rounds {
+            toolbox.attention(0, 1400, &q, &mut out);
+        }
+        let attn_s = started.elapsed().as_secs_f64() / attention_rounds as f64;
+        let attn_macs = (real_cfg.q_heads * 1400 * real_cfg.head_dim * 2) as f64;
+        println!(
+            "attention @1400 keys: {attn_s:.6}s per call = {:.1} GMACs/s effective",
+            attn_macs / attn_s / 1e9
+        );
+    }
+
 }

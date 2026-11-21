@@ -16,11 +16,14 @@
 //! is declared here.
 
 use super::native::decoder::DecoderConfig;
-use super::native::ops::{self, OpsToolbox, Scratch};
+use super::native::ops::{self, ChunkScratch, OpsToolbox, Scratch};
 #[cfg(test)]
 use super::native::store::MmapWeightStore;
 use super::templates::gemma;
-use super::{AntTierControl, BackendLoader, ChatTemplate, ModelFamily, ModelForward, ModelRegistration};
+use super::{
+    AntTierControl, BackendLoader, ChatTemplate, KvSnapshot, ModelFamily, ModelForward,
+    ModelRegistration,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -94,6 +97,8 @@ pub(crate) struct GemmaNative {
     pub(crate) ctx: OpsToolbox,
     /// Reusable activation buffers (preallocated at capacity).
     pub(crate) scratch: Scratch,
+    /// Chunked-prefill activation buffers (`[rows, width]` stacks).
+    pub(crate) chunk: ChunkScratch,
 }
 
 impl GemmaNative {
@@ -103,6 +108,7 @@ impl GemmaNative {
         let ctx = OpsToolbox::with_store(cfg.clone(), store);
         Self {
             scratch: Scratch::new(&cfg),
+            chunk: ChunkScratch::new(),
             cfg,
             ctx,
         }
@@ -114,6 +120,7 @@ impl GemmaNative {
         let cfg = ctx.cfg.clone();
         Self {
             scratch: Scratch::new(&cfg),
+            chunk: ChunkScratch::new(),
             cfg,
             ctx,
         }
@@ -121,14 +128,38 @@ impl GemmaNative {
 
     /// Run the full forward for tokens starting at `offset`; returns the
     /// logits of the final position only (matching the engine's sampling
-    /// contract).
+    /// contract). Single tokens (decode steps) run the per-position path;
+    /// longer batches (prefill) split into chunked batched-GEMM passes.
     fn run_forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        self.forward_with_chunk(tokens, offset, ops::prefill_chunk_size())
+    }
+
+    /// [`Self::run_forward`] with an explicit chunk size — tests force
+    /// `chunk_rows = 1` as the per-position reference.
+    pub(crate) fn forward_with_chunk(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        chunk_rows: usize,
+    ) -> Result<Vec<f32>, String> {
         self.ctx.validate_tokens(tokens)?;
-        for (index, &token) in tokens.iter().enumerate() {
-            self.forward_position(token as usize, offset + index)?;
+        // Reserve the KV span for the whole prefill up front: growth into
+        // reserved capacity instead of doubling copies mid-prefill.
+        self.ctx.reserve_kv(offset + tokens.len());
+        if tokens.len() == 1 {
+            self.forward_position(tokens[0] as usize, offset)?;
+        } else {
+            self.forward_chunked(tokens, offset, chunk_rows)?;
         }
-        // Gemma ties the lm head to the (unscaled) embedding table; the
-        // untied branch reads a separate `lm_head.weight` tensor instead.
+        self.lm_head()
+    }
+
+    /// Gemma ties the lm head to the (unscaled) embedding table; the untied
+    /// branch reads a separate `lm_head.weight` tensor instead. Ant: layer
+    /// 0's bucket also holds the embedding / final norm, whose pages lm_head
+    /// just swept; the disk-tier ones drop now and re-fault from the OS page
+    /// cache.
+    fn lm_head(&mut self) -> Result<Vec<f32>, String> {
         let head_unit = if self.cfg.tie_word_embeddings {
             "model.embed_tokens.weight"
         } else {
@@ -136,9 +167,6 @@ impl GemmaNative {
         };
         self.ctx
             .lm_head_into(head_unit, &self.scratch.hidden, &mut self.scratch.logits)?;
-        // Ant: layer 0's bucket also holds the embedding / final norm, whose
-        // pages lm_head just swept; drop the disk-tier ones now. The pages
-        // re-fault (from the OS page cache) on their next access.
         self.ctx.drop_disk_units_of_layer(0);
         Ok(std::mem::take(&mut self.scratch.logits))
     }
@@ -162,6 +190,253 @@ impl GemmaNative {
         }
         self.ctx
             .rmsnorm_offset("model.norm", &mut self.scratch.hidden)?;
+        Ok(())
+    }
+
+    /// Chunked prefill: splits `tokens` into `chunk_rows`-sized batches and
+    /// processes each through [`Self::forward_chunk`]. The projections run as
+    /// batched GEMMs (the per-token path is a GEMV per token, re-streaming
+    /// every weight once per position); norms, rope, KV append and attention
+    /// stay per-row, which keeps the result bit-exact against the
+    /// per-position path.
+    pub(crate) fn forward_chunked(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        chunk_rows: usize,
+    ) -> Result<(), String> {
+        for start in (0..tokens.len()).step_by(chunk_rows.max(1)) {
+            let end = (start + chunk_rows).min(tokens.len());
+            self.forward_chunk(&tokens[start..end], offset + start)?;
+        }
+        Ok(())
+    }
+
+    /// One chunk of prefill positions as batched GEMMs, ending with the final
+    /// norm of the last position (the only one whose logits the caller reads).
+    fn forward_chunk(&mut self, tokens: &[u32], offset: usize) -> Result<(), String> {
+        let rows = tokens.len();
+        let hidden = self.cfg.hidden_size;
+        self.chunk.resize_for(&self.cfg, rows);
+        // Stack the embedding rows into `chunk.hidden` = [rows, hidden].
+        // gemma scales the embedding output by sqrt(hidden_size); the lm_head
+        // later reads the same (unscaled) table directly.
+        let scale = (self.cfg.hidden_size as f32).sqrt();
+        self.chunk.hidden.clear();
+        let mut row = std::mem::take(&mut self.scratch.hidden);
+        for &token in tokens {
+            self.ctx.embedding_row_into(token as usize, &mut row)?;
+            for value in row.iter_mut() {
+                *value *= scale;
+            }
+            self.chunk.hidden.extend_from_slice(&row);
+        }
+        self.scratch.hidden = row;
+        for layer in 0..self.cfg.num_layers {
+            self.forward_layer_chunk(layer, offset, rows)?;
+            // Ant: same per-layer page release as the per-position path.
+            self.ctx.drop_disk_units_of_layer(layer as i32);
+        }
+        // Only the final position feeds the LM head: norm its residual row
+        // into `scratch.hidden` (the caller's logits input).
+        let last_row_start = (rows - 1) * hidden;
+        self.scratch.hidden.clear();
+        self.scratch
+            .hidden
+            .extend_from_slice(&self.chunk.hidden[last_row_start..last_row_start + hidden]);
+        self.ctx
+            .rmsnorm_offset("model.norm", &mut self.scratch.hidden)?;
+        Ok(())
+    }
+
+    /// One decoder layer over a whole chunk — the gemma block shape (offset
+    /// RMSNorms, GeGLU feed-forward) with the projections batched. Biases are
+    /// family-optional no-ops.
+    fn forward_layer_chunk(
+        &mut self,
+        layer: usize,
+        offset: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let cfg = &self.cfg;
+        let q_dim = cfg.q_heads * cfg.head_dim;
+        let kv_dim = cfg.kv_heads * cfg.head_dim;
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        let prefix = format!("model.layers.{layer}.");
+
+        // Input norm per row.
+        self.chunk.normed.clear();
+        self.chunk.normed.resize(rows * hidden, 0.0);
+        for row in 0..rows {
+            let range = row * hidden..(row + 1) * hidden;
+            self.chunk.normed[range.clone()].copy_from_slice(&self.chunk.hidden[range.clone()]);
+            self.ctx.rmsnorm_offset(
+                &format!("{prefix}input_layernorm"),
+                &mut self.chunk.normed[range],
+            )?;
+        }
+
+        // Q/K/V projections as batched GEMMs, then the (unit-optional)
+        // biases per row.
+        self.chunk.q.clear();
+        self.chunk.q.resize(rows * q_dim, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.q_proj.weight"),
+            q_dim,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.q,
+        )?;
+        self.chunk.k.clear();
+        self.chunk.k.resize(rows * kv_dim, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.k_proj.weight"),
+            kv_dim,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.k,
+        )?;
+        self.chunk.v.clear();
+        self.chunk.v.resize(rows * kv_dim, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.v_proj.weight"),
+            kv_dim,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.v,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                &format!("{prefix}self_attn.q_proj"),
+            );
+            self.ctx.add_bias(
+                &mut self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                &format!("{prefix}self_attn.k_proj"),
+            );
+            self.ctx.add_bias(
+                &mut self.chunk.v[row * kv_dim..(row + 1) * kv_dim],
+                &format!("{prefix}self_attn.v_proj"),
+            );
+        }
+
+        // Rope, cache append and attention per row, in order: appending row
+        // r's K/V before attending position r keeps the causal prefix exactly
+        // what the per-position path sees at that point.
+        self.chunk.attn_out.clear();
+        self.chunk.attn_out.resize(rows * q_dim, 0.0);
+        for row in 0..rows {
+            let position = offset + row;
+            ops::rope_heads(
+                &mut self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                cfg.q_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_theta,
+            );
+            ops::rope_heads(
+                &mut self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                cfg.kv_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_theta,
+            );
+            self.ctx.cache_append(
+                layer,
+                &self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                &self.chunk.v[row * kv_dim..(row + 1) * kv_dim],
+            );
+            self.ctx.attention(
+                layer,
+                position,
+                &self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                &mut self.chunk.attn_out[row * q_dim..(row + 1) * q_dim],
+            );
+        }
+
+        // Output projection as a batched GEMM (plus optional bias), then the
+        // residual add.
+        self.chunk.attn_projected.clear();
+        self.chunk.attn_projected.resize(rows * hidden, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.o_proj.weight"),
+            hidden,
+            q_dim,
+            &self.chunk.attn_out,
+            &mut self.chunk.attn_projected,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.attn_projected[row * hidden..(row + 1) * hidden],
+                &format!("{prefix}self_attn.o_proj"),
+            );
+        }
+        for (value, residual) in self
+            .chunk
+            .attn_projected
+            .iter()
+            .zip(self.chunk.hidden.iter_mut())
+        {
+            *residual += *value;
+        }
+
+        // Post-attention norm per row.
+        self.chunk.normed.clear();
+        self.chunk.normed.resize(rows * hidden, 0.0);
+        for row in 0..rows {
+            let range = row * hidden..(row + 1) * hidden;
+            self.chunk.normed[range.clone()].copy_from_slice(&self.chunk.hidden[range.clone()]);
+            self.ctx.rmsnorm_offset(
+                &format!("{prefix}post_attention_layernorm"),
+                &mut self.chunk.normed[range],
+            )?;
+        }
+
+        // Feed-forward as batched GEMMs: gate/up, per-row SwiGLU, down.
+        self.chunk.gate.clear();
+        self.chunk.gate.resize(rows * intermediate, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}mlp.gate_proj.weight"),
+            intermediate,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.gate,
+        )?;
+        self.chunk.up.clear();
+        self.chunk.up.resize(rows * intermediate, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}mlp.up_proj.weight"),
+            intermediate,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.up,
+        )?;
+        for row in 0..rows {
+            ops::gelu_multiply(
+                &mut self.chunk.gate[row * intermediate..(row + 1) * intermediate],
+                &self.chunk.up[row * intermediate..(row + 1) * intermediate],
+            );
+        }
+        self.chunk.mlp_out.clear();
+        self.chunk.mlp_out.resize(rows * hidden, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}mlp.down_proj.weight"),
+            hidden,
+            intermediate,
+            &self.chunk.gate,
+            &mut self.chunk.mlp_out,
+        )?;
+        for (value, residual) in self
+            .chunk
+            .mlp_out
+            .iter()
+            .zip(self.chunk.hidden.iter_mut())
+        {
+            *residual += *value;
+        }
         Ok(())
     }
 
@@ -353,6 +628,18 @@ impl ModelForward for GemmaNative {
 /// Clears the toolbox KV caches between generations.
     fn clear_cache(&mut self) {
         self.ctx.clear_kv();
+    }
+
+    /// Captures the toolbox KV state for cross-generation prefix reuse.
+    fn kv_snapshot(&self) -> Option<KvSnapshot> {
+        Some(self.ctx.kv_snapshot())
+    }
+
+    /// Restores a cached prefix into the (freshly cleared) toolbox KV —
+    /// native caches are plain f32 rows, so any prefix restores bit-exact.
+    fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) -> bool {
+        self.ctx.restore_kv_prefix(snapshot, positions);
+        true
     }
 
 /// Reports the constant backend label `"native-cpu"`.

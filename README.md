@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | 🧠 **Ant tiered memory** | per-tensor VRAM/RAM/Disk residency acting on real pages — 123 MB steady RSS on a 0.5B model (vs 2.5 GB untiered) |
-| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B |
+| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B; chunked prefill runs batched GEMMs (`CHEETAH_PREFILL_CHUNK`), an LRU KV-prefix cache skips re-prefilling shared history across turns, and serve warms the model up before binding |
 | 🧩 **declarative model registry** | one registration file per family — architecture, chat template, stop markers, both backends, family constants; build.rs generates the registry, lookups derive from it |
 | 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
 | 🧰 **MCP, both directions** | **Server**: built into `cheetah serve` — the model is exposed at `POST /mcp` for any MCP agent, no flags needed. **Client**: `--mcp-server` / `--mcp-config` connects MCP servers whose tools the model calls in an agentic loop. Guide: [docs/MCP.md](docs/MCP.md) |
@@ -108,6 +108,8 @@ Key variables (full list in [docs/CODEBASE.md](docs/CODEBASE.md) §4):
 |----------|--------|---------|
 | `CHEETAH_DEVICE` | `cpu` / `vulkan` | `cpu` (native backend) |
 | `CHEETAH_QUANT_Q8` | `1` / `0` | `0` (full precision; Vulkan only) |
+| `CHEETAH_PREFILL_CHUNK` | positive integer | `256` (rows per chunked-prefill GEMM batch, native backend) |
+| `RUST_LOG` | env-filter | `info` in serve (per-request TTFT/prefill timing on stderr) |
 | `CHEETAH_VRAM_POOL_SIZE` | bytes | `838860800` (800 MiB; Vulkan C substrate pool) |
 
 ### 5. Run a chat

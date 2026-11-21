@@ -36,6 +36,7 @@ use rayon::prelude::*;
 use super::decoder::DecoderConfig;
 use super::store::{MmapWeightStore, Tier, WeightDType};
 use crate::chat::precision::{self, PrecisionBuffer};
+use crate::chat::registry::KvSnapshot;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -275,6 +276,263 @@ pub fn gemv(weight: &[u8], dtype: WeightDType, rows: usize, cols: usize, x: &[f3
             }
         });
 }
+
+/// Rows per GEMM row-block: sized so a block's weight bytes (~115 KB at
+/// Qwen-scale widths) share the L2 with the active token group.
+const GEMM_BLOCK_ROWS: usize = 64;
+/// Tokens per GEMM token-group: the group's x rows (~14 KB at Qwen-scale
+/// widths) stay L1-resident while the row block streams past them.
+const GEMM_TOKEN_GROUP: usize = 4;
+/// Cache length above which attention fans its heads out to rayon: below
+/// this the fork/join costs more than the per-head math.
+const ATTENTION_PARALLEL_MIN_CACHE: usize = 384;
+
+/// Row-parallel matrix-matrix `Y = X · Wᵀ` over stored-precision weight bytes:
+/// `x` is `[n, cols]` row-major and `y` is `[n, rows]` row-major.
+///
+/// BF16 (the prepared-model dtype) is where chunked prefill gets its win: the
+/// weight bytes stream from RAM once per batch instead of once per token.
+/// Blocking is two-level — rayon owns `[GEMM_BLOCK_ROWS, n]` row-block
+/// slices of a transposed scratch, and inside each block the tokens are
+/// walked in `GEMM_TOKEN_GROUP`-sized groups through a multi-token AVX2
+/// kernel, so the weight block lives in L2 while each 4-token x group lives
+/// in L1 (at Qwen widths the full stacked x is far bigger than a mobile
+/// L2 — a naive row-major loop re-reads it from L3 once per weight row and
+/// gives every cache win back). Every other dtype (and `n == 1`) runs the
+/// existing per-token [`gemv`] unchanged, so non-bf16 paths lose nothing.
+///
+/// Bit-exactness with the per-token path: every output element is a dot of
+/// the same weight row against the same input row with the same accumulation
+/// order per element — the batching changes only the loop order, never the
+/// math.
+pub fn gemm(
+    weight: &[u8],
+    dtype: WeightDType,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    n: usize,
+    y: &mut [f32],
+) {
+    assert_eq!(x.len(), n * cols, "gemm input width mismatch");
+    assert_eq!(y.len(), n * rows, "gemm output width mismatch");
+    if n == 1 || !matches!(dtype, WeightDType::Bf16) {
+        for index in 0..n {
+            gemv(
+                weight,
+                dtype,
+                rows,
+                cols,
+                &x[index * cols..(index + 1) * cols],
+                &mut y[index * rows..(index + 1) * rows],
+            );
+        }
+        return;
+    }
+    // Transposed scratch `y_t[row][token]`: each row-block owns one
+    // contiguous slice, so the parallel chunks write disjoint memory while
+    // sharing the read-only x.
+    let mut y_t = vec![0f32; rows * n];
+    let block_rows = GEMM_BLOCK_ROWS.min(rows);
+    if rows <= block_rows {
+        gemm_row_block(weight, cols, x, n, 0, rows, &mut y_t);
+    } else {
+        y_t.par_chunks_mut(block_rows * n)
+            .enumerate()
+            .for_each(|(chunk, out)| {
+                let row_start = chunk * block_rows;
+                let rows_in_block = out.len() / n;
+                gemm_row_block(weight, cols, x, n, row_start, rows_in_block, out);
+            });
+    }
+    // Transpose the scratch `[rows][n]` into the caller's `[n][rows]` layout.
+    for (row, out_row) in y_t.chunks_exact(n).enumerate() {
+        for (token, value) in out_row.iter().enumerate() {
+            y[token * rows + row] = *value;
+        }
+    }
+}
+
+/// Dots weight rows `row_start..row_start + block_rows` against every input
+/// row, writing `y_t[row][token]` into `out` (`block_rows` rows of `n`
+/// tokens each). Token groups outer, weight rows inner: the group's x rows
+/// stay L1-hot across the whole row block, and the row block stays L2-hot
+/// across all token groups.
+fn gemm_row_block(
+    weight: &[u8],
+    cols: usize,
+    x: &[f32],
+    n: usize,
+    row_start: usize,
+    block_rows: usize,
+    out: &mut [f32],
+) {
+    let row_stride = cols * WeightDType::Bf16.element_size();
+    for token_start in (0..n).step_by(GEMM_TOKEN_GROUP) {
+        let token_count = GEMM_TOKEN_GROUP.min(n - token_start);
+        for index_in_block in 0..block_rows {
+            let row = row_start + index_in_block;
+            let row_bytes = &weight[row * row_stride..(row + 1) * row_stride];
+            let out_row = &mut out[index_in_block * n..(index_in_block + 1) * n];
+            dot_row_bf16_multi_fused(
+                row_bytes,
+                x,
+                token_start,
+                token_count,
+                &mut out_row[token_start..token_start + token_count],
+            );
+        }
+    }
+}
+
+/// Dots one bf16 weight row against `token_count` consecutive input rows at
+/// once, writing the `token_count` results into `out`. The weight bytes and
+/// their bf16→f32 widening are amortized across the token group; each x row
+/// is `token_stride` floats wide (the caller passes the full stacked x).
+/// AVX2+FMA path: per 16-weight chunk the widened halves feed 4 tokens × 2
+/// FMA accumulators; the per-dot horizontal reductions shrink by the same
+/// group factor. Falls back to per-token [`dot_row_bf16_fused`] without AVX2.
+fn dot_row_bf16_multi_fused(
+    row: &[u8],
+    x: &[f32],
+    token_start: usize,
+    token_count: usize,
+    out: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: guarded by the runtime feature detection above.
+            unsafe {
+                return dot_row_bf16_avx2_multi(row, x, token_start, token_count, out);
+            }
+        }
+    }
+    let cols = row.len() / WeightDType::Bf16.element_size();
+    for (index, slot) in out.iter_mut().enumerate() {
+        let token = token_start + index;
+        *slot = dot_row_bf16_fused(row, &x[token * cols..(token + 1) * cols]);
+    }
+}
+
+/// Multi-token bf16 row dot over AVX2+FMA: one weight row against
+/// `token_count` (≤ 4) input rows of `cols = row.len()/2` floats each,
+/// starting at x row `token_start`. The four token accumulators are held in
+/// *explicitly unrolled* ymm registers — a runtime-indexed accumulator array
+/// spills to the stack on LLVM, serializing every FMA through memory — so
+/// the weight load and its bf16→f32 widening are amortized across the group
+/// while each FMA chain stays in registers. Each x row is `cols` floats wide
+/// (the caller passes the full stacked x).
+///
+/// # Safety
+/// Callers must guarantee AVX2 + FMA support (runtime detection).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_row_bf16_avx2_multi(
+    row: &[u8],
+    x: &[f32],
+    token_start: usize,
+    token_count: usize,
+    out: &mut [f32],
+) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let cols = row.len() / 2;
+        let (full, tail) = row.as_chunks::<32>(); // 32 bytes = 16 bf16 per chunk
+        // One accumulator pair per token lane, unrolled: 8 ymm registers.
+        let (mut a00, mut a01, mut a10, mut a11, mut a20, mut a21, mut a30, mut a31) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
+        // x row base pointers for the (up to) four lanes; inactive lanes
+        // reuse lane 0 — the extra FMAs land in accumulators that are never
+        // reduced into `out`.
+        let base0 = x.as_ptr().add(token_start * cols);
+        let base1 = if token_count > 1 { x.as_ptr().add((token_start + 1) * cols) } else { base0 };
+        let base2 = if token_count > 2 { x.as_ptr().add((token_start + 2) * cols) } else { base0 };
+        let base3 = if token_count > 3 { x.as_ptr().add((token_start + 3) * cols) } else { base0 };
+        for (chunk_index, chunk) in full.iter().enumerate() {
+            let w = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+            let lo = _mm256_castsi256_si128(w);
+            let hi = _mm256_extracti128_si256::<1>(w);
+            // Zero-extend u16 → u32 then shift left 16: the u32 lane becomes
+            // `bf16 << 16`, bit-casting to the exact f32 value.
+            let f_lo = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(lo), 16));
+            let f_hi = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(hi), 16));
+            let base = chunk_index * 16;
+            a00 = _mm256_fmadd_ps(f_lo, _mm256_loadu_ps(base0.add(base)), a00);
+            a01 = _mm256_fmadd_ps(f_hi, _mm256_loadu_ps(base0.add(base + 8)), a01);
+            a10 = _mm256_fmadd_ps(f_lo, _mm256_loadu_ps(base1.add(base)), a10);
+            a11 = _mm256_fmadd_ps(f_hi, _mm256_loadu_ps(base1.add(base + 8)), a11);
+            a20 = _mm256_fmadd_ps(f_lo, _mm256_loadu_ps(base2.add(base)), a20);
+            a21 = _mm256_fmadd_ps(f_hi, _mm256_loadu_ps(base2.add(base + 8)), a21);
+            a30 = _mm256_fmadd_ps(f_lo, _mm256_loadu_ps(base3.add(base)), a30);
+            a31 = _mm256_fmadd_ps(f_hi, _mm256_loadu_ps(base3.add(base + 8)), a31);
+        }
+        let full_count = full.len() * 16;
+        let tails = tail.as_chunks::<2>().0;
+        let mut results = [0f32; GEMM_TOKEN_GROUP];
+        let accs = [
+            [a00, a01],
+            [a10, a11],
+            [a20, a21],
+            [a30, a31],
+        ];
+        // Only the active lanes reduce: inactive lanes' accumulators hold
+        // recomputed lane-0 values and their x rows may not exist.
+        for (token_in_group, slot) in results[..token_count].iter_mut().enumerate() {
+            let x_row = &x[(token_start + token_in_group) * cols..(token_start + token_in_group + 1) * cols];
+            let mut tail_total = 0f32;
+            for (index, byte_pair) in tails.iter().enumerate() {
+                let x_index = full_count + index;
+                tail_total += widen_bf16(byte_pair[0], byte_pair[1]) * x_row[x_index];
+            }
+            *slot = horizontal_sum(accs[token_in_group][0])
+                + horizontal_sum(accs[token_in_group][1])
+                + tail_total;
+        }
+        out[..token_count].copy_from_slice(&results[..token_count]);
+    }
+}
+
+/// Sums the 8 f32 lanes of one accumulator (once per weight row per token —
+/// negligible next to the FMA loop).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn horizontal_sum(value: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut storage = std::mem::MaybeUninit::<[f32; 8]>::uninit();
+        _mm256_storeu_ps(storage.as_mut_ptr() as *mut f32, value);
+        storage.assume_init().iter().sum()
+    }
+}
+
+/// Rows per chunked-prefill GEMM batch. Overridable with
+/// `CHEETAH_PREFILL_CHUNK` for experiments; 256 keeps the stacked inputs
+/// (roughly a megabyte at Qwen-scale widths) cache-friendly while amortizing
+/// the weight traffic across the whole chunk.
+pub(crate) fn prefill_chunk_size() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("CHEETAH_PREFILL_CHUNK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(PREFILL_CHUNK_ROWS)
+    })
+}
+
+/// Default rows per chunked prefill batch (see [`prefill_chunk_size`]).
+const PREFILL_CHUNK_ROWS: usize = 256;
 
 /// Q8 matvec over the registered quantized buffer layout (`q8` in
 /// `crate::chat::precision`): a head of `rows` f32 row scales followed by
@@ -604,6 +862,80 @@ impl Scratch {
     }
 }
 
+/// Chunked-prefill scratch: the same intermediates as [`Scratch`], stacked
+/// `[chunk_rows, width]` row-major so the batched projections run as GEMMs.
+/// The final position's residual row lands back in the per-token
+/// [`Scratch::hidden`] for the LM head.
+///
+/// Cloning a runtime keeps the buffers (like [`Scratch`], they are pure
+/// scratch — contents never leak into results).
+#[derive(Clone)]
+pub(crate) struct ChunkScratch {
+    /// Residual stream rows, `[rows, hidden_size]`.
+    pub(crate) hidden: Vec<f32>,
+    /// Most recent norm output per row, `[rows, hidden_size]`.
+    pub(crate) normed: Vec<f32>,
+    /// Query rows after projection, optional norms, and rope, `[rows, q_dim]`.
+    pub(crate) q: Vec<f32>,
+    /// Key rows after projection, optional norms, and rope, `[rows, kv_dim]`.
+    pub(crate) k: Vec<f32>,
+    /// Value rows after projection, `[rows, kv_dim]`.
+    pub(crate) v: Vec<f32>,
+    /// Attention output rows before the output projection, `[rows, q_dim]`.
+    pub(crate) attn_out: Vec<f32>,
+    /// Attention output rows after `o_proj`/`dense`, `[rows, hidden_size]`.
+    pub(crate) attn_projected: Vec<f32>,
+    /// Gate projection rows / activated intermediate, `[rows, intermediate]`.
+    pub(crate) gate: Vec<f32>,
+    /// Up projection rows, `[rows, intermediate]`.
+    pub(crate) up: Vec<f32>,
+    /// Feed-forward output rows, `[rows, hidden_size]`.
+    pub(crate) mlp_out: Vec<f32>,
+    /// Rows the buffers were last sized for.
+    capacity_rows: usize,
+}
+
+impl ChunkScratch {
+    /// Empty chunk scratch; buffers grow on the first
+    /// [`ChunkScratch::resize_for`].
+    pub(crate) fn new() -> Self {
+        Self {
+            hidden: Vec::new(),
+            normed: Vec::new(),
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            attn_out: Vec::new(),
+            attn_projected: Vec::new(),
+            gate: Vec::new(),
+            up: Vec::new(),
+            mlp_out: Vec::new(),
+            capacity_rows: 0,
+        }
+    }
+
+    /// Sizes every buffer for `rows` chunk rows (a no-op when the capacity
+    /// already covers them; grows when `CHEETAH_PREFILL_CHUNK` yields a
+    /// larger final chunk than previous calls saw).
+    pub(crate) fn resize_for(&mut self, cfg: &DecoderConfig, rows: usize) {
+        if rows <= self.capacity_rows {
+            return;
+        }
+        let kv_dim = cfg.kv_heads * cfg.head_dim;
+        self.hidden = vec![0.0; rows * cfg.hidden_size];
+        self.normed = vec![0.0; rows * cfg.hidden_size];
+        self.q = vec![0.0; rows * cfg.q_heads * cfg.head_dim];
+        self.k = vec![0.0; rows * kv_dim];
+        self.v = vec![0.0; rows * kv_dim];
+        self.attn_out = vec![0.0; rows * cfg.q_heads * cfg.head_dim];
+        self.attn_projected = vec![0.0; rows * cfg.hidden_size];
+        self.gate = vec![0.0; rows * cfg.intermediate_size];
+        self.up = vec![0.0; rows * cfg.intermediate_size];
+        self.mlp_out = vec![0.0; rows * cfg.hidden_size];
+        self.capacity_rows = rows;
+    }
+}
+
 /// The selected quantization format's native operators (from the precision
 /// registry) plus the quantized unit buffers it has produced. `None`-free
 /// design: without a selected format both operators stay `None` and every
@@ -904,10 +1236,112 @@ impl OpsToolbox {
         Ok(())
     }
 
+    /// Batched linear: `y[n, rows] = x[n, cols] · Wᵀ` against `unit` — the
+    /// chunked-prefill counterpart of [`OpsToolbox::linear`]. Stored-precision
+    /// bf16 runs the batched [`gemm`]; quantized units (registered buffer or
+    /// lazy first-use quantization) keep their packed-domain per-row matvec,
+    /// run once per input row, so their math is unchanged.
+    pub(crate) fn linear_batch(
+        &mut self,
+        unit: &str,
+        rows: usize,
+        cols: usize,
+        x: &[f32],
+        y: &mut [f32],
+    ) -> Result<(), String> {
+        let n = x.len() / cols;
+        // Fast path: this unit has already been quantized at least once.
+        if let Some(buffer) = self.quant.buffers.get(unit) {
+            let gemv = self
+                .quant
+                .gemv
+                .expect("quantized unit present without a registered gemv operator");
+            let bytes = buffer.buffer();
+            for index in 0..n {
+                (gemv)(
+                    bytes,
+                    buffer.rows(),
+                    buffer.cols(),
+                    &x[index * cols..(index + 1) * cols],
+                    &mut y[index * rows..(index + 1) * rows],
+                );
+            }
+            return Ok(());
+        }
+        if let (Some(quantize), Some(gemv)) = (self.quant.quantize, self.quant.gemv) {
+            // Lazy load-time quantization — the same first-use conversion
+            // `linear` performs, then one matvec per input row.
+            let (bytes, dtype, _) = self.store.slice(unit)?;
+            let count = rows
+                .checked_mul(cols)
+                .ok_or_else(|| format!("Linear unit '{unit}' size overflow."))?;
+            if bytes.len() != count * dtype.element_size() {
+                return Err(format!(
+                    "Linear unit '{unit}' does not match its {rows}x{cols} shape."
+                ));
+            }
+            let values = dequant_values(bytes, dtype, count);
+            let buffer = quantize(&values, rows, cols)?;
+            self.quant.buffers.insert(unit.to_owned(), buffer);
+            self.store.drop_pages(unit);
+            let buffer = self
+                .quant
+                .buffers
+                .get(unit)
+                .expect("quantized buffer was just inserted");
+            let bytes = buffer.buffer();
+            for index in 0..n {
+                (gemv)(
+                    bytes,
+                    buffer.rows(),
+                    buffer.cols(),
+                    &x[index * cols..(index + 1) * cols],
+                    &mut y[index * rows..(index + 1) * rows],
+                );
+            }
+            return Ok(());
+        }
+        let (bytes, dtype, _) = self.store.slice(unit)?;
+        let format_id = dtype.format_id();
+        let ops = precision::native_ops_for_format(format_id).ok_or_else(|| {
+            format!(
+                "Weight precision '{format_id}' ({}) has no native operator table for unit '{unit}'.",
+                precision::format_label(format_id)
+            )
+        })?;
+        if matches!(dtype, WeightDType::Bf16) {
+            gemm(bytes, dtype, rows, cols, x, n, y);
+        } else {
+            for index in 0..n {
+                (ops.gemv)(
+                    bytes,
+                    rows,
+                    cols,
+                    &x[index * cols..(index + 1) * cols],
+                    &mut y[index * rows..(index + 1) * rows],
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Append one position's K/V rows to a layer's cache.
     pub(crate) fn cache_append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
         self.kv_k[layer].extend_from_slice(k);
         self.kv_v[layer].extend_from_slice(v);
+    }
+
+    /// Pre-allocates every layer's KV cache for `positions` upcoming rows, so
+    /// a long prefill grows into reserved capacity instead of repeatedly
+    /// doubling (each doubling memcpys the whole cache). Never shrinks or
+    /// moves existing contents; a no-op when the capacity is already there.
+    pub(crate) fn reserve_kv(&mut self, positions: usize) {
+        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
+        let needed = positions.saturating_mul(kv_dim);
+        for (keys, values) in self.kv_k.iter_mut().zip(self.kv_v.iter_mut()) {
+            keys.reserve(needed.saturating_sub(keys.len()));
+            values.reserve(needed.saturating_sub(values.len()));
+        }
     }
 
     /// Grouped-query attention over the cached keys for `position`.
@@ -936,47 +1370,100 @@ impl OpsToolbox {
         };
         // Never start past the cache: an all-masked softmax would be NaN.
         let window_start = window_start.min(cache_len.saturating_sub(1));
-        let mut head0_scores: Option<Vec<f32>> = None;
-        for head in 0..self.cfg.q_heads {
-            let kv_head = head / head_group;
-            let q_base = head * self.cfg.head_dim;
-            let kv_base = kv_head * self.cfg.head_dim;
-            self.scores.clear();
-            self.scores.resize(cache_len, f32::NEG_INFINITY);
-            for pos in window_start..cache_len {
-                let k_base = pos * kv_dim + kv_base;
-                let score: f32 = self.kv_k[layer][k_base..k_base + self.cfg.head_dim]
-                    .iter()
-                    .zip(&q[q_base..q_base + self.cfg.head_dim])
-                    .map(|(k, q)| k * q)
-                    .sum();
-                self.scores[pos] = score * scale;
-            }
-            softmax(&mut self.scores);
-            if head == 0 && self.debug_capture_armed {
-                head0_scores = Some(self.scores.clone());
-            }
-            for pos in window_start..cache_len {
-                let weight = self.scores[pos];
-                if weight == 0.0 {
-                    continue;
-                }
-                let v_base = pos * kv_dim + kv_base;
-                for (index, out_value) in out[q_base..q_base + self.cfg.head_dim]
-                    .iter_mut()
-                    .enumerate()
-                {
-                    *out_value += weight * self.kv_v[layer][v_base + index];
-                }
-            }
+        let head_dim = self.cfg.head_dim;
+        let q_heads = self.cfg.q_heads;
+        let keys = &self.kv_k[layer];
+        let values = &self.kv_v[layer];
+        // Heads are independent: scores → softmax → value mix is a pure
+        // function of the cache + q. At long caches this loop dominates
+        // prefill, so heads fan out to rayon (short caches and single-head
+        // configs run sequentially — the fork/join would cost more than the
+        // math). The math per head is unchanged, so results stay bit-exact.
+        let parallel = q_heads > 1 && cache_len >= ATTENTION_PARALLEL_MIN_CACHE;
+        let head_results: Vec<(Vec<f32>, Vec<f32>)> = if parallel {
+            (0..q_heads)
+                .into_par_iter()
+                .map(|head| {
+                    Self::attention_head(
+                        keys, values, q, cache_len, window_start, kv_dim, head_group, head_dim,
+                        scale, head,
+                    )
+                })
+                .collect()
+        } else {
+            (0..q_heads)
+                .map(|head| {
+                    Self::attention_head(
+                        keys, values, q, cache_len, window_start, kv_dim, head_group, head_dim,
+                        scale, head,
+                    )
+                })
+                .collect()
+        };
+        for (head, (_, head_out)) in head_results.iter().enumerate() {
+            out[head * head_dim..(head + 1) * head_dim].copy_from_slice(head_out);
         }
-        if head0_scores.is_some() {
+        if self.debug_capture_armed {
             self.debug_capture_armed = false;
+            let head0_scores = head_results
+                .into_iter()
+                .next()
+                .map(|(scores, _)| scores)
+                .expect("armed capture always records head 0");
             self.debug_capture_buf = Some(DebugCapture {
-                scores: head0_scores.expect("armed capture recorded head-0 scores"),
+                scores: head0_scores,
                 attn_out: out.to_vec(),
             });
         }
+    }
+
+    /// One attention head: scaled scores over the visible cache window,
+    /// softmax, weighted value mix. Side-effect-free over the cache — the
+    /// per-head fan-out inside [`OpsToolbox::attention`] relies on that.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_head(
+        keys: &[f32],
+        values: &[f32],
+        q: &[f32],
+        cache_len: usize,
+        window_start: usize,
+        kv_dim: usize,
+        head_group: usize,
+        head_dim: usize,
+        scale: f32,
+        head: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let kv_head = head / head_group;
+        let q_base = head * head_dim;
+        let kv_base = kv_head * head_dim;
+        let mut scores = vec![f32::NEG_INFINITY; cache_len];
+        for pos in window_start..cache_len {
+            let k_base = pos * kv_dim + kv_base;
+            let score: f32 = keys[k_base..k_base + head_dim]
+                .iter()
+                .zip(&q[q_base..q_base + head_dim])
+                .map(|(k, q)| k * q)
+                .sum();
+            scores[pos] = score * scale;
+        }
+        softmax(&mut scores);
+        // Weighted value mix: per position, one contiguous `head_dim` slice
+        // of the V cache. Slices (not per-element indexing) keep this
+        // auto-vectorizable — a bounds-checked `kv_v[base+index]` per element
+        // ran this loop ~10x slower at long contexts.
+        let mut out_head = vec![0f32; head_dim];
+        for pos in window_start..cache_len {
+            let weight = scores[pos];
+            if weight == 0.0 {
+                continue;
+            }
+            let v_base = pos * kv_dim + kv_base;
+            let v_row = &values[v_base..v_base + head_dim];
+            for (out_value, v) in out_head.iter_mut().zip(v_row) {
+                *out_value += weight * v;
+            }
+        }
+        (scores, out_head)
     }
 
     /// RC2-B: routing-aware per-expert residency management. Evict the
@@ -1081,6 +1568,41 @@ impl OpsToolbox {
     pub(crate) fn kv_len(&self, layer: usize) -> usize {
         let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
         self.kv_k[layer].len() / kv_dim.max(1)
+    }
+
+    /// Captures the current KV state (all layers, all stored positions) for
+    /// cross-generation prefix reuse.
+    pub(crate) fn kv_snapshot(&self) -> KvSnapshot {
+        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
+        let positions = self
+            .kv_k
+            .first()
+            .map(|layer| layer.len() / kv_dim.max(1))
+            .unwrap_or(0);
+        KvSnapshot {
+            positions,
+            kv_k: self.kv_k.clone(),
+            kv_v: self.kv_v.clone(),
+        }
+    }
+
+    /// Restores the first `positions` positions of `snapshot` into this
+    /// toolbox's (freshly cleared) KV caches, truncating anything beyond.
+    /// The result must be bit-equivalent to having prefilled those tokens
+    /// here — the decoder KV-continuation tests pin that property.
+    pub(crate) fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) {
+        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
+        let keep = positions.min(snapshot.positions).saturating_mul(kv_dim);
+        self.kv_k = snapshot
+            .kv_k
+            .iter()
+            .map(|layer| layer.iter().take(keep).copied().collect())
+            .collect();
+        self.kv_v = snapshot
+            .kv_v
+            .iter()
+            .map(|layer| layer.iter().take(keep).copied().collect())
+            .collect();
     }
 
     /// Clear every layer's KV cache.
@@ -1196,6 +1718,80 @@ mod tests {
         }
         gemv(&weight_bf16, WeightDType::Bf16, 2, 3, &x, &mut y);
         assert_eq!(y, vec![-2.0, -2.0]);
+    }
+
+    /// gemm vs per-row gemv: every output element of the batched kernel must
+    /// match a per-token `gemv` call bit for bit — the chunked prefill path
+    /// depends on this equivalence (same dot, different loop order only).
+    #[test]
+    fn gemm_matches_per_row_gemv_bit_exact() {
+        // Deterministic pseudo-random weights/inputs; bf16-rounded.
+        let rows = GEMV_CHUNK_ROWS * 2 + 3; // exercises the parallel chunk path
+        let cols = 8usize;
+        let n = 7usize;
+        let weight: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index * 37 % 23) as f32 - 11.0) / 8.0)
+            .collect();
+        let mut weight_bf16 = Vec::with_capacity(rows * cols * 2);
+        for value in &weight {
+            let bits = (value.to_bits() >> 16) as u16;
+            weight_bf16.extend_from_slice(&bits.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..n * cols)
+            .map(|index| ((index * 11 % 17) as f32 - 8.0) / 4.0)
+            .collect();
+
+        let mut y_gemm = vec![0f32; n * rows];
+        gemm(
+            &weight_bf16,
+            WeightDType::Bf16,
+            rows,
+            cols,
+            &x,
+            n,
+            &mut y_gemm,
+        );
+        for token in 0..n {
+            let mut y_gemv = vec![0f32; rows];
+            gemv(
+                &weight_bf16,
+                WeightDType::Bf16,
+                rows,
+                cols,
+                &x[token * cols..(token + 1) * cols],
+                &mut y_gemv,
+            );
+            assert_eq!(
+                &y_gemm[token * rows..(token + 1) * rows],
+                &y_gemv[..],
+                "token {token}: gemm must equal per-token gemv bit for bit"
+            );
+        }
+
+        // Non-bf16 dtypes fall back to per-row gemv — must match trivially.
+        let weight_f32: Vec<u8> = weight.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let mut y_f32 = vec![0f32; n * rows];
+        gemm(
+            &weight_f32,
+            WeightDType::F32,
+            rows,
+            cols,
+            &x,
+            n,
+            &mut y_f32,
+        );
+        for token in 0..n {
+            let mut y_gemv = vec![0f32; rows];
+            gemv(
+                &weight_f32,
+                WeightDType::F32,
+                rows,
+                cols,
+                &x[token * cols..(token + 1) * cols],
+                &mut y_gemv,
+            );
+            assert_eq!(&y_f32[token * rows..(token + 1) * rows], &y_gemv[..]);
+        }
     }
 
     /// gemv_q8: the dot runs in the quantized domain — per-row scale × int8

@@ -16,7 +16,10 @@ use super::native::ops::{self, OpsToolbox, Scratch};
 #[cfg(test)]
 use super::native::store::MmapWeightStore;
 use super::templates::mixtral;
-use super::{AntTierControl, BackendLoader, ChatTemplate, ModelFamily, ModelForward, ModelRegistration};
+use super::{
+    AntTierControl, BackendLoader, ChatTemplate, KvSnapshot, ModelFamily, ModelForward,
+    ModelRegistration,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -118,6 +121,9 @@ impl MixtralNative {
     /// contract).
     fn run_forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         self.ctx.validate_tokens(tokens)?;
+        // Reserve the KV span for the whole prefill up front: growth into
+        // reserved capacity instead of doubling copies mid-prefill.
+        self.ctx.reserve_kv(offset + tokens.len());
         for (index, &token) in tokens.iter().enumerate() {
             self.forward_position(token as usize, offset + index)?;
         }
@@ -442,6 +448,18 @@ impl ModelForward for MixtralNative {
 /// Clears the toolbox KV caches between generations.
     fn clear_cache(&mut self) {
         self.ctx.clear_kv();
+    }
+
+    /// Captures the toolbox KV state for cross-generation prefix reuse.
+    fn kv_snapshot(&self) -> Option<KvSnapshot> {
+        Some(self.ctx.kv_snapshot())
+    }
+
+    /// Restores a cached prefix into the (freshly cleared) toolbox KV —
+    /// native caches are plain f32 rows, so any prefix restores bit-exact.
+    fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) -> bool {
+        self.ctx.restore_kv_prefix(snapshot, positions);
+        true
     }
 
 /// Reports the constant backend label `"native-cpu"`.

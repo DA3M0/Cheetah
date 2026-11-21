@@ -98,9 +98,39 @@ main.rs::run (dispatch)                      src/main.rs
 ```
 serve::serve            src/serve/mod.rs:17  (auth checks, resolve_model:140)
   → load_engine_with_progress (same pipeline as chat)
+  → engine.warmup       one-token forward before the listener binds (page-in)
   → axum server         http.rs (SSE streaming, queue.rs concurrency tickets)
   → per request: openai.rs (request parsing/validation) → engine.generate_with_chat_params
 ```
+
+Per-request timing (queue wait / tokenize / prefill / TTFT) is logged at
+`info` level to stderr — set `RUST_LOG=info` (the serve default filter) to see
+it. Long prompts prefill through chunked batched-GEMM passes
+(`CHEETAH_PREFILL_CHUNK`, default 256 rows), and the engine keeps a small LRU
+of post-prefill KV snapshots (`PrefixCache` in engine.rs) so a request whose
+history extends a recently prefilled prompt skips re-prefilling the shared
+prefix — multi-turn chat, agentic tool rounds and identical retries all hit
+it. Backends without KV snapshot support (Vulkan, currently) simply never
+reuse; mixtral does not batch its sparse feed-forward yet. Known limitation:
+with `CHEETAH_QUANT_Q8`/`Q4`, quantized buffers start fresh per generation
+(the runtime clone resets them), so quantize-at-first-use repeats inside every
+request's TTFT — full-resident bf16 does not have this cost.
+
+Measured TTFT on the reference laptop (i5-4200M, 2C/4T, native bf16,
+qwen-0.5b-prepared, ~1.4k-token prompt, `max_tokens=8`, streaming, first
+content delta):
+
+| Scenario | before (HEAD c3c79bf) | after |
+|---|---|---|
+| Repeat / multi-turn turn hitting the KV prefix cache | 187–208 s | **0.17–0.45 s** |
+| Cold prompt (no cached prefix) | 187–208 s | **~75 s** |
+
+The cold prompt is bounded by raw CPU: chunked GEMM runs ~15.8 GMACs/s and
+attention ~3.2 GMACs/s on this machine (see the ignored
+`bench_prefill_hotspots` test: `cargo test --release bench_prefill -- --ignored --nocapture`).
+Remaining headroom: chunk-parallel attention (needs a visibility-cap parameter
+on `OpsToolbox::attention`), GEMM port-5 shuffle pressure, and pre-widening x
+to f32 per token group.
 
 ### 2.3 `cheetah init <src> <dst>`
 
@@ -227,6 +257,8 @@ run_init_command      src/main.rs:90
 | `CHEETAH_NATIVE` | engine.rs | `0` / `1` | `0` skips native selection (surfaces the guidance error for architectures without a native backend on CPU). Kept for policy testing. |
 | `CHEETAH_QUANT_Q8` | precision registry (`chat::precision::selected_format`) → both backends | `1` / `true` | Selects the registered `q8` format: Linear projections quantize to row-wise int8 at load time through the format's registered operators — Vulkan (streaming + resident matmul) and native (quantize-at-first-use gemv, source pages released). Halves the weight footprint; norms/biases/embeddings stay in original precision. |
 | `CHEETAH_QUANT_Q4` | precision registry (`chat::precision::selected_format`) → both backends | `1` / `true` | Selects the registered `q4` format: Linear projections quantize to row-wise symmetric int4 (two codes per byte, scale = max\|w\|/7) — a quarter of the BF16 footprint. Same dual-backend operator table as q8 (`matmul_q4.comp` pipeline on Vulkan, `gemv_q4` on native). |
+| `CHEETAH_PREFILL_CHUNK` | `ops::prefill_chunk_size` (native backend) | positive integer (default 256) | Rows per chunked-prefill batched-GEMM pass. Single-token decode steps are unaffected; only prefill batching changes. |
+| `RUST_LOG` | `tracing_subscriber` (serve only) | env-filter syntax (serve default `info`) | Per-request timing lines (queue wait / tokenize / prefill / TTFT / decode rate) log at `info` on stderr. |
 
 ### 4.2 Vulkan substrate
 

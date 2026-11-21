@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Sleep;
 
@@ -313,6 +314,7 @@ async fn handle_chat_completions(
     request: Request,
     generation_ticket: QueueTicket,
 ) -> Response {
+    let arrived = Instant::now();
     let body = match axum::body::to_bytes(request.into_body(), BODY_LIMIT).await {
         Ok(body) => body,
         Err(error) => {
@@ -512,6 +514,7 @@ async fn handle_chat_completions(
     }
 
     let mut messages = prepared.messages;
+    let tokenize_started = Instant::now();
     let tokens = match state
         .engine
         .prepare(&mut messages, system.as_deref(), options.max_tokens)
@@ -519,6 +522,7 @@ async fn handle_chat_completions(
         Ok((tokens, _)) => tokens,
         Err(error) => return error_response(prompt_error_status(&error), &error),
     };
+    let tokenize_duration = tokenize_started.elapsed();
 
     if api_request.stream {
         let heartbeat_frame =
@@ -530,8 +534,12 @@ async fn handle_chat_completions(
         let disconnected = Arc::new(AtomicBool::new(false));
         let response = sse_response(rx, heartbeat_frame, Some(Arc::clone(&disconnected)));
         let gen_state = Arc::clone(&state);
+        let queue_started = Instant::now();
+        let request_total_ms = arrived.elapsed().as_millis();
         tokio::task::spawn_blocking(move || {
             let guard = generation_ticket.acquire();
+            let queue_wait_ms = queue_started.elapsed().as_millis();
+            let acquired_at = Instant::now();
             let mut sink =
                 SseSink::new_with_disconnect(tx, completion_id, created, model, disconnected);
             let result = generate_chat(
@@ -545,6 +553,19 @@ async fn handle_chat_completions(
             );
             match result {
                 Ok(generation) => {
+                    let ttft_ms = sink
+                        .first_push_at
+                        .map(|first_push| first_push.duration_since(acquired_at).as_millis());
+                    tracing::info!(
+                        queue_wait_ms,
+                        tokenize_ms = tokenize_duration.as_millis(),
+                        prefill_ms = generation.prefill_duration.as_millis(),
+                        ttft_ms = ttft_ms.unwrap_or(0),
+                        prompt_tokens = generation.prompt_tokens,
+                        generated_tokens = generation.generated_tokens,
+                        request_total_ms,
+                        "chat completion (stream) timing"
+                    );
                     if let Err(err) = sink
                         .send_chunk(None, None, None, Some(generation.finish_reason.as_str()))
                         .and_then(|()| sink.send_done())
@@ -570,10 +591,12 @@ async fn handle_chat_completions(
         });
         response
     } else {
+        let queue_started = Instant::now();
         let generation = tokio::task::spawn_blocking(move || {
             let guard = generation_ticket.acquire();
+            let queue_wait_ms = queue_started.elapsed().as_millis();
             let mut sink = NullSink;
-            generate_chat(
+            let result = generate_chat(
                 &state,
                 guard,
                 tokens,
@@ -581,7 +604,18 @@ async fn handle_chat_completions(
                 &stop,
                 &mut sink,
                 &resident_overrides,
-            )
+            );
+            if let Ok(generation) = &result {
+                tracing::info!(
+                    queue_wait_ms,
+                    tokenize_ms = tokenize_duration.as_millis(),
+                    prefill_ms = generation.prefill_duration.as_millis(),
+                    prompt_tokens = generation.prompt_tokens,
+                    generated_tokens = generation.generated_tokens,
+                    "chat completion timing"
+                );
+            }
+            result
         })
         .await
         .expect("generation task panicked");
@@ -901,6 +935,9 @@ struct SseSink {
     created: u64,
     model: String,
     first: bool,
+    /// Timestamp of the first content delta pushed to the client — the raw
+    /// material for the TTFT timing log.
+    first_push_at: Option<Instant>,
     disconnected: Option<Arc<AtomicBool>>,
 }
 
@@ -941,6 +978,7 @@ impl SseSink {
             created,
             model,
             first: true,
+            first_push_at: None,
             disconnected,
         }
     }
@@ -1070,6 +1108,9 @@ impl TextSink for SseSink {
             .is_some_and(|disconnected| disconnected.load(Ordering::Relaxed))
         {
             return Err("Client disconnected".to_string());
+        }
+        if self.first_push_at.is_none() {
+            self.first_push_at = Some(Instant::now());
         }
         let role = self.first.then_some("assistant");
         self.first = false;
@@ -1327,6 +1368,7 @@ mod tests {
             created: 0,
             model: "test".to_string(),
             first: true,
+            first_push_at: None,
             disconnected: None,
         };
 

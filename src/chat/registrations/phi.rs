@@ -13,11 +13,14 @@
 //! `rotary_dim` share of each head), and an untied lm head.
 
 use super::native::decoder::DecoderConfig;
-use super::native::ops::{self, OpsToolbox, Scratch};
+use super::native::ops::{self, ChunkScratch, OpsToolbox, Scratch};
 #[cfg(test)]
 use super::native::store::MmapWeightStore;
 use super::templates::phi;
-use super::{AntTierControl, BackendLoader, ChatTemplate, ModelFamily, ModelForward, ModelRegistration};
+use super::{
+    AntTierControl, BackendLoader, ChatTemplate, KvSnapshot, ModelFamily, ModelForward,
+    ModelRegistration,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -95,6 +98,8 @@ pub(crate) struct PhiNative {
     pub(crate) ctx: OpsToolbox,
     /// Reusable activation buffers (preallocated at capacity).
     pub(crate) scratch: Scratch,
+    /// Chunked-prefill activation buffers (`[rows, width]` stacks).
+    pub(crate) chunk: ChunkScratch,
 }
 
 impl PhiNative {
@@ -104,6 +109,7 @@ impl PhiNative {
         let ctx = OpsToolbox::with_store(cfg.clone(), store);
         Self {
             scratch: Scratch::new(&cfg),
+            chunk: ChunkScratch::new(),
             cfg,
             ctx,
         }
@@ -115,6 +121,7 @@ impl PhiNative {
         let cfg = ctx.cfg.clone();
         Self {
             scratch: Scratch::new(&cfg),
+            chunk: ChunkScratch::new(),
             cfg,
             ctx,
         }
@@ -122,14 +129,37 @@ impl PhiNative {
 
     /// Run the full forward for tokens starting at `offset`; returns the
     /// logits of the final position only (matching the engine's sampling
-    /// contract).
+    /// contract). Single tokens (decode steps) run the per-position path;
+    /// longer batches (prefill) split into chunked batched-GEMM passes.
     fn run_forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        self.forward_with_chunk(tokens, offset, ops::prefill_chunk_size())
+    }
+
+    /// [`Self::run_forward`] with an explicit chunk size — tests force
+    /// `chunk_rows = 1` as the per-position reference.
+    pub(crate) fn forward_with_chunk(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        chunk_rows: usize,
+    ) -> Result<Vec<f32>, String> {
         self.ctx.validate_tokens(tokens)?;
-        for (index, &token) in tokens.iter().enumerate() {
-            self.forward_position(token as usize, offset + index)?;
+        // Reserve the KV span for the whole prefill up front: growth into
+        // reserved capacity instead of doubling copies mid-prefill.
+        self.ctx.reserve_kv(offset + tokens.len());
+        if tokens.len() == 1 {
+            self.forward_position(tokens[0] as usize, offset)?;
+        } else {
+            self.forward_chunked(tokens, offset, chunk_rows)?;
         }
-        // Phi keeps a separate lm_head tensor; the tied branch reads the
-        // embedding table instead.
+        self.lm_head()
+    }
+
+    /// Phi keeps a separate lm_head tensor; the tied branch reads the
+    /// embedding table instead. Ant: layer 0's bucket also holds the
+    /// embedding / final norm, whose pages lm_head just swept; the disk-tier
+    /// ones drop now and re-fault from the OS page cache.
+    fn lm_head(&mut self) -> Result<Vec<f32>, String> {
         let head_unit = if self.cfg.tie_word_embeddings {
             "model.embed_tokens.weight"
         } else {
@@ -137,9 +167,6 @@ impl PhiNative {
         };
         self.ctx
             .lm_head_into(head_unit, &self.scratch.hidden, &mut self.scratch.logits)?;
-        // Ant: layer 0's bucket also holds the embedding / final norm, whose
-        // pages lm_head just swept; drop the disk-tier ones now. The pages
-        // re-fault (from the OS page cache) on their next access.
         self.ctx.drop_disk_units_of_layer(0);
         Ok(std::mem::take(&mut self.scratch.logits))
     }
@@ -158,6 +185,216 @@ impl PhiNative {
         }
         self.ctx
             .layernorm("model.final_layernorm", &mut self.scratch.hidden)?;
+        Ok(())
+    }
+
+    /// Chunked prefill: splits `tokens` into `chunk_rows`-sized batches and
+    /// processes each through [`Self::forward_chunk`]. The projections run as
+    /// batched GEMMs (the per-token path is a GEMV per token, re-streaming
+    /// every weight once per position); norms, rope, KV append and attention
+    /// stay per-row, which keeps the result bit-exact against the
+    /// per-position path.
+    pub(crate) fn forward_chunked(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        chunk_rows: usize,
+    ) -> Result<(), String> {
+        for start in (0..tokens.len()).step_by(chunk_rows.max(1)) {
+            let end = (start + chunk_rows).min(tokens.len());
+            self.forward_chunk(&tokens[start..end], offset + start)?;
+        }
+        Ok(())
+    }
+
+    /// One chunk of prefill positions as batched GEMMs, ending with the final
+    /// norm of the last position (the only one whose logits the caller reads).
+    fn forward_chunk(&mut self, tokens: &[u32], offset: usize) -> Result<(), String> {
+        let rows = tokens.len();
+        let hidden = self.cfg.hidden_size;
+        self.chunk.resize_for(&self.cfg, rows);
+        // Stack the embedding rows (unscaled — phi has no embedding scale).
+        self.chunk.hidden.clear();
+        let mut row = std::mem::take(&mut self.scratch.hidden);
+        for &token in tokens {
+            self.ctx.embedding_row_into(token as usize, &mut row)?;
+            self.chunk.hidden.extend_from_slice(&row);
+        }
+        self.scratch.hidden = row;
+        for layer in 0..self.cfg.num_layers {
+            self.forward_layer_chunk(layer, offset, rows)?;
+            // Ant: same per-layer page release as the per-position path.
+            self.ctx.drop_disk_units_of_layer(layer as i32);
+        }
+        // Only the final position feeds the LM head: norm its residual row
+        // into `scratch.hidden` (the caller's logits input). Phi's GPT-NeoX
+        // heritage names it `final_layernorm`.
+        let last_row_start = (rows - 1) * hidden;
+        self.scratch.hidden.clear();
+        self.scratch
+            .hidden
+            .extend_from_slice(&self.chunk.hidden[last_row_start..last_row_start + hidden]);
+        self.ctx
+            .layernorm("model.final_layernorm", &mut self.scratch.hidden)?;
+        Ok(())
+    }
+
+    /// One decoder layer over a whole chunk — the phi parallel-residual block
+    /// with the projections batched: one input LayerNorm feeds attention AND
+    /// MLP, the fused `qkv_proj` runs as one GEMM, and the residual is the
+    /// single update `x + attn_out + mlp_out`.
+    fn forward_layer_chunk(
+        &mut self,
+        layer: usize,
+        offset: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let cfg = &self.cfg;
+        let q_dim = cfg.q_heads * cfg.head_dim;
+        let kv_dim = cfg.kv_heads * cfg.head_dim;
+        let fused_rows = (cfg.q_heads + 2 * cfg.kv_heads) * cfg.head_dim;
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        let prefix = format!("model.layers.{layer}.");
+
+        // Input norm per row: attention AND MLP read the same normed state.
+        self.chunk.normed.clear();
+        self.chunk.normed.resize(rows * hidden, 0.0);
+        for row in 0..rows {
+            let range = row * hidden..(row + 1) * hidden;
+            self.chunk.normed[range.clone()].copy_from_slice(&self.chunk.hidden[range.clone()]);
+            self.ctx
+                .layernorm(&format!("{prefix}input_layernorm"), &mut self.chunk.normed[range])?;
+        }
+
+        // Fused qkv projection as one batched GEMM (plus its fused bias per
+        // row), then split into q/k/v the way the per-position path does.
+        self.chunk.q.clear();
+        self.chunk.q.resize(rows * fused_rows, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.qkv_proj.weight"),
+            fused_rows,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.q,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.q[row * fused_rows..(row + 1) * fused_rows],
+                &format!("{prefix}self_attn.qkv_proj"),
+            );
+        }
+        self.chunk.k.clear();
+        self.chunk.k.resize(rows * kv_dim, 0.0);
+        self.chunk.v.clear();
+        self.chunk.v.resize(rows * kv_dim, 0.0);
+        for row in 0..rows {
+            let fused_start = row * fused_rows;
+            self.chunk.k[row * kv_dim..(row + 1) * kv_dim]
+                .copy_from_slice(&self.chunk.q[fused_start + q_dim..fused_start + q_dim + kv_dim]);
+            self.chunk.v[row * kv_dim..(row + 1) * kv_dim].copy_from_slice(
+                &self.chunk.q[fused_start + q_dim + kv_dim..fused_start + fused_rows],
+            );
+        }
+        for row in (0..rows).rev() {
+            self.chunk
+                .q
+                .copy_within(row * fused_rows..row * fused_rows + q_dim, row * q_dim);
+        }
+        self.chunk.q.truncate(rows * q_dim);
+
+        // Partial rotary, cache append and attention per row, in order:
+        // appending row r's K/V before attending position r keeps the causal
+        // prefix exactly what the per-position path sees at that point.
+        self.chunk.attn_out.clear();
+        self.chunk.attn_out.resize(rows * q_dim, 0.0);
+        for row in 0..rows {
+            let position = offset + row;
+            ops::rope_heads(
+                &mut self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                cfg.q_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_theta,
+            );
+            ops::rope_heads(
+                &mut self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                cfg.kv_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_theta,
+            );
+            self.ctx.cache_append(
+                layer,
+                &self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                &self.chunk.v[row * kv_dim..(row + 1) * kv_dim],
+            );
+            self.ctx.attention(
+                layer,
+                position,
+                &self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                &mut self.chunk.attn_out[row * q_dim..(row + 1) * q_dim],
+            );
+        }
+
+        // Output projection `dense` as a batched GEMM (plus its bias).
+        self.chunk.attn_projected.clear();
+        self.chunk.attn_projected.resize(rows * hidden, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.dense.weight"),
+            hidden,
+            q_dim,
+            &self.chunk.attn_out,
+            &mut self.chunk.attn_projected,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.attn_projected[row * hidden..(row + 1) * hidden],
+                &format!("{prefix}self_attn.dense"),
+            );
+        }
+
+        // MLP off the same normed rows: fc1 batched + bias + per-row GELU,
+        // then fc2 batched + bias.
+        self.chunk.gate.clear();
+        self.chunk.gate.resize(rows * intermediate, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}mlp.fc1.weight"),
+            intermediate,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.gate,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.gate[row * intermediate..(row + 1) * intermediate],
+                &format!("{prefix}mlp.fc1"),
+            );
+            ops::gelu(&mut self.chunk.gate[row * intermediate..(row + 1) * intermediate]);
+        }
+        self.chunk.mlp_out.clear();
+        self.chunk.mlp_out.resize(rows * hidden, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}mlp.fc2.weight"),
+            hidden,
+            intermediate,
+            &self.chunk.gate,
+            &mut self.chunk.mlp_out,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.mlp_out[row * hidden..(row + 1) * hidden],
+                &format!("{prefix}mlp.fc2"),
+            );
+        }
+
+        // Parallel residual: one update sums attention and MLP outputs.
+        for index in 0..rows * hidden {
+            self.chunk.hidden[index] +=
+                self.chunk.attn_projected[index] + self.chunk.mlp_out[index];
+        }
         Ok(())
     }
 
@@ -318,6 +555,18 @@ impl ModelForward for PhiNative {
 /// Clears the toolbox KV caches between generations.
     fn clear_cache(&mut self) {
         self.ctx.clear_kv();
+    }
+
+    /// Captures the toolbox KV state for cross-generation prefix reuse.
+    fn kv_snapshot(&self) -> Option<KvSnapshot> {
+        Some(self.ctx.kv_snapshot())
+    }
+
+    /// Restores a cached prefix into the (freshly cleared) toolbox KV —
+    /// native caches are plain f32 rows, so any prefix restores bit-exact.
+    fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) -> bool {
+        self.ctx.restore_kv_prefix(snapshot, positions);
+        true
     }
 
 /// Reports the constant backend label `"native-cpu"`.

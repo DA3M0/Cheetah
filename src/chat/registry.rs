@@ -40,6 +40,20 @@ pub(crate) type PromptRenderer = fn(&[super::ChatMessage], Option<&str>) -> Stri
 /// carries no backend types and no family types — control flow vs. operators
 /// split — so a model's layer stacking lives in its registration file and
 /// the main program stays family-free.
+/// A captured KV cache state: per-layer key/value rows in the backend's own
+/// cache layout, covering `positions` absolute positions. Produced by
+/// [`ModelForward::kv_snapshot`] right after a prefill; consumed by
+/// [`ModelForward::restore_kv_prefix`] so a later prompt sharing that token
+/// prefix skips its re-prefill.
+pub(crate) struct KvSnapshot {
+    /// Number of absolute positions the captured rows cover.
+    pub(crate) positions: usize,
+    /// Per-layer key rows, backend-native layout.
+    pub(crate) kv_k: Vec<Vec<f32>>,
+    /// Per-layer value rows, backend-native layout.
+    pub(crate) kv_v: Vec<Vec<f32>>,
+}
+
 pub(crate) trait ModelForward: ModelForwardClone + Send {
     /// Run the model over `tokens` starting at absolute position `offset` and
     /// return the logits of the final position. Backend-agnostic inference boundary.
@@ -48,6 +62,21 @@ pub(crate) trait ModelForward: ModelForwardClone + Send {
     fn clear_cache(&mut self);
     /// Backend label for the startup banner and log lines.
     fn device_name(&self) -> &'static str;
+    /// Captures the runtime's KV state for cross-generation prefix reuse.
+    /// `None` on backends without a reusable snapshot — the engine's prefix
+    /// cache stays disabled for them and every prompt prefills in full.
+    fn kv_snapshot(&self) -> Option<KvSnapshot> {
+        None
+    }
+    /// Restores the first `positions` positions of `snapshot` into this
+    /// runtime's empty KV cache. `false` when the backend cannot restore, in
+    /// which case the caller falls back to a full prefill. Restoring must
+    /// leave the runtime bit-exact-equivalent to having prefilled those
+    /// tokens itself (see the decoder KV-continuation tests).
+    fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) -> bool {
+        let _ = (snapshot, positions);
+        false
+    }
     /// Ant: real tier transitions on backends that own mmap-backed weights
     /// (the native CPU backend); host-resident backends report None.
     fn as_ant_tier_control(&mut self) -> Option<&mut dyn AntTierControl> {
