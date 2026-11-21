@@ -1,7 +1,7 @@
 # Coding standards & complete function reference
 
 This document defines Cheetah's coding conventions and contains the analysis
-of **every function in the codebase** (section 10): 917 functions across 39
+of **every function in the codebase** (section 10): 920 functions across 39
 source files — runtime functions, FFI declarations, and tests — each with a
 one-entry explanation of what it does and why it exists the way it does.
 
@@ -798,7 +798,7 @@ both backends.
 
 | Function | Analysis |
 |---|---|
-| `serve(options, chat_options, ant_options)` | Server lifecycle: refuses unauthenticated non-loopback listeners, resolves the model + Ant settings, loads the engine, resolves/generates the API key, installs the Ctrl-C handler, builds the shared state, and loops on `recv_timeout` spawning one worker per request (generation requests take a queue ticket first). |
+| `serve(options, chat_options, ant_options, mcp_options)` | Server lifecycle: refuses unauthenticated non-loopback listeners, resolves the model + Ant settings, loads the engine, resolves/generates the API key, installs the Ctrl-C handler, builds the shared state, and loops on `recv_timeout` spawning one worker per request (generation requests take a queue ticket first). |
 | `resolve_model(options)` | Model resolution: direct safetensors file → prepared model directory → name match inside `--model-dir` (ambiguous/missing errors list what is available). |
 | `model_name_for_match(model)` | Strips directories + the `.safetensors` suffix to get the matchable name. |
 | `model_id_from_path(path)` | The API-visible model id: file stem for files, directory name for directories. |
@@ -881,8 +881,8 @@ both backends.
 
 ### 10.23 Coverage notes & regeneration
 
-- **Coverage**: the tables above cover all 917 functions extracted from
-  `src/` — 677 runtime functions (including the 36 `extern` FFI declarations
+- **Coverage**: the tables above cover all 920 functions extracted from
+  `src/` — 680 runtime functions (including the 36 `extern` FFI declarations
   that bind the C substrate) and 240 test-context functions. Every runtime
   function carries an English `///` doc comment in source (extern
   declarations a `//` line), per section 3. Where a
@@ -909,7 +909,7 @@ both backends.
 
 Section 10 groups test suites into analyzed rows; this index names every
 one of the 240 test functions so the reference covers the full
-917-function inventory (677 runtime + 240 tests).
+920-function inventory (680 runtime + 240 tests).
 
 **`src/ant.rs`** (9):
   `unit` `layered_unit` `plan_residency_assigns_vram_then_ram_then_disk`

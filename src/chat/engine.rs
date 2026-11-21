@@ -318,6 +318,88 @@ pub trait TextSink {
     }
 }
 
+/// Streaming sink for tool rounds: text deltas stream live with hold-back.
+///
+/// A tool call begins with exactly the markers plain text rarely starts a
+/// line with — a `{` (the tool JSON) or a code fence — so everything from the
+/// first such marker stays buffered until the round decision: plain answers
+/// flush the remainder at round end (brace-bearing prose arrives as one
+/// slightly-late delta), tool-call rounds drop it (the calls go to the
+/// executor instead and must never leak as content). The wrapper is what
+/// makes the agentic loop stream honestly instead of buffering whole rounds.
+struct ToolStreamSink<'a> {
+    inner: &'a mut dyn TextSink,
+    buffer: String,
+    emitted: usize,
+}
+
+impl<'a> ToolStreamSink<'a> {
+    fn new(inner: &'a mut dyn TextSink) -> Self {
+        Self {
+            inner,
+            buffer: String::new(),
+            emitted: 0,
+        }
+    }
+
+    /// Emit everything up to the first hold marker, if any.
+    fn stream_safe(&mut self) -> Result<(), String> {
+        let rest = &self.buffer[self.emitted..];
+        let hold = match (rest.find('{'), rest.find("```")) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let safe_end = self.emitted + hold.unwrap_or(rest.len());
+        if safe_end > self.emitted {
+            let delta = self.buffer[self.emitted..safe_end].to_owned();
+            self.emitted = safe_end;
+            self.inner.push(&delta)?;
+        }
+        Ok(())
+    }
+
+    /// Round decided as a tool call: discard the held remainder.
+    fn drop_round(&mut self) {
+        self.emitted = self.buffer.len();
+    }
+
+    /// Round decided as a plain answer: flush everything still held (the
+    /// held tail is prose containing braces, not a tool call).
+    fn flush_round(&mut self) -> Result<(), String> {
+        if self.buffer.len() > self.emitted {
+            let delta = self.buffer[self.emitted..].to_owned();
+            self.emitted = self.buffer.len();
+            self.inner.push(&delta)?;
+        }
+        Ok(())
+    }
+}
+
+impl TextSink for ToolStreamSink<'_> {
+    fn push(&mut self, text: &str) -> Result<(), String> {
+        self.buffer.push_str(text);
+        self.stream_safe()
+    }
+
+    /// Per-round boundary inside the tool loop — the round decision (flush
+    /// vs drop) is made by the loop after parsing, never here.
+    fn finish(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The loop parses `generation.text`, so the transcript must be captured
+    /// even though the safe prefix already streamed.
+    fn capture_text(&self) -> bool {
+        true
+    }
+
+    fn interrupted(&mut self) -> bool {
+        self.inner.interrupted()
+    }
+}
+
 /// Why the decode loop stopped producing tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
@@ -1544,6 +1626,7 @@ impl Engine {
         let mut messages = messages_json.to_owned();
         let mut context = self.new_context()?;
         let mut rounds = 0usize;
+        let mut hold = ToolStreamSink::new(sink);
         loop {
             let (tokens, chat_params) =
                 self.prepare_tool_chat(&messages, tools_json, choice, max_tokens)?;
@@ -1552,7 +1635,7 @@ impl Engine {
                 &tokens,
                 options,
                 extra_stop,
-                sink,
+                &mut hold,
                 &chat_params,
                 resident_overrides,
             )?;
@@ -1567,6 +1650,7 @@ impl Engine {
                 && calls.iter().all(|call| mcp.has_tool(&call.function.name))
                 && rounds < Self::MAX_TOOL_ROUNDS
             {
+                hold.drop_round();
                 rounds += 1;
                 let mut results = Vec::with_capacity(calls.len());
                 for call in calls {
@@ -1588,6 +1672,7 @@ impl Engine {
                 messages = toolcalls::next_tool_round(&messages, calls, &results)?;
                 continue;
             }
+            hold.flush_round()?;
             return Ok((generation, response));
         }
     }
@@ -2524,5 +2609,103 @@ mod tests {
             ..generation
         };
         assert_eq!(zero_duration.tokens_per_second(), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_stream_tests {
+    use super::*;
+
+    /// Recording sink: captures what the wrapper streamed.
+    #[derive(Default)]
+    struct RecordingSink {
+        chunks: Vec<String>,
+        captured: String,
+    }
+
+    impl TextSink for RecordingSink {
+        fn push(&mut self, text: &str) -> Result<(), String> {
+            self.chunks.push(text.to_owned());
+            self.captured.push_str(text);
+            Ok(())
+        }
+
+        fn capture_text(&self) -> bool {
+            true
+        }
+    }
+
+    /// Plain text streams through immediately (no hold markers).
+    #[test]
+    fn plain_text_streams_through() -> Result<(), String> {
+        let mut inner = RecordingSink::default();
+        {
+            let mut sink = ToolStreamSink::new(&mut inner);
+            sink.push("The weather is sunny today.")?;
+        }
+        assert_eq!(inner.chunks, vec!["The weather is sunny today."]);
+        Ok::<(), String>(())
+    }
+
+    /// Once a `{` appears, everything from it is held; the round decision
+    /// either flushes (prose) or drops it (tool call).
+    #[test]
+    fn brace_holds_and_round_decision_decides() -> Result<(), String> {
+        let mut inner = RecordingSink::default();
+        {
+            let mut sink = ToolStreamSink::new(&mut inner);
+            sink.push("Let me check: {\"tool_calls\":[")?;
+            sink.drop_round();
+        }
+        assert_eq!(inner.chunks, vec!["Let me check: "]);
+        Ok::<(), String>(())
+    }
+
+    /// A flush at round end releases the held prose (brace-bearing text that
+    /// turned out to be a plain answer).
+    #[test]
+    fn flush_round_releases_held_prose() -> Result<(), String> {
+        let mut inner = RecordingSink::default();
+        {
+            let mut sink = ToolStreamSink::new(&mut inner);
+            sink.push("JSON looks like {\"a\": 1} in Rust syntax.")?;
+            sink.flush_round()?;
+        }
+        assert_eq!(
+            inner.chunks,
+            vec!["JSON looks like ", "{\"a\": 1} in Rust syntax."]
+        );
+        assert_eq!(inner.captured, "JSON looks like {\"a\": 1} in Rust syntax.");
+        Ok::<(), String>(())
+    }
+
+    /// Code fences hold exactly like braces (the fenced tool-call shape).
+    #[test]
+    fn fence_holds_like_brace() -> Result<(), String> {
+        let mut inner = RecordingSink::default();
+        {
+            let mut sink = ToolStreamSink::new(&mut inner);
+            sink.push("```json")?;
+        }
+        assert!(inner.chunks.is_empty());
+        Ok::<(), String>(())
+    }
+
+    /// Deltas across pushes stay stitched: the hold marker may span pushes.
+    #[test]
+    fn hold_marker_spanning_pushes_holds() -> Result<(), String> {
+        let mut inner = RecordingSink::default();
+        {
+            let mut sink = ToolStreamSink::new(&mut inner);
+            sink.push("text with no marker yet")?;
+            sink.push(" then {\"tool")?;
+            sink.flush_round()?;
+        }
+        assert_eq!(
+            inner.chunks,
+            vec!["text with no marker yet", " then ", "{\"tool"]
+        );
+        assert_eq!(inner.captured, "text with no marker yet then {\"tool");
+        Ok::<(), String>(())
     }
 }

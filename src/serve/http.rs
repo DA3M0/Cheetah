@@ -1,22 +1,26 @@
-//! HTTP routing, authentication, and streaming for `cheetah serve`.
+//! HTTP routing, authentication, and streaming for `cheetah serve` (axum).
 
 use crate::chat::{Engine, Generation, TextSink, ToolChoice};
 use crate::color::{self, Color};
 use crate::options::ChatOptions;
 use crate::serve::openai::{self, *};
 use crate::serve::queue::{QueueGuard, QueueTicket};
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode};
+use axum::response::Response;
 use bytes::Bytes;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::Duration;
-use tiny_http::{Header, Method, Request, Response, StatusCode};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::Sleep;
 
-const SSE_CHANNEL_CAPACITY: usize = 8;
 const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
+/// Request-body cap (parity with the former unlimited `read_to_end`).
+const BODY_LIMIT: usize = usize::MAX;
 
 pub(crate) struct ServerState {
     pub(crate) engine: Arc<Engine>,
@@ -33,86 +37,89 @@ pub(crate) struct ServerState {
 /// Whether an incoming request is a generation endpoint (POST
 /// `/v1/chat/completions` or `/v1/completions`, ignoring query strings and
 /// trailing slashes) — decides whether a queue ticket is taken.
-pub(crate) fn is_generation_request(request: &Request) -> bool {
-    if request.method() != &Method::Post {
-        return false;
-    }
-    let raw = request.url();
-    let path = raw.split('?').next().unwrap_or(raw);
-    let path = path.strip_suffix('/').unwrap_or(path);
-    matches!(path, "/v1/chat/completions" | "/v1/completions")
+pub(crate) fn is_generation_request(method: &Method, path: &str) -> bool {
+    method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions")
 }
 
 /// The request dispatcher: OPTIONS → CORS preflight, `/health` free of auth
 /// so probes can check liveness, then the Bearer check and the route table
-/// (models / chat / completions). Generation routes expect a queue ticket.
-pub(crate) fn handle(
-    state: Arc<ServerState>,
-    request: Request,
-    generation_ticket: Option<QueueTicket>,
-) {
-    if request.method() == &Method::Options {
-        let _ = request.respond(options_response());
-        return;
-    }
+/// (models / chat / completions). Generation requests take a queue ticket at
+/// arrival, preserving the FIFO-at-arrival ordering.
+/// The axum app: every request (any method, any path) flows through
+/// [`handle_any`], which owns the OPTIONS/auth/route contract verbatim.
+pub(crate) fn router(state: Arc<ServerState>) -> axum::Router {
+    axum::Router::new()
+        .fallback(any_handler)
+        .layer(axum::extract::DefaultBodyLimit::max(usize::MAX))
+        .with_state(state)
+}
 
+async fn any_handler(State(state): State<Arc<ServerState>>, request: Request) -> Response {
+    handle_any(state, request).await
+}
+
+pub(crate) async fn handle_any(state: Arc<ServerState>, request: Request) -> Response {
     let method = request.method().clone();
-    let raw = request.url();
-    let path = raw.split('?').next().unwrap_or(raw);
-    let path = path.strip_suffix('/').unwrap_or(path);
+    let raw = request.uri().path().to_owned();
+    let path = raw.strip_suffix('/').unwrap_or(&raw);
     let path = if path.is_empty() { "/" } else { path };
+
+    if method == Method::OPTIONS {
+        return options_response();
+    }
 
     // /health is auth-free so probes and load balancers can check liveness.
     // /health 不要求鉴权，便于健康探针和负载均衡器检查服务状态。
-    if method == Method::Get && path == "/health" {
-        respond_json(request, StatusCode(200), health_body());
-        return;
+    if method == Method::GET && path == "/health" {
+        return json_response(StatusCode::OK, health_body());
     }
 
-    if !authorized(&request, state.api_key.as_deref()) {
-        respond_error(
-            request,
+    // Generation requests take a ticket at arrival (before auth), preserving
+    // the FIFO-at-arrival ordering the queue contract promises.
+    let generation_ticket = if is_generation_request(&method, path) {
+        Some(state.generation_queue.enqueue())
+    } else {
+        None
+    };
+
+    if !authorized(request.headers(), state.api_key.as_deref()) {
+        return error_response(
             401,
             "Missing or invalid API key; provide a Bearer token in the Authorization header.",
         );
-        return;
     }
 
     match route(&method, path) {
-        Ok(RouteEnum::Health) => respond_json(request, StatusCode(200), health_body()),
+        Ok(RouteEnum::Health) => json_response(StatusCode::OK, health_body()),
         Ok(RouteEnum::ListModels) => {
             let body = model_list_string(&state);
-            respond_json(request, StatusCode(200), body);
+            json_response(StatusCode::OK, body)
         }
         Ok(RouteEnum::GetModel(id)) => {
             if id == state.model_id {
                 let body = single_model_string(&state);
-                respond_json(request, StatusCode(200), body);
+                json_response(StatusCode::OK, body)
             } else {
-                respond_error(
-                    request,
+                error_response(
                     404,
                     &format!(
                         "Model '{id}' does not exist; the loaded model is '{}'.",
                         state.model_id
                     ),
-                );
+                )
             }
         }
-        Ok(RouteEnum::ChatCompletions) => handle_chat_completions(
-            state,
-            request,
-            generation_ticket.expect("generation request receives a queue ticket"),
-        ),
-        Ok(RouteEnum::Completions) => handle_completions(
-            state,
-            request,
-            generation_ticket.expect("generation request receives a queue ticket"),
-        ),
-        Err(status) => respond_error(
-            request,
-            status.0,
-            if status.0 == 405 {
+        Ok(RouteEnum::ChatCompletions) => {
+            let ticket = generation_ticket.expect("generation request receives a queue ticket");
+            handle_chat_completions(state, request, ticket).await
+        }
+        Ok(RouteEnum::Completions) => {
+            let ticket = generation_ticket.expect("generation request receives a queue ticket");
+            handle_completions(state, request, ticket).await
+        }
+        Err(status) => error_response(
+            status.as_u16(),
+            if status == StatusCode::METHOD_NOT_ALLOWED {
                 "Method not allowed."
             } else {
                 "Endpoint not found."
@@ -135,23 +142,23 @@ enum RouteEnum {
 /// Route table: a known path with a wrong method is 405, anything unknown
 /// is 404.
 fn route(method: &Method, path: &str) -> Result<RouteEnum, StatusCode> {
-    if method == &Method::Get && path == "/health" {
+    if method == Method::GET && path == "/health" {
         return Ok(RouteEnum::Health);
     }
-    if method == &Method::Get && path == "/v1/models" {
+    if method == Method::GET && path == "/v1/models" {
         return Ok(RouteEnum::ListModels);
     }
-    if method == &Method::Get
+    if method == Method::GET
         && let Some(id) = path.strip_prefix("/v1/models/")
         && !id.is_empty()
         && !id.contains('/')
     {
         return Ok(RouteEnum::GetModel(id.to_string()));
     }
-    if method == &Method::Post && path == "/v1/chat/completions" {
+    if method == Method::POST && path == "/v1/chat/completions" {
         return Ok(RouteEnum::ChatCompletions);
     }
-    if method == &Method::Post && path == "/v1/completions" {
+    if method == Method::POST && path == "/v1/completions" {
         return Ok(RouteEnum::Completions);
     }
 
@@ -161,9 +168,9 @@ fn route(method: &Method, path: &str) -> Result<RouteEnum, StatusCode> {
         || path == "/v1/chat/completions"
         || path == "/v1/completions";
     if known {
-        Err(StatusCode(405))
+        Err(StatusCode::METHOD_NOT_ALLOWED)
     } else {
-        Err(StatusCode(404))
+        Err(StatusCode::NOT_FOUND)
     }
 }
 
@@ -171,18 +178,15 @@ fn route(method: &Method, path: &str) -> Result<RouteEnum, StatusCode> {
 
 /// Bearer-token check against the expected key; no expected key means the
 /// request is allowed (loopback-only posture enforced upstream).
-fn authorized(request: &Request, expected: Option<&str>) -> bool {
+fn authorized(headers: &axum::http::HeaderMap, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
     };
-    let header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"));
-    let Some(header) = header else {
-        return false;
-    };
-    let Some(token) = header.value.as_str().strip_prefix("Bearer ") else {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
         return false;
     };
     constant_time_eq(token.as_bytes(), expected.as_bytes())
@@ -199,7 +203,51 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-// ---- helpers ----
+// ---- response helpers ----
+
+/// The CORS header set (origin, methods, headers).
+fn cors_headers() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+        (
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        ),
+    ]
+}
+
+/// The 204 CORS preflight response with CORS + Allow headers.
+fn options_response() -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("Allow", "GET, POST, OPTIONS");
+    for (name, value) in cors_headers() {
+        response = response.header(name, value);
+    }
+    response.body(Body::empty()).expect("static response")
+}
+
+/// CORS headers plus `application/json`.
+fn json_response(status: StatusCode, body: String) -> Response {
+    let mut response = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json");
+    for (name, value) in cors_headers() {
+        response = response.header(name, value);
+    }
+    response.body(Body::from(body)).expect("json response")
+}
+
+/// Sends an OpenAI-shaped error envelope (`error_body`) for a status code.
+fn error_response(status: u16, message: &str) -> Response {
+    json_response(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        error_body(status, message),
+    )
+}
+
+// ---- models endpoints ----
 
 /// The static `{"status":"ok"}` liveness body.
 fn health_body() -> String {
@@ -231,111 +279,37 @@ fn single_model_string(state: &ServerState) -> String {
     serde_json::to_string(&entry).unwrap_or_default()
 }
 
-/// The CORS header set (origin, methods, headers).
-fn cors_headers() -> Vec<Header> {
-    vec![
-        Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).expect("cors header"),
-        Header::from_bytes(
-            &b"Access-Control-Allow-Methods"[..],
-            &b"GET, POST, OPTIONS"[..],
-        )
-        .expect("cors methods"),
-        Header::from_bytes(
-            &b"Access-Control-Allow-Headers"[..],
-            &b"Content-Type, Authorization"[..],
-        )
-        .expect("cors headers"),
-    ]
-}
-
-/// The 204 CORS preflight response with CORS + Allow headers.
-fn options_response() -> Response<io::Empty> {
-    let mut response = Response::new(StatusCode(204), cors_headers(), io::empty(), Some(0), None);
-    response = response.with_header(
-        Header::from_bytes(&b"Allow"[..], &b"GET, POST, OPTIONS"[..]).expect("allow header"),
-    );
-    response
-}
-
-/// CORS headers plus `application/json`.
-fn json_headers() -> Vec<Header> {
-    let mut headers = cors_headers();
-    headers.push(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("ct"));
-    headers
-}
-
-/// Sends a JSON response with an explicit content length.
-fn respond_json(request: Request, status: StatusCode, body: String) {
-    let data = body.into_bytes();
-    let len = data.len();
-    let response = Response::new(
-        status,
-        json_headers(),
-        io::Cursor::new(data),
-        Some(len),
-        None,
-    );
-    let _ = request.respond(response);
-}
-
-/// Sends an OpenAI-shaped error envelope (`error_body`) for a status code.
-fn respond_error(request: Request, status: u16, message: &str) {
-    let body = error_body(status, message);
-    respond_json(request, StatusCode(status), body);
-}
-
-/// Drains the request body into a byte buffer.
-fn read_body(request: &mut Request) -> io::Result<Vec<u8>> {
-    let mut body = Vec::new();
-    request.as_reader().read_to_end(&mut body)?;
-    Ok(body)
-}
-
 // ---- chat completions ----
 
 /// The chat endpoint: parse → model match → tool-choice validation →
 /// message building → option resolution; tool-enabled requests route
-/// through the tool prompt path, then either stream (SSE with disconnect
-/// tracking) or respond non-streaming. Every validation failure maps to a
-/// status + error body before any generation starts.
-fn handle_chat_completions(
+/// through the tool prompt path (the agentic MCP loop executes server-side
+/// tools), then either stream (SSE with disconnect tracking) or respond
+/// non-streaming. Every validation failure maps to a status + error body
+/// before any generation starts.
+async fn handle_chat_completions(
     state: Arc<ServerState>,
     request: Request,
     generation_ticket: QueueTicket,
-) {
-    let mut request = request;
-    let body = match read_body(&mut request) {
+) -> Response {
+    let body = match axum::body::to_bytes(request.into_body(), BODY_LIMIT).await {
         Ok(body) => body,
         Err(error) => {
-            respond_error(
-                request,
-                400,
-                &format!("Failed to read request body: {error}"),
-            );
-            return;
+            return error_response(400, &format!("Failed to read request body: {error}"));
         }
     };
     let api_request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(error) => {
-            respond_error(
-                request,
-                400,
-                &format!("Request body is not valid JSON: {error}"),
-            );
-            return;
+            return error_response(400, &format!("Request body is not valid JSON: {error}"));
         }
     };
     if let Err(error) = ensure_model_matches(&api_request.model, &state.model_id) {
-        respond_error(request, error.status, &error.message);
-        return;
+        return error_response(error.status, &error.message);
     }
     let mut tool_choice = match resolve_tool_choice(&api_request.tools, &api_request.tool_choice) {
         Ok(choice) => choice,
-        Err(error) => {
-            respond_error(request, error.status, &error.message);
-            return;
-        }
+        Err(error) => return error_response(error.status, &error.message),
     };
     // MCP tools join every request once servers are configured: the merged
     // tool list feeds the prompt, and MCP-named calls execute in the agentic
@@ -361,17 +335,11 @@ fn handle_chat_completions(
 
     let prepared = match build_chat_messages(&api_request) {
         Ok(p) => p,
-        Err(error) => {
-            respond_error(request, error.status, &error.message);
-            return;
-        }
+        Err(error) => return error_response(error.status, &error.message),
     };
     let options = match resolve_chat_options(&state.default_options, &api_request) {
         Ok(o) => o,
-        Err(error) => {
-            respond_error(request, error.status, &error.message);
-            return;
-        }
+        Err(error) => return error_response(error.status, &error.message),
     };
     let resident_overrides: HashSet<String> = api_request
         .resident_units
@@ -400,60 +368,47 @@ fn handle_chat_completions(
             state.default_options.system.as_deref(),
         ) {
             Ok(inputs) => inputs,
-            Err(error) => {
-                respond_error(request, 400, &error);
-                return;
-            }
+            Err(error) => return error_response(400, &error),
         };
-        let guard = generation_ticket.acquire();
         let engine_choice = match &tool_choice {
             ResolvedToolChoice::Auto => ToolChoice::Auto,
             ResolvedToolChoice::None => ToolChoice::None,
             ResolvedToolChoice::Required | ResolvedToolChoice::Named(_) => ToolChoice::Required,
         };
+        let gen_state = Arc::clone(&state);
+        let requested_tools = tools.clone();
+        let generation_input = ToolChatInput {
+            messages_json,
+            tools_json,
+            tools: requested_tools,
+            choice: tool_choice.clone(),
+            engine_choice,
+            options,
+            stop,
+            resident_overrides,
+        };
         if api_request.stream {
             let heartbeat_frame =
                 match sse_frame(&completion_id, created, &model, None, Some(""), None, None) {
                     Ok(frame) => frame,
-                    Err(error) => {
-                        respond_error(request, 500, &error);
-                        return;
-                    }
+                    Err(error) => return error_response(500, &error),
                 };
-            let (tx, rx) = mpsc::sync_channel::<Bytes>(SSE_CHANNEL_CAPACITY);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
             let response = sse_response(rx, heartbeat_frame, None);
-            let gen_state = Arc::clone(&state);
-            let requested_tools = tools.clone();
-            std::thread::spawn(move || {
-                let result = generate_tool_chat(
-                    &gen_state,
-                    guard,
-                    ToolChatInput {
-                        messages_json,
-                        tools_json,
-                        tools: requested_tools,
-                        choice: tool_choice.clone(),
-                        engine_choice,
-                        options,
-                        stop,
-                        resident_overrides,
-                    },
-                );
+            // The SSE sink goes INTO the loop: text deltas stream live (with
+            // tool-call hold-back), so streaming tool requests get
+            // incremental frames per round instead of one post-hoc blob.
+            tokio::task::spawn_blocking(move || {
+                let guard = generation_ticket.acquire();
+                let mut sink = SseSink::new(tx, completion_id, created, model);
+                let result = generate_tool_chat(&gen_state, guard, generation_input, &mut sink);
                 match result {
-                    Ok((generation, ToolResponse::Text(content))) => {
-                        let mut sink = SseSink::new(tx, completion_id, created, model);
-                        let result = sink
-                            .push(&content)
-                            .and_then(|()| {
-                                sink.send_chunk(
-                                    None,
-                                    None,
-                                    None,
-                                    Some(generation.finish_reason.as_str()),
-                                )
-                            })
-                            .and_then(|()| sink.send_done());
-                        if let Err(error) = result {
+                    Ok((generation, ToolResponse::Text(_))) => {
+                        // Content deltas already streamed round by round.
+                        if let Err(error) = sink
+                            .send_chunk(None, None, None, Some(generation.finish_reason.as_str()))
+                            .and_then(|()| sink.send_done())
+                        {
                             eprintln!(
                                 "{}",
                                 color::stderr(
@@ -464,12 +419,13 @@ fn handle_chat_completions(
                         }
                     }
                     Ok((_, ToolResponse::Calls(calls))) => {
-                        let mut sink = SseSink::new(tx, completion_id, created, model);
-                        let result = sink
+                        // Client-declared calls: the OpenAI client executes
+                        // them and sends the results back.
+                        if let Err(error) = sink
                             .send_tool_calls(&calls)
                             .and_then(|()| sink.send_chunk(None, None, None, Some("tool_calls")))
-                            .and_then(|()| sink.send_done());
-                        if let Err(error) = result {
+                            .and_then(|()| sink.send_done())
+                        {
                             eprintln!(
                                 "{}",
                                 color::stderr(
@@ -480,7 +436,6 @@ fn handle_chat_completions(
                         }
                     }
                     Err(error) => {
-                        let sink = SseSink::new(tx, completion_id, created, model);
                         let _ = sink.send_chunk(None, None, None, Some("server_error"));
                         let _ = sink.send_done();
                         eprintln!(
@@ -493,83 +448,69 @@ fn handle_chat_completions(
                     }
                 }
             });
-            let _ = request.respond(response);
-        } else {
-            match generate_tool_chat(
-                &state,
-                guard,
-                ToolChatInput {
-                    messages_json,
-                    tools_json,
-                    tools,
-                    choice: tool_choice.clone(),
-                    engine_choice,
-                    options,
-                    stop,
-                    resident_overrides,
-                },
-            ) {
-                Ok((generation, result)) => {
-                    let (content, calls, finish_reason) = match result {
-                        ToolResponse::Text(content) => (
-                            Some(content),
-                            None,
-                            generation.finish_reason.as_str().to_string(),
-                        ),
-                        ToolResponse::Calls(calls) => (None, Some(calls), "tool_calls".to_string()),
-                    };
-                    let body = serde_json::to_string(&ChatCompletionResponse {
-                        id: completion_id,
-                        object: "chat.completion",
-                        created,
-                        model,
-                        choices: vec![ChatChoice {
-                            index: 0,
-                            message: ChoiceMessage {
-                                role: "assistant",
-                                content,
-                                tool_calls: calls,
-                            },
-                            finish_reason,
-                        }],
-                        usage: Usage::new(generation.prompt_tokens, generation.generated_tokens),
-                    })
-                    .unwrap_or_default();
-                    respond_json(request, StatusCode(200), body);
-                }
-                Err(error) => respond_error(request, prompt_error_status(&error), &error),
-            }
+            return response;
         }
-        return;
+        let generation = tokio::task::spawn_blocking(move || {
+            let guard = generation_ticket.acquire();
+            let mut sink = NullSink;
+            generate_tool_chat(&gen_state, guard, generation_input, &mut sink)
+        })
+        .await
+        .expect("tool-mode generation task panicked");
+        return match generation {
+            Ok((generation, result)) => {
+                let (content, calls, finish_reason) = match result {
+                    ToolResponse::Text(content) => (
+                        Some(content),
+                        None,
+                        generation.finish_reason.as_str().to_string(),
+                    ),
+                    ToolResponse::Calls(calls) => (None, Some(calls), "tool_calls".to_string()),
+                };
+                let body = serde_json::to_string(&ChatCompletionResponse {
+                    id: completion_id,
+                    object: "chat.completion",
+                    created,
+                    model,
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        message: ChoiceMessage {
+                            role: "assistant",
+                            content,
+                            tool_calls: calls,
+                        },
+                        finish_reason,
+                    }],
+                    usage: Usage::new(generation.prompt_tokens, generation.generated_tokens),
+                })
+                .unwrap_or_default();
+                json_response(StatusCode::OK, body)
+            }
+            Err(error) => error_response(prompt_error_status(&error), &error),
+        };
     }
 
-    let guard = generation_ticket.acquire();
     let mut messages = prepared.messages;
     let tokens = match state
         .engine
         .prepare(&mut messages, system.as_deref(), options.max_tokens)
     {
         Ok((tokens, _)) => tokens,
-        Err(error) => {
-            respond_error(request, prompt_error_status(&error), &error);
-            return;
-        }
+        Err(error) => return error_response(prompt_error_status(&error), &error),
     };
 
     if api_request.stream {
         let heartbeat_frame =
             match sse_frame(&completion_id, created, &model, None, Some(""), None, None) {
                 Ok(frame) => frame,
-                Err(error) => {
-                    respond_error(request, 500, &error);
-                    return;
-                }
+                Err(error) => return error_response(500, &error),
             };
-        let (tx, rx) = mpsc::sync_channel::<Bytes>(SSE_CHANNEL_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let disconnected = Arc::new(AtomicBool::new(false));
         let response = sse_response(rx, heartbeat_frame, Some(Arc::clone(&disconnected)));
         let gen_state = Arc::clone(&state);
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
+            let guard = generation_ticket.acquire();
             let mut sink =
                 SseSink::new_with_disconnect(tx, completion_id, created, model, disconnected);
             let result = generate_chat(
@@ -606,18 +547,24 @@ fn handle_chat_completions(
                 }
             }
         });
-        let _ = request.respond(response);
+        response
     } else {
-        let mut sink = NullSink;
-        match generate_chat(
-            &state,
-            guard,
-            tokens,
-            &options,
-            &stop,
-            &mut sink,
-            &resident_overrides,
-        ) {
+        let generation = tokio::task::spawn_blocking(move || {
+            let guard = generation_ticket.acquire();
+            let mut sink = NullSink;
+            generate_chat(
+                &state,
+                guard,
+                tokens,
+                &options,
+                &stop,
+                &mut sink,
+                &resident_overrides,
+            )
+        })
+        .await
+        .expect("generation task panicked");
+        match generation {
             Ok(generation) => {
                 let (content, calls, finish_reason) =
                     chat_completion_parts(&generation.text, generation.finish_reason.as_str());
@@ -638,11 +585,9 @@ fn handle_chat_completions(
                     usage: Usage::new(generation.prompt_tokens, generation.generated_tokens),
                 })
                 .unwrap_or_default();
-                respond_json(request, StatusCode(200), body);
+                json_response(StatusCode::OK, body)
             }
-            Err(err) => {
-                respond_error(request, 500, &err);
-            }
+            Err(err) => error_response(500, &err),
         }
     }
 }
@@ -717,12 +662,14 @@ struct ToolChatInput {
 
 /// Runs one tool-mode request through the engine's agentic loop (shared with
 /// the chat REPL): MCP tool calls execute in place, client-declared calls
-/// return to the client. The null sink keeps intermediate rounds quiet — the
-/// caller emits the final text or tool calls.
+/// return to the client. The caller supplies the sink — the loop's
+/// `ToolStreamSink` holds back tool-call JSON so streaming callers never see
+/// it as content.
 fn generate_tool_chat(
     state: &ServerState,
     _guard: QueueGuard,
     input: ToolChatInput,
+    sink: &mut dyn TextSink,
 ) -> Result<(Generation, ToolResponse), String> {
     state.engine.generate_tool_chat(
         &input.messages_json,
@@ -733,7 +680,7 @@ fn generate_tool_chat(
         input.options.max_tokens,
         &input.options,
         &input.stop,
-        &mut NullSink,
+        sink,
         &input.resident_overrides,
         state.mcp.as_deref(),
     )
@@ -744,56 +691,40 @@ fn generate_tool_chat(
 /// The legacy `/v1/completions` endpoint (non-streaming only; `echo` is
 /// unsupported): prompt → single user message → generate → text completion
 /// response.
-fn handle_completions(state: Arc<ServerState>, request: Request, generation_ticket: QueueTicket) {
-    let mut request = request;
-    let body = match read_body(&mut request) {
+async fn handle_completions(
+    state: Arc<ServerState>,
+    request: Request,
+    generation_ticket: QueueTicket,
+) -> Response {
+    let body = match axum::body::to_bytes(request.into_body(), BODY_LIMIT).await {
         Ok(body) => body,
         Err(error) => {
-            respond_error(
-                request,
-                400,
-                &format!("Failed to read request body: {error}"),
-            );
-            return;
+            return error_response(400, &format!("Failed to read request body: {error}"));
         }
     };
     let api_request: CompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(error) => {
-            respond_error(
-                request,
-                400,
-                &format!("Request body is not valid JSON: {error}"),
-            );
-            return;
+            return error_response(400, &format!("Request body is not valid JSON: {error}"));
         }
     };
     if let Err(error) = ensure_model_matches(&api_request.model, &state.model_id) {
-        respond_error(request, error.status, &error.message);
-        return;
+        return error_response(error.status, &error.message);
     }
     if api_request.stream {
-        respond_error(
-            request,
+        return error_response(
             400,
             "Streaming for /v1/completions is not supported yet; use /v1/chat/completions.",
         );
-        return;
     }
 
     let message = match build_completion_message(&api_request) {
         Ok(m) => m,
-        Err(error) => {
-            respond_error(request, error.status, &error.message);
-            return;
-        }
+        Err(error) => return error_response(error.status, &error.message),
     };
     let options = match resolve_completion_options(&state.default_options, &api_request) {
         Ok(o) => o,
-        Err(error) => {
-            respond_error(request, error.status, &error.message);
-            return;
-        }
+        Err(error) => return error_response(error.status, &error.message),
     };
     let resident_overrides: HashSet<String> = api_request
         .resident_units
@@ -807,51 +738,51 @@ fn handle_completions(state: Arc<ServerState>, request: Request, generation_tick
         api_request.model.clone()
     };
     let system = state.default_options.system.clone();
-    let guard = generation_ticket.acquire();
-    let mut messages = vec![message];
-    let tokens = match state
-        .engine
-        .prepare(&mut messages, system.as_deref(), options.max_tokens)
-    {
-        Ok((tokens, _)) => tokens,
-        Err(error) => {
-            respond_error(request, prompt_error_status(&error), &error);
-            return;
-        }
-    };
     let completion_id = text_completion_id();
     let created = openai::now_unix();
 
-    let mut sink = NullSink;
-    match generate_chat(
-        &state,
-        guard,
-        tokens,
-        &options,
-        &stop,
-        &mut sink,
-        &resident_overrides,
-    ) {
-        Ok(generation) => {
-            let body = serde_json::to_string(&TextCompletionResponse {
-                id: completion_id,
-                object: "text_completion",
-                created,
-                model,
-                choices: vec![TextChoice {
-                    index: 0,
-                    text: generation.text,
-                    finish_reason: generation.finish_reason.as_str().to_string(),
-                }],
-                usage: Usage::new(generation.prompt_tokens, generation.generated_tokens),
-            })
-            .unwrap_or_default();
-            respond_json(request, StatusCode(200), body);
-        }
-        Err(err) => {
-            respond_error(request, 500, &err);
-        }
-    }
+    let generation =
+        tokio::task::spawn_blocking(move || -> Result<(Generation, ChatOptions), String> {
+            let guard = generation_ticket.acquire();
+            let mut messages = vec![message];
+            let (tokens, _) =
+                state
+                    .engine
+                    .prepare(&mut messages, system.as_deref(), options.max_tokens)?;
+            let mut sink = NullSink;
+            let generation = generate_chat(
+                &state,
+                guard,
+                tokens,
+                &options,
+                &stop,
+                &mut sink,
+                &resident_overrides,
+            )?;
+            Ok((generation, options))
+        })
+        .await
+        .expect("completions generation task panicked");
+
+    let (generation, _options) = match generation {
+        Ok(pair) => pair,
+        Err(err) => return error_response(prompt_error_status(&err), &err),
+    };
+
+    let body = serde_json::to_string(&TextCompletionResponse {
+        id: completion_id,
+        object: "text_completion",
+        created,
+        model,
+        choices: vec![TextChoice {
+            index: 0,
+            text: generation.text,
+            finish_reason: generation.finish_reason.as_str().to_string(),
+        }],
+        usage: Usage::new(generation.prompt_tokens, generation.generated_tokens),
+    })
+    .unwrap_or_default();
+    json_response(StatusCode::OK, body)
 }
 
 // ---- generation ----
@@ -901,8 +832,10 @@ impl TextSink for NullSink {
 }
 
 /// 流式 SSE 输出目标:把每段文本封装成 OpenAI 格式的 `data:` 帧。
+/// The channel is an unbounded tokio channel fed from the blocking
+/// generation task; the response body drains it (hyper flushes per frame).
 struct SseSink {
-    tx: SyncSender<Bytes>,
+    tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     id: String,
     created: u64,
     model: String,
@@ -911,19 +844,20 @@ struct SseSink {
 }
 
 impl SseSink {
-    /// Reader without disconnect tracking (tool-mode responses stream a fixed
-    /// frame set).
     /// Builds an SSE sink without disconnect tracking (tool responses).
-    fn new(tx: SyncSender<Bytes>, id: String, created: u64, model: String) -> Self {
+    fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+        id: String,
+        created: u64,
+        model: String,
+    ) -> Self {
         Self::new_inner(tx, id, created, model, None)
     }
 
-    /// Reader sharing the disconnect flag with the SSE sink, so dropping the
-    /// reader stops the generation.
     /// Builds an SSE sink that shares the client-disconnect flag with the
-    /// response reader, so a dropped connection stops the generation.
+    /// response body stream, so a dropped connection stops the generation.
     fn new_with_disconnect(
-        tx: SyncSender<Bytes>,
+        tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
         id: String,
         created: u64,
         model: String,
@@ -934,7 +868,7 @@ impl SseSink {
 
     /// Shared construction behind the two sink constructors.
     fn new_inner(
-        tx: SyncSender<Bytes>,
+        tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
         id: String,
         created: u64,
         model: String,
@@ -950,8 +884,8 @@ impl SseSink {
         }
     }
 
-    /// Emits one OpenAI `chat.completion.chunk` frame; a closed channel maps to
-    /// a "Client disconnected" error.
+    /// Emits one OpenAI `chat.completion.chunk` frame; a closed channel maps
+    /// to a "Client disconnected" error.
     fn send_chunk(
         &self,
         role: Option<&'static str>,
@@ -1094,118 +1028,83 @@ impl TextSink for SseSink {
     }
 }
 
-// ---- SSE reader ----
+// ---- SSE body ----
 
-/// Builds the `text/event-stream` response around a [`ChannelReader`], with
-/// CORS + no-cache headers and the disconnect flag wired to the sink.
+/// Builds the `text/event-stream` response over the frame channel, with
+/// CORS + no-cache headers and the disconnect flag wired to the sink. hyper
+/// flushes the body as the stream yields, so frames reach the client live.
 fn sse_response(
-    receiver: Receiver<Bytes>,
+    receiver: UnboundedReceiver<Bytes>,
     heartbeat_frame: Bytes,
     disconnected: Option<Arc<AtomicBool>>,
-) -> Response<ChannelReader> {
-    let mut headers = cors_headers();
-    headers
-        .push(Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).expect("ssect"));
-    headers.push(Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).expect("ssecc"));
-    let reader = match disconnected {
-        Some(disconnected) => ChannelReader::new_with_disconnect(
-            receiver,
-            heartbeat_frame,
-            SSE_HEARTBEAT_INTERVAL,
-            disconnected,
-        ),
-        None => ChannelReader::new(receiver, heartbeat_frame, SSE_HEARTBEAT_INTERVAL),
+) -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache");
+    for (name, value) in cors_headers() {
+        response = response.header(name, value);
+    }
+    let body = SseBody {
+        receiver,
+        heartbeat_frame,
+        heartbeat: Box::pin(tokio::time::sleep(SSE_HEARTBEAT_INTERVAL)),
+        disconnected,
     };
-    Response::new(StatusCode(200), headers, reader, None, None)
+    response.body(Body::from_stream(body)).expect("sse body")
 }
 
-struct ChannelReader {
-    receiver: Receiver<Bytes>,
+/// The SSE response body: drains the frame channel, emits the heartbeat
+/// frame when the stream goes idle past [`SSE_HEARTBEAT_INTERVAL`], and marks
+/// the client disconnected on drop (the generation sink polls that flag and
+/// stops).
+struct SseBody {
+    receiver: UnboundedReceiver<Bytes>,
     heartbeat_frame: Bytes,
-    heartbeat_interval: Duration,
-    disconnected: Arc<AtomicBool>,
-    current: Bytes,
-    offset: usize,
+    heartbeat: std::pin::Pin<Box<Sleep>>,
+    disconnected: Option<Arc<AtomicBool>>,
 }
 
-impl ChannelReader {
-    /// Reader without disconnect tracking (tool-mode responses stream a fixed
-    /// frame set, so nothing needs the shared flag).
-    fn new(
-        receiver: Receiver<Bytes>,
-        heartbeat_frame: Bytes,
-        heartbeat_interval: Duration,
-    ) -> Self {
-        Self::new_with_disconnect(
-            receiver,
-            heartbeat_frame,
-            heartbeat_interval,
-            Arc::new(AtomicBool::new(false)),
-        )
+impl SseBody {
+    /// Resets the idle timer after every emitted frame.
+    fn reset_heartbeat(&mut self) {
+        self.heartbeat
+            .as_mut()
+            .reset(tokio::time::Instant::now() + SSE_HEARTBEAT_INTERVAL);
     }
+}
 
-    /// Reader sharing the disconnect flag with the SSE sink, so dropping the
-    /// reader stops the generation.
-    fn new_with_disconnect(
-        receiver: Receiver<Bytes>,
-        heartbeat_frame: Bytes,
-        heartbeat_interval: Duration,
-        disconnected: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            receiver,
-            heartbeat_frame,
-            heartbeat_interval,
-            disconnected,
-            current: Bytes::new(),
-            offset: 0,
+impl futures_core::Stream for SseBody {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Idle past the interval → emit the heartbeat frame and re-arm.
+        if self.heartbeat.as_mut().poll(cx).is_ready() {
+            self.reset_heartbeat();
+            return std::task::Poll::Ready(Some(Ok(self.heartbeat_frame.clone())));
         }
-    }
-}
-
-impl Drop for ChannelReader {
-    /// Marks the client disconnected — the generation sink observes the flag on
-    /// its next delta and stops.
-    fn drop(&mut self) {
-        self.disconnected.store(true, Ordering::Relaxed);
-    }
-}
-
-impl Read for ChannelReader {
-    /// The streaming pump: blocks only when no bytes were returned yet this
-    /// call (emitting the heartbeat frame on idle timeout), otherwise drains
-    /// queued chunks without waiting; EOF once the sender drops.
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut written = 0;
-        while written < buf.len() {
-            if self.offset >= self.current.len() {
-                // Wait only when the caller has received no bytes; otherwise return queued data promptly.
-                // 仅在本次尚未返回数据时等待；已有数据时及时返回，避免阻塞流式响应。
-                let next = if written == 0 {
-                    match self.receiver.recv_timeout(self.heartbeat_interval) {
-                        Ok(chunk) => Some(chunk),
-                        Err(RecvTimeoutError::Timeout) => Some(self.heartbeat_frame.clone()),
-                        Err(RecvTimeoutError::Disconnected) => return Ok(0),
-                    }
-                } else {
-                    self.receiver.try_recv().ok()
-                };
-                let Some(next) = next else {
-                    break;
-                };
-                self.current = next;
-                self.offset = 0;
+        match self.receiver.poll_recv(cx) {
+            std::task::Poll::Ready(Some(chunk)) => {
+                self.reset_heartbeat();
+                std::task::Poll::Ready(Some(Ok(chunk)))
             }
-            let remaining = &self.current[self.offset..];
-            let n = remaining.len().min(buf.len() - written);
-            buf[written..written + n].copy_from_slice(&remaining[..n]);
-            self.offset += n;
-            written += n;
+            // The generation task finished (sender dropped): end the stream.
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
-        Ok(written)
+    }
+}
+
+impl Drop for SseBody {
+    /// Marks the client disconnected — the generation sink observes the flag
+    /// on its next delta and stops.
+    fn drop(&mut self) {
+        if let Some(disconnected) = &self.disconnected {
+            disconnected.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1235,145 +1134,41 @@ mod tests {
     #[test]
     fn routes_known_paths() {
         assert!(matches!(
-            route(&Method::Get, "/health"),
+            route(&Method::GET, "/health"),
             Ok(RouteEnum::Health)
         ));
         assert!(matches!(
-            route(&Method::Get, "/v1/models"),
+            route(&Method::GET, "/v1/models"),
             Ok(RouteEnum::ListModels)
         ));
         assert!(matches!(
-            route(&Method::Get, "/v1/models/qwen2"),
+            route(&Method::GET, "/v1/models/qwen2"),
             Ok(RouteEnum::GetModel(id)) if id == "qwen2"
         ));
         assert!(matches!(
-            route(&Method::Post, "/v1/chat/completions"),
+            route(&Method::POST, "/v1/chat/completions"),
             Ok(RouteEnum::ChatCompletions)
         ));
         assert!(matches!(
-            route(&Method::Post, "/v1/completions"),
+            route(&Method::POST, "/v1/completions"),
             Ok(RouteEnum::Completions)
         ));
     }
 
     #[test]
     fn routes_return_405_wrong_method_and_404_unknown() {
-        assert_eq!(route(&Method::Post, "/v1/models"), Err(StatusCode(405)));
         assert_eq!(
-            route(&Method::Get, "/v1/chat/completions"),
-            Err(StatusCode(405))
+            route(&Method::POST, "/v1/models"),
+            Err(StatusCode::METHOD_NOT_ALLOWED)
         );
-        assert_eq!(route(&Method::Get, "/v1/unknown"), Err(StatusCode(404)));
-    }
-
-    #[test]
-    fn channel_reader_eof_on_disconnect() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let mut reader =
-            ChannelReader::new(rx, Bytes::from_static(b"heartbeat"), Duration::from_secs(1));
-        let mut buf = [0u8; 16];
-        // dropping tx → EOF
-        drop(tx);
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn channel_reader_pumps_chunks() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let mut reader =
-            ChannelReader::new(rx, Bytes::from_static(b"heartbeat"), Duration::from_secs(1));
-        let mut buf = [0u8; 4];
-        tx.send(Bytes::from_static(b"hello")).unwrap();
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hell");
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"o");
-    }
-
-    #[test]
-    fn channel_reader_batches_ready_chunks() {
-        let (tx, rx) = mpsc::sync_channel(4);
-        let mut reader =
-            ChannelReader::new(rx, Bytes::from_static(b"heartbeat"), Duration::from_secs(1));
-        tx.send(Bytes::from_static(b"one")).unwrap();
-        tx.send(Bytes::from_static(b"two")).unwrap();
-        let mut buf = [0u8; 16];
-
-        let n = reader.read(&mut buf).unwrap();
-
-        assert_eq!(&buf[..n], b"onetwo");
-    }
-
-    #[test]
-    fn dropping_reader_unblocks_sse_sink() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        tx.send(Bytes::from_static(b"queued")).unwrap();
-        let disconnected = Arc::new(AtomicBool::new(false));
-        let reader = ChannelReader::new_with_disconnect(
-            rx,
-            Bytes::from_static(b"heartbeat"),
-            Duration::from_secs(1),
-            Arc::clone(&disconnected),
+        assert_eq!(
+            route(&Method::GET, "/v1/chat/completions"),
+            Err(StatusCode::METHOD_NOT_ALLOWED)
         );
-        let mut sink = SseSink::new_with_disconnect(
-            tx,
-            "test".to_string(),
-            0,
-            "test".to_string(),
-            disconnected,
+        assert_eq!(
+            route(&Method::GET, "/v1/unknown"),
+            Err(StatusCode::NOT_FOUND)
         );
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let sender = std::thread::spawn(move || {
-            done_tx.send(sink.push("token").is_err()).unwrap();
-        });
-
-        drop(reader);
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap()
-        );
-        sender.join().unwrap();
-    }
-
-    #[test]
-    fn sse_sink_stops_generation_after_reader_drop() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let disconnected = Arc::new(AtomicBool::new(false));
-        let reader = ChannelReader::new_with_disconnect(
-            rx,
-            Bytes::from_static(b"heartbeat"),
-            Duration::from_secs(1),
-            Arc::clone(&disconnected),
-        );
-        let mut sink =
-            SseSink::new_with_disconnect(tx, "test".into(), 0, "test".into(), disconnected);
-        assert!(sink.push("token").is_ok());
-        drop(reader);
-        assert_eq!(sink.push("token"), Err("Client disconnected".to_string()));
-    }
-
-    #[test]
-    fn channel_reader_sends_heartbeat_when_idle() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let heartbeat = sse_frame("test", 1, "test", None, Some(""), None, None).unwrap();
-        let mut reader = ChannelReader::new(rx, heartbeat.clone(), Duration::from_millis(10));
-        let mut buf = [0u8; 512];
-
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], heartbeat.as_ref());
-        assert!(heartbeat.starts_with(b"data: "));
-        assert!(heartbeat.ends_with(b"\n\n"));
-        let payload = std::str::from_utf8(&heartbeat[6..heartbeat.len() - 2]).unwrap();
-        let chunk: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(chunk["choices"][0]["delta"]["content"], "");
-
-        tx.send(Bytes::from_static(b"data: token\n\n")).unwrap();
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"data: token\n\n");
-        drop(tx);
-        assert_eq!(reader.read(&mut buf).unwrap(), 0);
     }
 
     #[test]
@@ -1409,9 +1204,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chat_stream_emits_each_generated_chunk_without_copying_text() {
-        let (tx, rx) = mpsc::sync_channel(4);
+    /// The SSE sink emits one frame per push with the OpenAI delta fields,
+    /// ignoring empty chunks and carrying the assistant role once.
+    #[tokio::test]
+    async fn chat_stream_emits_each_generated_chunk_without_copying_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let mut sink = SseSink::new(tx, "chatcmpl-test".to_string(), 1, "test".to_string());
         assert!(!sink.capture_text());
         sink.push("plain ").unwrap();
@@ -1462,7 +1259,7 @@ mod tests {
 
     #[test]
     fn sse_sink_ignores_empty_generated_chunks() {
-        let (tx, rx) = mpsc::sync_channel(2);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let mut sink = SseSink {
             tx,
             id: "test".to_string(),
@@ -1473,7 +1270,10 @@ mod tests {
         };
 
         sink.push("").unwrap();
-        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
         sink.push("token").unwrap();
         let chunk: serde_json::Value = serde_json::from_slice(
             &rx.try_recv()
@@ -1486,5 +1286,70 @@ mod tests {
         .unwrap();
         assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(chunk["choices"][0]["delta"]["content"], "token");
+    }
+
+    /// The SSE body emits queued frames, EOFs after the sender drops, and
+    /// emits the heartbeat frame when the stream goes idle.
+    #[tokio::test]
+    async fn sse_body_streams_frames_eof_and_heartbeat() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let heartbeat = sse_frame("test", 1, "test", None, Some(""), None, None).unwrap();
+        let body = SseBody {
+            receiver: rx,
+            heartbeat_frame: heartbeat.clone(),
+            heartbeat: Box::pin(tokio::time::sleep(Duration::from_millis(10))),
+            disconnected: None,
+        };
+        use futures_core::Stream;
+        let mut pinned = std::pin::pin!(body);
+
+        tx.send(Bytes::from_static(b"data: token\n\n")).unwrap();
+        match pinned
+            .as_mut()
+            .poll_next(&mut std::task::Context::from_waker(
+                futures_core::task::Waker::noop(),
+            )) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                assert_eq!(bytes.as_ref(), b"data: token\n\n")
+            }
+            other => panic!("expected the token frame, got {other:?}"),
+        }
+        drop(tx);
+        // EOF: the sender dropped, so the stream ends.
+        match pinned
+            .as_mut()
+            .poll_next(&mut std::task::Context::from_waker(
+                futures_core::task::Waker::noop(),
+            )) {
+            std::task::Poll::Ready(None) => {}
+            other => panic!("expected EOF, got {other:?}"),
+        }
+        let _ = heartbeat;
+    }
+
+    /// Dropping the SSE body marks the client disconnected — the generation
+    /// sink observes the flag and stops.
+    #[tokio::test]
+    async fn dropping_sse_body_marks_disconnected() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let body = SseBody {
+            receiver: rx,
+            heartbeat_frame: Bytes::from_static(b"heartbeat"),
+            heartbeat: Box::pin(tokio::time::sleep(Duration::from_millis(10))),
+            disconnected: Some(Arc::clone(&disconnected)),
+        };
+        let mut sink = SseSink::new_with_disconnect(
+            tx,
+            "test".into(),
+            0,
+            "test".into(),
+            Arc::clone(&disconnected),
+        );
+        assert!(sink.push("token").is_ok());
+        drop(body);
+        assert!(disconnected.load(Ordering::Relaxed));
+        assert!(sink.interrupted());
+        assert_eq!(sink.push("token"), Err("Client disconnected".to_string()));
     }
 }

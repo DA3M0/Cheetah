@@ -50,7 +50,7 @@ cheetah/
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
 │   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs)
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
-│   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue)
+│   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue; axum)
 │   ├── inspect.rs              model inspection (load/inspect command)
 │   ├── color.rs, options.rs    CLI coloring, ChatOptions
 │   └── context.rs              (see above)
@@ -97,7 +97,7 @@ main.rs::run (dispatch)                      src/main.rs
 ```
 serve::serve            src/serve/mod.rs:17  (auth checks, resolve_model:140)
   → load_engine_with_progress (same pipeline as chat)
-  → tiny_http server    http.rs (SSE streaming, queue.rs concurrency tickets)
+  → axum server         http.rs (SSE streaming, queue.rs concurrency tickets)
   → per request: openai.rs (request parsing/validation) → engine.generate_with_chat_params
 ```
 

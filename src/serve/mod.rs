@@ -61,45 +61,6 @@ pub fn serve(
     let api_key = resolve_api_key(&options)?;
 
     let addr = format!("{}:{}", options.host, options.port);
-    let server = tiny_http::Server::http(&addr)
-        .map_err(|error| format!("Failed to listen on {addr}: {error}"))?;
-    let local_addr = server.server_addr();
-    let port = match local_addr {
-        tiny_http::ListenAddr::IP(address) => address.port(),
-        #[cfg(unix)]
-        tiny_http::ListenAddr::Unix(_) => {
-            return Err("Listening on Unix sockets is not supported yet.".to_string());
-        }
-    };
-
-    println!(
-        "{}",
-        color::stdout(
-            &format!("Loaded model: {}", model_path.display()),
-            Color::Green
-        )
-    );
-    println!(
-        "{}",
-        color::stdout(
-            &format!("Server started: {}", display_url(&options.host, port)),
-            Color::Green
-        )
-    );
-    if let Some(key) = &api_key {
-        println!(
-            "{}",
-            color::stdout(&format!("API Key: {key}"), Color::Yellow)
-        );
-    } else {
-        println!(
-            "{}",
-            color::stdout(
-                "API key authentication is disabled (server is listening on a loopback address only).",
-                Color::Yellow
-            )
-        );
-    }
 
     ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst))
         .map_err(|error| format!("Failed to install Ctrl-C handler: {error}"))?;
@@ -111,35 +72,66 @@ pub fn serve(
         engine: Arc::new(engine),
         default_options: chat_options,
         model_id,
-        api_key,
+        api_key: api_key.clone(),
         generation_queue: Arc::new(queue::FifoQueue::new(options.max_concurrent_generations)?),
         created,
         mcp: mcp.map(std::sync::Arc::new),
     });
 
-    loop {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            break;
+    // The axum app routes every request through `http::handle_any`, which
+    // keeps the long-standing contract verbatim: OPTIONS preflight, auth-free
+    // /health, Bearer auth, 405/404 bodies, and FIFO queue tickets taken at
+    // arrival. hyper flushes the SSE body per frame, so streaming is real.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Failed to start the async runtime: {error}"))?;
+    runtime.block_on(async move {
+        let app = http::router(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|error| format!("Failed to listen on {addr}: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("Failed to resolve the listener address: {error}"))?
+            .port();
+        println!(
+            "{}",
+            color::stdout(
+                &format!("Loaded model: {}", model_path.display()),
+                Color::Green
+            )
+        );
+        println!(
+            "{}",
+            color::stdout(
+                &format!("Server started: {}", display_url(&options.host, port)),
+                Color::Green
+            )
+        );
+        if let Some(key) = &api_key {
+            println!(
+                "{}",
+                color::stdout(&format!("API Key: {key}"), Color::Yellow)
+            );
+        } else {
+            println!(
+                "{}",
+                color::stdout(
+                    "API key authentication is disabled (server is listening on a loopback address only).",
+                    Color::Yellow
+                )
+            );
         }
-        match server.recv_timeout(Duration::from_millis(200)) {
-            Ok(Some(request)) => {
-                let state = Arc::clone(&state);
-                let ticket = http::is_generation_request(&request)
-                    .then(|| Arc::clone(&state.generation_queue).enqueue());
-                std::thread::spawn(move || http::handle(state, request, ticket));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!(
-                    "{}",
-                    color::stderr(
-                        &format!("Failed to receive connection: {error}"),
-                        Color::Red
-                    )
-                );
-            }
-        }
-    }
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !SHUTDOWN.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await
+            .map_err(|error| format!("Server error: {error}"))
+    })?;
 
     println!("{}", color::stdout("Server stopped.", Color::Green));
     Ok(())
