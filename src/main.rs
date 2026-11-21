@@ -31,6 +31,7 @@ use options::ChatOptions;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 /// Process entry point: runs [`run`] and prints errors to stderr in red,
 /// then hands the [`RunError`]-mapped exit code back to the OS.
@@ -94,9 +95,9 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             run_context_command(operation, options.directory)
         }
         "mcp" => {
-            let (path, options, _context_options, ant_options, _mcp_client_options) =
+            let (path, options, _context_options, ant_options, mcp_client_options) =
                 cli::parse_chat_args(&args[1..])?;
-            run_mcp_command(&path, options, ant_options)
+            run_mcp_command(&path, options, ant_options, &mcp_client_options)
         }
         "serve" => {
             let (serve_args, ant_options) = split_ant_args(&args[1..])?;
@@ -136,9 +137,21 @@ fn run_mcp_command(
     path: &Path,
     options: ChatOptions,
     ant_options: cli::AntCliOptions,
+    mcp_client_options: &cli::McpCliOptions,
 ) -> Result<(), RunError> {
     let settings = resolve_ant_settings(path, &ant_options)?;
-    runtime(crate::mcp_server::run(path, &options, Some(&settings)))
+    // The MCP server mode shares serve's client integration: configured MCP
+    // servers connect up front and their tools join the agentic loop.
+    let mcp = runtime(crate::mcp::registry_from_flags(
+        &mcp_client_options.servers,
+        mcp_client_options.config.as_deref(),
+    ))?;
+    runtime(crate::mcp_server::run(
+        path,
+        &options,
+        Some(&settings),
+        mcp.map(Arc::new),
+    ))
 }
 
 fn run_init_command(args: &[String]) -> Result<(), RunError> {

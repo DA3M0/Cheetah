@@ -744,7 +744,7 @@ their tool calls in the agentic loop (`Engine::generate_tool_chat`).
 | `LineTransport` / `ChildTransport` | The newline transport trait + the real child-piped implementation (reader thread pumps stdout so a slow server never blocks past the deadline; stderr inherits). |
 | 14 tests *(test)* | Scripted-transport protocol tests (handshake shape, pagination, content joining, `isError`, protocol-error replies, server-error rejection) + config/spec parsing + a real-stdio end-to-end test against a live Python MCP server (gated on python3). |
 
-### 10.20b `src/mcp_server.rs` — Cheetah as an MCP server (4 runtime + 6 tests)
+### 10.20b `src/mcp_server.rs` — Cheetah as an MCP server (5 runtime + 6 tests)
 
 `cheetah mcp <model-path>` exposes the loaded model to MCP agents over
 stdio: JSON-RPC 2.0 (newline-delimited) in, responses out. The engine loads
@@ -753,9 +753,10 @@ only; diagnostics go to stderr.
 
 | Function | Analysis |
 |---|---|
-| `run(path, options, ant)` | Server lifecycle: `Engine::load` → the stdio request loop (parse → dispatch → respond) until the agent closes stdin; malformed JSON lines answer a parse error (id null) and keep serving. |
+| `run(path, options, ant, mcp)` | Server lifecycle: `Engine::load` → the stdio request loop (parse → dispatch → respond) until the agent closes stdin; malformed JSON lines answer a parse error (id null) and keep serving. `mcp` is the optional client registry (`Arc<McpRegistry>`, `None` when no `--mcp-server`/`--mcp-config` was given) shared into the state. |
 | `handle_request(message, state)` | Protocol dispatch: notifications (no id) return nothing; `initialize` → protocol version + tools capability + serverInfo; `ping` → empty result; `tools/list` → the two-tool catalog; `tools/call` → routed through the `McpServerStateLike` invoker; unknown methods → `-32601`. Generic over the invoker so tests stub generation. |
-| `McpServerState::invoke_tool(params)` (via `McpServerStateLike`) | Tool dispatch: `chat_generate` (validate messages → apply max_tokens/temperature overrides → chat template → generate → text) and `model_info` (id/architecture/device); unknown tools → `-32602`. Execution failures are `isError: true` MCP results — the agent sees them. |
+| `McpServerState::invoke_tool(params)` (via `McpServerStateLike`) | Tool dispatch: `chat_generate` (validate messages → apply max_tokens/temperature overrides → `McpServerState::run_generation`) and `model_info` (id/architecture/device); unknown tools → `-32602`. Execution failures are `isError: true` MCP results — the agent sees them. |
+| `McpServerState::run_generation(messages, options)` | Generation routing: no connected servers → plain `prepare`/`generate` (DiscardSink); servers connected → serve's agentic loop `Engine::generate_tool_chat` with `ToolChoice::Auto` and the registry's tool definitions — model tool calls execute against the owning server, results feed back, capped at 8 rounds. A leftover `ToolResponse::Calls` (hallucinated name matching no connected tool) serializes to text. |
 | `parse_tool_messages(arguments)` | Validates the agent's `messages` array (roles/content strings, non-empty) into engine chat messages. |
 | `initialize_result()` / `tools_list_result()` | The static protocol payloads (protocol version, capabilities, two-tool catalog with JSON Schema). |
 | `DiscardSink` | Drops streamed deltas — the MCP result carries `generation.text` (capture defaults to true). |

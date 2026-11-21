@@ -9,13 +9,15 @@
 //! banners and spinner go elsewhere or are skipped), and every diagnostic
 //! here uses stderr.
 
-use crate::chat::{ChatMessage, Engine, TextSink};
+use crate::chat::toolcalls;
+use crate::chat::{ChatMessage, Engine, TextSink, ToolChoice};
 use crate::options::ChatOptions;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashSet;
 use std::io::{BufRead, StdoutLock, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Tools exposed to MCP agents.
 const CHAT_GENERATE_TOOL: &str = "chat_generate";
@@ -25,6 +27,9 @@ const MODEL_INFO_TOOL: &str = "model_info";
 pub(crate) struct McpServerState {
     engine: Engine,
     options: ChatOptions,
+    /// Connected MCP servers (`None` when none configured) — their tools
+    /// join the agentic loop, the same integration serve uses.
+    mcp: Option<Arc<crate::mcp::McpRegistry>>,
 }
 
 /// Run the MCP stdio server: load the engine, then serve JSON-RPC requests
@@ -34,11 +39,13 @@ pub(crate) fn run(
     path: &Path,
     options: &ChatOptions,
     ant: Option<&crate::ant::AntSettings>,
+    mcp: Option<Arc<crate::mcp::McpRegistry>>,
 ) -> Result<(), String> {
     let engine = Engine::load(path, options.threads, options.ctx_size, ant)?;
     let mut state = McpServerState {
         engine,
         options: options.clone(),
+        mcp,
     };
 
     let stdin = std::io::stdin();
@@ -161,20 +168,64 @@ impl McpServerState {
         messages: Vec<ChatMessage>,
         options: &ChatOptions,
     ) -> Result<String, String> {
-        let (tokens, _) = self
-            .engine
-            .prepare(&mut messages.clone(), None, options.max_tokens)?;
-        let mut context = self.engine.new_context()?;
+        // When MCP servers are connected, the agentic loop runs (the model
+        // calls MCP tools server-side and the results feed back) — the same
+        // generation path serve uses. Without servers, plain generation.
+        let Some(mcp) = &self.mcp else {
+            let (tokens, _) =
+                self.engine
+                    .prepare(&mut messages.clone(), None, options.max_tokens)?;
+            let mut context = self.engine.new_context()?;
+            let mut sink = DiscardSink;
+            let generation = self.engine.generate(
+                &mut context,
+                &tokens,
+                options,
+                &[],
+                &mut sink,
+                &HashSet::new(),
+            )?;
+            return Ok(generation.text);
+        };
+
+        // Agentic path (shares serve's Engine::generate_tool_chat): MCP tool
+        // calls execute server-side, results feed back, the loop continues
+        // until a plain answer (or the round cap).
+        let tools = mcp.tool_definitions();
+        let tools_json = serde_json::to_string(&tools)
+            .map_err(|error| format!("Failed to serialize MCP tools: {error}"))?;
+        let messages_json = serde_json::to_string(
+            &messages
+                .iter()
+                .map(
+                    |message| serde_json::json!({"role": message.role, "content": message.content}),
+                )
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| format!("Failed to serialize messages: {error}"))?;
         let mut sink = DiscardSink;
-        let generation = self.engine.generate(
-            &mut context,
-            &tokens,
+        let (_, response) = self.engine.generate_tool_chat(
+            &messages_json,
+            &tools_json,
+            &tools,
+            ToolChoice::Auto,
+            &toolcalls::ResolvedToolChoice::Auto,
+            options.max_tokens,
             options,
             &[],
             &mut sink,
             &HashSet::new(),
+            Some(mcp),
         )?;
-        Ok(generation.text)
+        // In MCP server mode every tool is MCP-owned, so the loop always
+        // ends with a plain answer; a hallucinated non-MCP call surfaces as
+        // text (the agent sees what the model emitted).
+        match response {
+            crate::chat::toolcalls::ToolResponse::Text(text) => Ok(text),
+            crate::chat::toolcalls::ToolResponse::Calls(calls) => {
+                Ok(serde_json::to_string(&calls).unwrap_or_default())
+            }
+        }
     }
 }
 

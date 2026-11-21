@@ -19,6 +19,7 @@ Both directions speak the MCP stdio transport: newline-delimited JSON-RPC
 
 ```sh
 cheetah mcp <model-path> [--max-tokens N] [--temperature F]
+            [--mcp-server "name=command [args...]" | --mcp-config mcp.json]
 ```
 
 Runs until the agent closes stdin (`Ctrl-C` also stops it). The loaded model
@@ -52,40 +53,22 @@ is exposed as two tools:
   template and context limits). `max_tokens` and `temperature` override the
   server defaults per call. Execution failures surface as `isError: true`
   results — the agent sees them and can react.
+- **Nested tool calling**: the same `--mcp-server` / `--mcp-config` flags as
+  chat/serve work here — configured servers connect before the model loads
+  and their tools join `Engine::generate_tool_chat`, so `chat_generate` runs
+  the full agentic loop server-side (a model tool call executes against the
+  owning MCP server, the result feeds back, and the loop continues to a
+  plain answer, capped at 8 rounds). A malformed or hallucinated call that
+  matches no connected tool surfaces as plain text.
 - **stdout discipline**: the protocol channel carries JSON frames only; all
-  diagnostics go to stderr.
+  diagnostics go to stderr (tool executions appear as `[mcp] calling tool
+  '...'` lines).
 
 ## 2. Cheetah as an MCP client (tool calling)
 
 ```sh
 # Chat REPL with one MCP server (repeatable flag)
 cheetah chat ./qwen-0.5b-prepared   --mcp-server "fs=npx -y @modelcontextprotocol/server-filesystem /tmp"
-
-# Same, via a JSON config file
-cheetah serve ./qwen-0.5b-prepared --mcp-config mcp.json
-
-# mcp.json
-{
-  "servers": [
-    {"name": "fs",     "command": "npx",     "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
-    {"name": "time",   "command": "python3", "args": ["time_server.py"]}
-  ]
-}
-```
-
-- `--mcp-server "name=command [args...]"` — repeatable. The first token
-  carries `name=command`; the rest are the command's arguments (split on
-  whitespace — arguments containing spaces belong in a `--mcp-config` file).
-- `--mcp-config <path>` — JSON config file (once).
-
-Servers connect **before the model loads**; a server that fails to spawn,
-answer the handshake, or list tools fails startup loudly — a half-configured
-tool surface would silently corrupt tool calls.
-
-```sh
-# Chat REPL with one MCP server (repeatable flag)
-cheetah chat ./qwen-0.5b-prepared \
-  --mcp-server "fs=npx -y @modelcontextprotocol/server-filesystem /tmp"
 
 # Same, via a JSON config file
 cheetah serve ./qwen-0.5b-prepared --mcp-config mcp.json
@@ -185,5 +168,6 @@ The full function-level reference lives in
   tool name colliding with a request-declared tool is shadowed by the
   request's declaration.
 - **Server mode** (`cheetah mcp`): one model per server process; sequential
-  request processing (stdio agents issue one call at a time); Ant settings
-  supported via the shared chat flags.
+  request processing (stdio agents issue one call at a time); nested MCP
+  servers (`--mcp-server` / `--mcp-config`) share the 8-round agentic cap;
+  Ant settings supported via the shared chat flags.
