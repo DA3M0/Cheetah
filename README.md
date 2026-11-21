@@ -8,7 +8,7 @@
 | 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B |
 | 🧩 **declarative model registry** | one registration file per family — architecture, chat template, stop markers, both backends, family constants; build.rs generates the registry, lookups derive from it |
 | 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
-| 🧰 **MCP tool calling** | Connect Model Context Protocol servers over stdio (`--mcp-server` / `--mcp-config`); their tools join every request and execute server-side in an agentic loop — chat REPL and API both. Guide: [docs/MCP.md](docs/MCP.md) |
+| 🧰 **MCP, both directions** | **Server**: `cheetah mcp <model>` exposes the model to any MCP agent (Claude Desktop, Cursor). **Client**: `--mcp-server` / `--mcp-config` connects MCP servers whose tools the model calls in an agentic loop. Guide: [docs/MCP.md](docs/MCP.md) |
 | 🛠️ **no GGUF** | Safetensors in, self-describing prepared directory out (`cheetah init`) |
 
 ```
@@ -366,6 +366,7 @@ The service prints its URL and, when enabled, its API key at startup. Press `Ctr
 | `--mcp-server name=cmd [args...]` | None | Connect one MCP stdio server; its tools join every request and execute server-side (repeatable) |
 | `--mcp-config <path>` | None | JSON file: `{servers: [{name, command, args: [...]}]}` (once) |
 
+`cheetah mcp <model-path>` exposes the model **as** an MCP stdio server for agents (see [docs/MCP.md](docs/MCP.md) §1).
 Chat options can also be supplied to `serve` to set generation defaults. Without authentication, the server refuses non-loopback listen addresses. Requests other than `GET /health` require `Authorization: Bearer <key>`.
 
 ### Endpoints

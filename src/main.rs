@@ -19,6 +19,7 @@ mod color;
 mod context;
 mod inspect;
 mod mcp;
+mod mcp_server;
 mod options;
 mod serve;
 
@@ -92,6 +93,11 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             let (operation, options) = cli::parse_context_args(&args[1..])?;
             run_context_command(operation, options.directory)
         }
+        "mcp" => {
+            let (path, options, _context_options, ant_options, _mcp_client_options) =
+                cli::parse_chat_args(&args[1..])?;
+            run_mcp_command(&path, options, ant_options)
+        }
         "serve" => {
             let (serve_args, ant_options) = split_ant_args(&args[1..])?;
             let (serve_options, chat_options, mcp_options) = cli::parse_serve_args(&serve_args)?;
@@ -124,6 +130,17 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
 /// 3. resolve Ant settings and run the residency planner, assigning each
 ///    atomic unit to one of the three tiers (VRAM → RAM → disk) and
 ///    immediately `page_in`-ing it into the target tier.
+/// `cheetah mcp <model-path>`: expose the loaded model as an MCP stdio
+/// server. Runs until the agent closes stdin (Ctrl-C also stops it).
+fn run_mcp_command(
+    path: &Path,
+    options: ChatOptions,
+    ant_options: cli::AntCliOptions,
+) -> Result<(), RunError> {
+    let settings = resolve_ant_settings(path, &ant_options)?;
+    runtime(crate::mcp_server::run(path, &options, Some(&settings)))
+}
+
 fn run_init_command(args: &[String]) -> Result<(), RunError> {
     // init takes exactly two positional arguments (source and destination
     // directories) plus a batch of Ant flags; group them coarsely here by

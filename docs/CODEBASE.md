@@ -50,6 +50,7 @@ cheetah/
 │   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
 │   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs; docs/MCP.md)
+│   ├── mcp_server.rs           ★ MCP server: `cheetah mcp <model>` exposes chat_generate/model_info to agents over stdio
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue; axum)
 │   ├── inspect.rs              model inspection (load/inspect command)
@@ -177,6 +178,7 @@ run_init_command      src/main.rs:90
 | `McpServerConfig` / `parse_server_spec` / `server_configs` / `registry_from_flags` | mcp.rs | `--mcp-server name=command args...` + `--mcp-config <file>` parsing; registry construction (spawn → initialize → tools/list); `None` when nothing configured |
 | `McpRegistry` | mcp.rs | Connected servers + flattened tool list; `tool_definitions()` renders OpenAI-style definitions, `call()` routes `tools/call` to the owning server (per-client mutex, `Arc`-shared across request workers); `Drop` kills children |
 | `McpClient` / `LineTransport` / `ChildTransport` | mcp/client.rs | JSON-RPC 2.0 over newline-delimited stdio: `initialize` handshake, `tools/list` (paginated), `tools/call`; id-correlated requests with a 30s deadline; reader thread pumps stdout; server→client requests answered with a protocol error |
+| **MCP server** (`cheetah mcp <model>`) | mcp_server.rs | Loads the engine via `Engine::load` (protocol-only stdout), then serves `initialize` / `tools/list` / `tools/call` over stdio: `chat_generate` (messages → chat template → generation → text) and `model_info`; execution failures surface as `isError: true` results |
 
 ### `src/chat/` — runtime boundary & backend resolution
 
