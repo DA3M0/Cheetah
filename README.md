@@ -8,7 +8,7 @@
 | 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B |
 | 🧩 **declarative model registry** | one registration file per family — architecture, chat template, stop markers, both backends, family constants; build.rs generates the registry, lookups derive from it |
 | 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
-| 🧰 **MCP tool calling** | Connect Model Context Protocol servers over stdio (`--mcp-server` / `--mcp-config`); their tools join every request and execute server-side in an agentic loop — chat REPL and API both |
+| 🧰 **MCP tool calling** | Connect Model Context Protocol servers over stdio (`--mcp-server` / `--mcp-config`); their tools join every request and execute server-side in an agentic loop — chat REPL and API both. Guide: [docs/MCP.md](docs/MCP.md) |
 | 🛠️ **no GGUF** | Safetensors in, self-describing prepared directory out (`cheetah init`) |
 
 ```

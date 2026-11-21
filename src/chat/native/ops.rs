@@ -1075,6 +1075,14 @@ impl OpsToolbox {
         Ok(())
     }
 
+    /// Cached positions in one layer's KV cache (test/diagnostics view:
+    /// `kv_k[layer].len() / kv_dim`).
+    #[cfg(test)]
+    pub(crate) fn kv_len(&self, layer: usize) -> usize {
+        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
+        self.kv_k[layer].len() / kv_dim.max(1)
+    }
+
     /// Clear every layer's KV cache.
     pub(crate) fn clear_kv(&mut self) {
         for cache in self.kv_k.iter_mut().chain(self.kv_v.iter_mut()) {

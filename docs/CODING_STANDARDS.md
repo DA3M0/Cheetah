@@ -1,7 +1,7 @@
 # Coding standards & complete function reference
 
 This document defines Cheetah's coding conventions and contains the analysis
-of **every function in the codebase** (section 10): 920 functions across 39
+of **every function in the codebase** (section 10): 921 functions across 39
 source files — runtime functions, FFI declarations, and tests — each with a
 one-entry explanation of what it does and why it exists the way it does.
 
@@ -634,7 +634,7 @@ Each file has the same skeleton; only the family-specific pieces differ.
 | `MmapWeightStore::drop_disk_units_of_layer(layer_id)` | Drops every disk-tier unit of one layer after its step completed. |
 | `madvise_range(ptr, len, advice)` | Page-aligned madvise helper; the kernel rounds as needed. |
 
-### 10.17 `src/chat/native/decoder.rs` — config resolution + tests (5 runtime + 33 tests)
+### 10.17 `src/chat/native/decoder.rs` — config resolution + tests (5 runtime + 36 tests)
 
 | Function | Analysis |
 |---|---|
@@ -881,8 +881,8 @@ both backends.
 
 ### 10.23 Coverage notes & regeneration
 
-- **Coverage**: the tables above cover all 920 functions extracted from
-  `src/` — 680 runtime functions (including the 36 `extern` FFI declarations
+- **Coverage**: the tables above cover all 921 functions extracted from
+  `src/` — 681 runtime functions (including the 36 `extern` FFI declarations
   that bind the C substrate) and 240 test-context functions. Every runtime
   function carries an English `///` doc comment in source (extern
   declarations a `//` line), per section 3. Where a
@@ -909,7 +909,7 @@ both backends.
 
 Section 10 groups test suites into analyzed rows; this index names every
 one of the 240 test functions so the reference covers the full
-920-function inventory (680 runtime + 240 tests).
+921-function inventory (681 runtime + 240 tests).
 
 **`src/ant.rs`** (9):
   `unit` `layered_unit` `plan_residency_assigns_vram_then_ram_then_disk`
@@ -1044,6 +1044,10 @@ one of the 240 test functions so the reference covers the full
   `safetensors_file` `inspects_safetensors_header_and_tensor_shapes`
   `hides_internal_aligned_shard_padding_tensors` `rejects_invalid_safetensors_files`
   `resolves_manifest_shards_for_inspection`
+
+**`src/chat/native/decoder.rs`** — KV 复用基础测试（3，计入 decoder 测试组）:
+  `kv_continuation_matches_full_prefill_bit_exact` `kv_cache_does_not_leak_across_generations`
+  `clone_shares_weights_but_starts_with_empty_kv`
 
 **`src/chat/toolcalls.rs`** (2):
   `next_tool_round_appends_calls_and_results` `next_tool_round_rejects_invalid_history`

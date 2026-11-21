@@ -4,7 +4,8 @@ A navigation map of the repository: every source file, what it owns, its key
 entry points, the request data flows, the environment surface, and the test
 map. Read this first when landing in the codebase; the deep guides
 ([ANT_MEMORY.md](ANT_MEMORY.md), [REGISTRY.md](REGISTRY.md)) pick up where
-this file points, and the conventions + per-function reference live in
+this file points, MCP tool calling is documented in
+[MCP.md](MCP.md), and the conventions + per-function reference live in
 [CODING_STANDARDS.md](CODING_STANDARDS.md).
 
 Line numbers are approximate (they drift); function names are the anchors.
@@ -48,7 +49,7 @@ cheetah/
 │   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
 │   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
-│   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs)
+│   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs; docs/MCP.md)
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue; axum)
 │   ├── inspect.rs              model inspection (load/inspect command)

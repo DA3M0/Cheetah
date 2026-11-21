@@ -1696,4 +1696,91 @@ mod forward_tests {
         let cfg = DecoderConfig::resolve(Some(&raw), &gemma_fixture.store, Some(family)).unwrap();
         assert_eq!(cfg.sliding_window, 4096);
     }
+
+    // --- KV 复用基础性质（任何前缀复用优化的正确性基石） ---
+
+    /// KV 前缀续算 parity：缓存中已有 4 个位置后，以 offset=4 续算 [5,6]，
+    /// 最终位置的 logits 必须与"从头全量 prefill [1..6]"的结果**逐比特一致**。
+    /// 这是任何 KV 复用/前缀缓存优化所依赖的核心正确性性质——当前引擎的
+    /// `forward(tokens, offset)` 机制已满足它。
+    #[test]
+    fn kv_continuation_matches_full_prefill_bit_exact() {
+        let fixture = Fixture::new("kv_continuation", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+
+        // 增量路径：先 prefill [1,2,3,4]（KV 持有 4 个位置），再以 offset=4 续算 [5,6]。
+        let mut incremental = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        incremental.forward(&[1, 2, 3, 4], 0).unwrap();
+        assert_eq!(incremental.ctx.kv_len(0), 4, "KV 应持有 4 个位置");
+        let logits_continued = incremental.forward(&[5, 6], 4).unwrap();
+
+        // 全量路径：全新 decoder 一次 prefill [1..6]。
+        let mut fresh = LlamaNative::with_store(cfg, Arc::clone(&fixture.store));
+        let logits_full = fresh.forward(&[1, 2, 3, 4, 5, 6], 0).unwrap();
+
+        assert_eq!(
+            logits_continued, logits_full,
+            "KV 前缀续算必须与全量 prefill 比特一致"
+        );
+    }
+
+    /// KV 代间隔离：clear_cache 之后，同一 decoder 上跑不同 prompt 的 logits
+    /// 必须与全新 decoder 的结果完全一致——上一个生成的 KV 状态绝不泄漏。
+    #[test]
+    fn kv_cache_does_not_leak_across_generations() {
+        let fixture = Fixture::new("kv_isolation", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+
+        // 复用路径：先跑一段长 prompt（A），clear 后跑短 prompt（B）。
+        let mut reused = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let logits_a = reused.forward(&[1, 2, 3, 4, 5, 6, 7, 8], 0).unwrap();
+        assert_eq!(reused.ctx.kv_len(0), 8);
+        reused.clear_cache();
+        assert_eq!(reused.ctx.kv_len(0), 0, "clear_cache 必须清空 KV");
+        let logits_b_after = reused.forward(&[20, 21], 0).unwrap();
+
+        // 全新基准：各自独立 decoder 跑 A 与 B。
+        let mut fresh_a = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let logits_a_fresh = fresh_a.forward(&[1, 2, 3, 4, 5, 6, 7, 8], 0).unwrap();
+        let mut fresh_b = LlamaNative::with_store(cfg, Arc::clone(&fixture.store));
+        let logits_b_fresh = fresh_b.forward(&[20, 21], 0).unwrap();
+
+        assert_eq!(logits_a, logits_a_fresh, "A 的 logits 应与全新运行一致");
+        assert_eq!(
+            logits_b_after, logits_b_fresh,
+            "clear_cache 之后 B 的 logits 不得受 A 的 KV 残留影响"
+        );
+    }
+
+    /// 克隆即新 KV：`clone()` 共享权重（Arc），但 KV 缓存必须从零开始——
+    /// 这是引擎每次生成克隆 runtime 时的隔离契约。
+    #[test]
+    fn clone_shares_weights_but_starts_with_empty_kv() {
+        let fixture = Fixture::new("kv_clone", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+        let mut original = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        original.forward(&[3, 1, 4, 1, 5], 0).unwrap();
+        assert_eq!(original.ctx.kv_len(0), 5);
+
+        let mut cloned = original.clone();
+        assert_eq!(cloned.ctx.kv_len(0), 0, "克隆必须从空 KV 开始");
+        // 权重共享：克隆（空 KV、位置 0 起）与一台全新 decoder（同一 mmap
+        // 权重）跑相同 prompt 的 logits 必须逐比特一致。
+        let logits_cloned = cloned.forward(&[2, 7], 0).unwrap();
+        let mut standalone = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let logits_standalone = standalone.forward(&[2, 7], 0).unwrap();
+        assert_eq!(
+            logits_cloned, logits_standalone,
+            "克隆的权重必须与原机共享（同一 mmap 存储）"
+        );
+        // 原机继续在自己的 KV 上续算（位置 5-6；rope 位置不同 → logits 不同
+        // 是正确行为），验证其 KV 连续性不受克隆影响。
+        let logits_original = original.forward(&[2, 7], 5).unwrap();
+        let mut fresh_full = LlamaNative::with_store(cfg, Arc::clone(&fixture.store));
+        let logits_full = fresh_full.forward(&[3, 1, 4, 1, 5, 2, 7], 0).unwrap();
+        assert_eq!(
+            logits_original, logits_full,
+            "原机在位置 5 续算必须等价于从头 prefill 全序列（KV 连续性）"
+        );
+    }
 }
