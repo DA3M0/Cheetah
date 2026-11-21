@@ -18,6 +18,7 @@ pub enum WeightDType {
 }
 
 impl WeightDType {
+    /// Byte width per stored element (BF16/F16 = 2, F32 = 4).
     pub fn element_size(self) -> usize {
         match self {
             WeightDType::Bf16 | WeightDType::F16 => 2,
@@ -162,6 +163,7 @@ impl MmapWeightStore {
         })
     }
 
+    /// Iterator over every unit id the manifest indexed.
     pub fn unit_ids(&self) -> impl Iterator<Item = &str> {
         self.units.keys().map(String::as_str)
     }
@@ -200,6 +202,7 @@ impl MmapWeightStore {
         Ok((&shard.mmap[start..end], unit.dtype, &unit.shape))
     }
 
+    /// Current Ant tier of one unit; units without an explicit tier default to [`Tier::Resident`].
     pub fn tier(&self, unit_id: &str) -> Tier {
         self.tiers
             .lock()
@@ -209,6 +212,9 @@ impl MmapWeightStore {
             .unwrap_or(Tier::Resident)
     }
 
+    /// Sets a unit's tier behind the interior-mutability lock and immediately
+    /// drives the real page control: resident tiers are faulted in, disk tiers
+    /// are dropped with `madvise(DONTNEED)`. Unknown unit ids are ignored.
     pub fn set_tier(&self, unit_id: &str, tier: Tier) {
         let mut tiers = self
             .tiers

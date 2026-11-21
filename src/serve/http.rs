@@ -28,6 +28,9 @@ pub(crate) struct ServerState {
     pub(crate) created: u64,
 }
 
+/// Whether an incoming request is a generation endpoint (POST
+/// `/v1/chat/completions` or `/v1/completions`, ignoring query strings and
+/// trailing slashes) — decides whether a queue ticket is taken.
 pub(crate) fn is_generation_request(request: &Request) -> bool {
     if request.method() != &Method::Post {
         return false;
@@ -38,6 +41,9 @@ pub(crate) fn is_generation_request(request: &Request) -> bool {
     matches!(path, "/v1/chat/completions" | "/v1/completions")
 }
 
+/// The request dispatcher: OPTIONS → CORS preflight, `/health` free of auth
+/// so probes can check liveness, then the Bearer check and the route table
+/// (models / chat / completions). Generation routes expect a queue ticket.
 pub(crate) fn handle(
     state: Arc<ServerState>,
     request: Request,
@@ -124,6 +130,8 @@ enum RouteEnum {
     Completions,
 }
 
+/// Route table: a known path with a wrong method is 405, anything unknown
+/// is 404.
 fn route(method: &Method, path: &str) -> Result<RouteEnum, StatusCode> {
     if method == &Method::Get && path == "/health" {
         return Ok(RouteEnum::Health);
@@ -159,6 +167,8 @@ fn route(method: &Method, path: &str) -> Result<RouteEnum, StatusCode> {
 
 // ---- auth ----
 
+/// Bearer-token check against the expected key; no expected key means the
+/// request is allowed (loopback-only posture enforced upstream).
 fn authorized(request: &Request, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -176,6 +186,8 @@ fn authorized(request: &Request, expected: Option<&str>) -> bool {
     constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
+/// Length-checked constant-time byte comparison so token validation does
+/// not leak the first differing position.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Compare every byte when lengths match to avoid leaking the first differing position.
     // 长度相同时遍历所有字节，避免通过首个差异位置泄露令牌内容。
@@ -187,10 +199,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ---- helpers ----
 
+/// The static `{"status":"ok"}` liveness body.
 fn health_body() -> String {
     r#"{"status":"ok"}"#.to_string()
 }
 
+/// Serializes the OpenAI `/v1/models` list (the single loaded model).
 fn model_list_string(state: &ServerState) -> String {
     let list = ModelList {
         object: "list",
@@ -204,6 +218,7 @@ fn model_list_string(state: &ServerState) -> String {
     serde_json::to_string(&list).unwrap_or_default()
 }
 
+/// Serializes the `/v1/models/{id}` entry for the loaded model.
 fn single_model_string(state: &ServerState) -> String {
     let entry = ModelEntry {
         id: state.model_id.clone(),
@@ -214,6 +229,7 @@ fn single_model_string(state: &ServerState) -> String {
     serde_json::to_string(&entry).unwrap_or_default()
 }
 
+/// The CORS header set (origin, methods, headers).
 fn cors_headers() -> Vec<Header> {
     vec![
         Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).expect("cors header"),
@@ -230,6 +246,7 @@ fn cors_headers() -> Vec<Header> {
     ]
 }
 
+/// The 204 CORS preflight response with CORS + Allow headers.
 fn options_response() -> Response<io::Empty> {
     let mut response = Response::new(StatusCode(204), cors_headers(), io::empty(), Some(0), None);
     response = response.with_header(
@@ -238,12 +255,14 @@ fn options_response() -> Response<io::Empty> {
     response
 }
 
+/// CORS headers plus `application/json`.
 fn json_headers() -> Vec<Header> {
     let mut headers = cors_headers();
     headers.push(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("ct"));
     headers
 }
 
+/// Sends a JSON response with an explicit content length.
 fn respond_json(request: Request, status: StatusCode, body: String) {
     let data = body.into_bytes();
     let len = data.len();
@@ -257,11 +276,13 @@ fn respond_json(request: Request, status: StatusCode, body: String) {
     let _ = request.respond(response);
 }
 
+/// Sends an OpenAI-shaped error envelope (`error_body`) for a status code.
 fn respond_error(request: Request, status: u16, message: &str) {
     let body = error_body(status, message);
     respond_json(request, StatusCode(status), body);
 }
 
+/// Drains the request body into a byte buffer.
 fn read_body(request: &mut Request) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     request.as_reader().read_to_end(&mut body)?;
@@ -270,6 +291,11 @@ fn read_body(request: &mut Request) -> io::Result<Vec<u8>> {
 
 // ---- chat completions ----
 
+/// The chat endpoint: parse → model match → tool-choice validation →
+/// message building → option resolution; tool-enabled requests route
+/// through the tool prompt path, then either stream (SSE with disconnect
+/// tracking) or respond non-streaming. Every validation failure maps to a
+/// status + error body before any generation starts.
 fn handle_chat_completions(
     state: Arc<ServerState>,
     request: Request,
@@ -608,6 +634,9 @@ fn handle_chat_completions(
     }
 }
 
+/// Splits a finished generation into content / tool-calls / finish-reason —
+/// tool JSON detected in the text turns the response into a tool_calls
+/// message.
 fn chat_completion_parts(
     text: &str,
     finish_reason: &str,
@@ -618,6 +647,9 @@ fn chat_completion_parts(
     }
 }
 
+/// Serializes the messages (injecting the default system prompt when the
+/// request carries none) and the tools — filtered to the named function
+/// when `tool_choice` names one — for the template's tool parser.
 fn build_tool_prompt_inputs(
     request: &ChatCompletionRequest,
     tools: &[ToolDefinition],
@@ -666,6 +698,9 @@ struct ToolChatInput<'a> {
     resident_overrides: &'a HashSet<String>,
 }
 
+/// Runs a tool-mode generation into a null sink, parses the output through
+/// the chat template parser, then through `parse_tool_response` → text or
+/// tool calls.
 fn generate_tool_chat(
     state: &ServerState,
     _guard: QueueGuard,
@@ -697,6 +732,9 @@ fn generate_tool_chat(
 
 // ---- completions (legacy) ----
 
+/// The legacy `/v1/completions` endpoint (non-streaming only; `echo` is
+/// unsupported): prompt → single user message → generate → text completion
+/// response.
 fn handle_completions(state: Arc<ServerState>, request: Request, generation_ticket: QueueTicket) {
     let mut request = request;
     let body = match read_body(&mut request) {
@@ -809,6 +847,8 @@ fn handle_completions(state: Arc<ServerState>, request: Request, generation_tick
 
 // ---- generation ----
 
+/// Shared generation core under the queue guard: new context plus
+/// `Engine::generate`.
 fn generate_chat(
     state: &ServerState,
     _guard: QueueGuard,
@@ -829,6 +869,8 @@ fn generate_chat(
     )
 }
 
+/// Maps context-overflow prompt errors to 400 (client error); every other
+/// prompt failure is a 500.
 fn prompt_error_status(error: &str) -> u16 {
     if error.starts_with("Input plus reserved generation tokens exceeds the model context limit") {
         400
@@ -842,6 +884,8 @@ fn prompt_error_status(error: &str) -> u16 {
 struct NullSink;
 
 impl TextSink for NullSink {
+    /// NullSink discards streamed text — non-streaming requests still stream
+    /// internally and simply do not keep the text.
     fn push(&mut self, _text: &str) -> Result<(), String> {
         Ok(())
     }
@@ -858,10 +902,17 @@ struct SseSink {
 }
 
 impl SseSink {
+    /// Reader without disconnect tracking (tool-mode responses stream a fixed
+    /// frame set).
+    /// Builds an SSE sink without disconnect tracking (tool responses).
     fn new(tx: SyncSender<Bytes>, id: String, created: u64, model: String) -> Self {
         Self::new_inner(tx, id, created, model, None)
     }
 
+    /// Reader sharing the disconnect flag with the SSE sink, so dropping the
+    /// reader stops the generation.
+    /// Builds an SSE sink that shares the client-disconnect flag with the
+    /// response reader, so a dropped connection stops the generation.
     fn new_with_disconnect(
         tx: SyncSender<Bytes>,
         id: String,
@@ -872,6 +923,7 @@ impl SseSink {
         Self::new_inner(tx, id, created, model, Some(disconnected))
     }
 
+    /// Shared construction behind the two sink constructors.
     fn new_inner(
         tx: SyncSender<Bytes>,
         id: String,
@@ -889,6 +941,8 @@ impl SseSink {
         }
     }
 
+    /// Emits one OpenAI `chat.completion.chunk` frame; a closed channel maps to
+    /// a "Client disconnected" error.
     fn send_chunk(
         &self,
         role: Option<&'static str>,
@@ -909,6 +963,8 @@ impl SseSink {
             .map_err(|_| "Client disconnected".to_string())
     }
 
+    /// Emits the tool-call delta frame — indexed calls with id / name /
+    /// arguments — carrying the assistant role on the first emission.
     fn send_tool_calls(&mut self, calls: &[ToolCall]) -> Result<(), String> {
         let role = self.first.then_some("assistant");
         self.first = false;
@@ -928,6 +984,7 @@ impl SseSink {
         self.send_chunk(role, None, Some(calls), None)
     }
 
+    /// Emits the `data: [DONE]` SSE terminator.
     fn send_done(&self) -> Result<(), String> {
         self.tx
             .send(Bytes::from_static(b"data: [DONE]\n\n"))
@@ -962,6 +1019,8 @@ struct SseChunkDelta<'a> {
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
+/// Serializes one SSE frame; `None` fields are skipped per the OpenAI
+/// delta shape.
 fn sse_frame(
     id: &str,
     created: u64,
@@ -995,6 +1054,8 @@ fn sse_frame(
 }
 
 impl TextSink for SseSink {
+    /// TextSink impl for SSE: streams one content delta (empty chunks ignored)
+    /// and aborts the generation once the client disconnected.
     fn push(&mut self, text: &str) -> Result<(), String> {
         if text.is_empty() {
             return Ok(());
@@ -1011,10 +1072,12 @@ impl TextSink for SseSink {
         self.send_chunk(role, Some(text), None, None)
     }
 
+    /// Always false — streamed text is never retained server-side.
     fn capture_text(&self) -> bool {
         false
     }
 
+    /// True once the client disconnected from the SSE stream.
     fn interrupted(&mut self) -> bool {
         self.disconnected
             .as_ref()
@@ -1024,6 +1087,8 @@ impl TextSink for SseSink {
 
 // ---- SSE reader ----
 
+/// Builds the `text/event-stream` response around a [`ChannelReader`], with
+/// CORS + no-cache headers and the disconnect flag wired to the sink.
 fn sse_response(
     receiver: Receiver<Bytes>,
     heartbeat_frame: Bytes,
@@ -1055,6 +1120,8 @@ struct ChannelReader {
 }
 
 impl ChannelReader {
+    /// Reader without disconnect tracking (tool-mode responses stream a fixed
+    /// frame set, so nothing needs the shared flag).
     fn new(
         receiver: Receiver<Bytes>,
         heartbeat_frame: Bytes,
@@ -1068,6 +1135,8 @@ impl ChannelReader {
         )
     }
 
+    /// Reader sharing the disconnect flag with the SSE sink, so dropping the
+    /// reader stops the generation.
     fn new_with_disconnect(
         receiver: Receiver<Bytes>,
         heartbeat_frame: Bytes,
@@ -1086,12 +1155,17 @@ impl ChannelReader {
 }
 
 impl Drop for ChannelReader {
+    /// Marks the client disconnected — the generation sink observes the flag on
+    /// its next delta and stops.
     fn drop(&mut self) {
         self.disconnected.store(true, Ordering::Relaxed);
     }
 }
 
 impl Read for ChannelReader {
+    /// The streaming pump: blocks only when no bytes were returned yet this
+    /// call (emitting the heartbeat frame on idle timeout), otherwise drains
+    /// queued chunks without waiting; EOF once the sender drops.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);

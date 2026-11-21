@@ -26,6 +26,7 @@ pub(crate) use engine::{
     ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice, load_engine_with_progress,
 };
 
+/// Interactive chat entry: validates the model path kind, loads the engine behind a progress spinner, and runs the REPL loop (`chat_loop`) with the supplied archive + store.
 pub fn chat(
     path: &std::path::Path,
     options: crate::options::ChatOptions,
@@ -36,6 +37,7 @@ pub fn chat(
     engine::chat(path, options, archive, store, ant)
 }
 
+/// Derives init-time metadata (chat template id + stop markers) from a model config's architecture name through the generated REGISTRY; `None` when the config names nothing resolvable.
 pub(crate) fn model_metadata_for_init(
     source: &std::path::Path,
 ) -> Result<Option<cheetah::native::ModelMetadata>, String> {

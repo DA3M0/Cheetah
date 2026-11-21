@@ -34,26 +34,32 @@ pub(crate) struct Q8Matrix {
 }
 
 impl PrecisionBuffer for Q8Matrix {
+    /// The registered format id: always `"q8"` for this buffer type.
     fn format_id(&self) -> &'static str {
         "q8"
     }
 
+    /// Matmul output features (`n`): one quantized row per output channel.
     fn rows(&self) -> usize {
         self.rows
     }
 
+    /// Matmul reduction width (`k`): elements per quantized row.
     fn cols(&self) -> usize {
         self.cols
     }
 
+    /// The complete buffer: f32 scale head + packed int8 payloads.
     fn buffer(&self) -> &[u8] {
         &self.buffer
     }
 
+    /// Padded per-row byte stride of the packed payloads (4-byte aligned).
     fn row_bytes(&self) -> usize {
         (self.cols + 3) / 4 * 4
     }
 
+    /// Dequantized element value: `row_scale * code` (tests and diagnostics).
     fn dequant_value(&self, row: usize, col: usize) -> f32 {
         let scale = f32::from_le_bytes([
             self.buffer[row * 4],

@@ -710,6 +710,7 @@ impl Ant {
     }
 }
 
+/// Prints a prompt, flushes stdout, and reads one trimmed stdin line for the `--setup` wizard.
 fn interactive_prompt(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     let mut stdout = std::io::stdout();
@@ -721,6 +722,7 @@ fn interactive_prompt(prompt: &str) -> Result<String, String> {
     Ok(line.trim().to_string())
 }
 
+/// Prompt variant returning a u64; an empty answer takes the `default`, anything unparsable is a wizard error.
 fn interactive_prompt_u64(prompt: &str, default: u64) -> Result<u64, String> {
     let answer = interactive_prompt(prompt)?;
     if answer.is_empty() {
@@ -731,6 +733,7 @@ fn interactive_prompt_u64(prompt: &str, default: u64) -> Result<u64, String> {
         .map_err(|_| format!("{prompt} expects a non-negative integer; received '{answer}'."))
 }
 
+/// Prompt variant returning a usize; an empty answer takes the `default`, anything unparsable is a wizard error.
 fn interactive_prompt_usize(prompt: &str, default: usize) -> Result<usize, String> {
     let answer = interactive_prompt(prompt)?;
     if answer.is_empty() {
@@ -741,6 +744,7 @@ fn interactive_prompt_usize(prompt: &str, default: usize) -> Result<usize, Strin
         .map_err(|_| format!("{prompt} expects a non-negative integer; received '{answer}'."))
 }
 
+/// Prompt variant accepting true/1/yes/on vs false/0/no/off (case-insensitive); an empty answer takes the `default`.
 fn interactive_prompt_bool(prompt: &str, default: bool) -> Result<bool, String> {
     let answer = interactive_prompt(prompt)?;
     if answer.is_empty() {
@@ -755,6 +759,7 @@ fn interactive_prompt_bool(prompt: &str, default: bool) -> Result<bool, String> 
     }
 }
 
+/// Prompt variant returning the raw trimmed string; an empty answer takes the `default`.
 fn interactive_prompt_str(prompt: &str, default: &str) -> Result<String, String> {
     let answer = interactive_prompt(prompt)?;
     if answer.is_empty() {
@@ -764,6 +769,7 @@ fn interactive_prompt_str(prompt: &str, default: &str) -> Result<String, String>
 }
 
 impl Drop for Ant {
+    /// Releases the C manager handle exactly once — the FFI ownership contract between [`Ant`] and `cheetah_ant_delete`.
     fn drop(&mut self) {
         native::ant_delete(self.handle);
     }

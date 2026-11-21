@@ -17,6 +17,8 @@ pub(crate) struct FifoQueue {
 }
 
 impl FifoQueue {
+    /// Builds the concurrency-limited FIFO queue; a zero limit is rejected
+    /// (at least one generation must be able to run).
     pub(crate) fn new(max_active: usize) -> Result<Self, String> {
         let max_active = NonZeroUsize::new(max_active)
             .ok_or_else(|| "Maximum concurrent generations must be greater than 0.".to_string())?;
@@ -27,6 +29,8 @@ impl FifoQueue {
         })
     }
 
+    /// Takes the next ticket number (wrapping) and returns a cancellable
+    /// ticket; nothing is reserved until the ticket is acquired.
     pub(crate) fn enqueue(self: &Arc<Self>) -> QueueTicket {
         let mut state = self.lock_state();
         let number = state.next_ticket;
@@ -38,6 +42,9 @@ impl FifoQueue {
         }
     }
 
+    /// Blocks until the ticket is at the head AND an active slot is free.
+    /// Cancelled tickets are skipped only when they reach the head, so later
+    /// requests can never jump the queue; every state change wakes all waiters.
     fn acquire(self: &Arc<Self>, mut ticket: QueueTicket) -> QueueGuard {
         let mut state = self.lock_state();
         // Ticket order preserves FIFO fairness while active tracks the configured parallelism limit.
@@ -59,6 +66,8 @@ impl FifoQueue {
         }
     }
 
+    /// Marks a ticket cancelled — a head ticket advances immediately, others
+    /// join the cancelled set for later skipping.
     fn cancel(&self, ticket: u64) {
         let mut state = self.lock_state();
         if state.serving == ticket {
@@ -70,6 +79,7 @@ impl FifoQueue {
         self.changed.notify_all();
     }
 
+    /// Mutex lock with poisoned-lock recovery.
     fn lock_state(&self) -> MutexGuard<'_, QueueState> {
         self.state
             .lock()
@@ -77,6 +87,8 @@ impl FifoQueue {
     }
 }
 
+/// Skips abandoned tickets only while they sit at the head of the serving
+/// line.
 fn advance_cancelled(state: &mut QueueState) {
     // Skip abandoned tickets only when they reach the head, so later requests cannot jump the queue.
     // 只有取消票到达队首时才跳过，避免后续请求越过仍在等待的请求。
@@ -92,6 +104,8 @@ pub(crate) struct QueueTicket {
 }
 
 impl QueueTicket {
+    /// Consumes the ticket into a queue guard — the point where the request
+    /// starts holding one active generation slot.
     pub(crate) fn acquire(self) -> QueueGuard {
         let queue = Arc::clone(&self.queue);
         queue.acquire(self)
@@ -99,6 +113,8 @@ impl QueueTicket {
 }
 
 impl Drop for QueueTicket {
+    /// An unacquired dropped ticket cancels itself, so abandoned requests never
+    /// block the queue.
     fn drop(&mut self) {
         if !self.acquired {
             self.queue.cancel(self.number);
@@ -111,6 +127,7 @@ pub(crate) struct QueueGuard {
 }
 
 impl Drop for QueueGuard {
+    /// Releases one active slot and wakes the waiters.
     fn drop(&mut self) {
         let mut state = self.queue.lock_state();
         state.active -= 1;
@@ -119,6 +136,7 @@ impl Drop for QueueGuard {
 }
 
 impl Default for FifoQueue {
+    /// One-slot queue — the default single-concurrent-generation posture.
     fn default() -> Self {
         Self::new(1).expect("one is a valid generation limit")
     }

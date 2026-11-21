@@ -235,6 +235,13 @@ unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// Row-parallel matrix-vector `y = W · x` over stored-precision weight bytes.
+///
+/// BF16 rows take the fused widening kernel (AVX2+FMA when the CPU supports
+/// it, the portable fused loop otherwise); every other dtype dequantizes one
+/// row at a time and dots in f32. Up to `GEMV_CHUNK_ROWS` (128) rows run
+/// sequentially (a rayon fork/join would cost more than the compute), larger
+/// matrices split into 128-row rayon chunks.
 pub fn gemv(weight: &[u8], dtype: WeightDType, rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), cols, "gemv input width mismatch");
     assert_eq!(y.len(), rows, "gemv output width mismatch");
@@ -676,6 +683,10 @@ pub(crate) struct OpsToolbox {
 }
 
 impl Clone for OpsToolbox {
+    /// Clone semantics for the toolbox: the weight store is shared through the
+    /// Arc, while the KV caches, quantized-buffer table, expert-residency map
+    /// and debug state start fresh — the engine clones the runtime per
+    /// generation and clears the cache anyway.
     fn clone(&self) -> Self {
         // Weights are shared through the Arc'd store; a clone starts from a
         // fresh KV cache and fresh quantized buffers (the engine clears the

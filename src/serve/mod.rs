@@ -14,6 +14,11 @@ use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Server lifecycle: refuses unauthenticated non-loopback listeners,
+/// resolves the model + Ant settings, loads the engine, resolves or
+/// generates the API key, installs the Ctrl-C handler, builds the shared
+/// state, and loops on `recv_timeout` spawning one worker per request —
+/// generation requests take a queue ticket before entering `http::handle`.
 pub fn serve(
     options: ServeOptions,
     chat_options: ChatOptions,
@@ -137,6 +142,9 @@ pub fn serve(
 
 // ---- model resolution ----
 
+/// Model resolution: a direct `.safetensors` file, a prepared model
+/// directory, or a name match inside `--model-dir`; ambiguous and missing
+/// names error with the available models listed.
 fn resolve_model(options: &ServeOptions) -> Result<(PathBuf, String), String> {
     let candidate = PathBuf::from(&options.model);
     if candidate.is_file()
@@ -228,6 +236,8 @@ fn resolve_model(options: &ServeOptions) -> Result<(PathBuf, String), String> {
     Err(id)
 }
 
+/// Strips directories and the `.safetensors` suffix down to the matchable
+/// model name.
 fn model_name_for_match(model: &str) -> &str {
     let name = Path::new(model)
         .file_name()
@@ -241,6 +251,8 @@ fn model_name_for_match(model: &str) -> &str {
     }
 }
 
+/// The API-visible model id: file stem for files, directory name for
+/// directories, `"model"` as the last-resort fallback.
 fn model_id_from_path(path: &Path) -> String {
     let name = if path.is_dir() {
         path.file_name()
@@ -251,6 +263,9 @@ fn model_id_from_path(path: &Path) -> String {
         .unwrap_or_else(|| "model".to_string())
 }
 
+/// Whether a directory looks like a loadable model: config.json +
+/// tokenizer.json + a recognized weight layout (single file, HF index, or
+/// cheetah manifest).
 fn is_model_directory(path: &Path) -> bool {
     path.join("config.json").is_file()
         && path.join("tokenizer.json").is_file()
@@ -259,6 +274,8 @@ fn is_model_directory(path: &Path) -> bool {
             || path.join("cheetah_manifest.json").is_file())
 }
 
+/// Sorted listing of safetensors files and model directories — embedded in
+/// the not-found error so users can pick the right name.
 fn list_safetensors_models(dir: &Path) -> String {
     if !dir.is_dir() {
         return String::new();
@@ -285,6 +302,9 @@ fn list_safetensors_models(dir: &Path) -> String {
 
 // ---- key / url helpers ----
 
+/// Explicit `--api-key` wins; `--generate-key` creates one; otherwise no
+/// auth (which the loopback-only check upstream already rejected for
+/// non-loopback binds).
 fn resolve_api_key(options: &ServeOptions) -> Result<Option<String>, String> {
     if let Some(key) = &options.api_key {
         return Ok(Some(key.clone()));
@@ -295,10 +315,14 @@ fn resolve_api_key(options: &ServeOptions) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Whether the bind host is loopback-only — the gate that decides whether
+/// auth is mandatory.
 fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
+/// The startup banner URL: `localhost` for loopback binds, bracketed IPv6
+/// for hosts containing a colon.
 fn display_url(host: &str, port: u16) -> String {
     let display = if is_loopback(host) {
         "localhost"

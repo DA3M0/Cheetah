@@ -1,5 +1,7 @@
 use crate::chat::ChatMessage;
 
+/// Qwen ChatML: `<|im_start|>{role}\n...<|im_end|>` per turn, an optional
+/// system turn first, and a bare `<|im_start|>assistant\n` tail.
 pub(super) fn qwen(messages: &[ChatMessage], system: Option<&str>) -> String {
     let mut rendered = String::new();
     if let Some(system) = system {
@@ -18,6 +20,8 @@ pub(super) fn qwen(messages: &[ChatMessage], system: Option<&str>) -> String {
     rendered
 }
 
+/// Gemma turns: `<start_of_turn>{user|model}` with the system prompt folded
+/// into the first non-assistant turn; ends with `<start_of_turn>model\n`.
 pub(super) fn gemma(messages: &[ChatMessage], system: Option<&str>) -> String {
     let mut rendered = String::new();
     for (index, message) in messages.iter().enumerate() {
@@ -42,18 +46,24 @@ pub(super) fn gemma(messages: &[ChatMessage], system: Option<&str>) -> String {
     rendered
 }
 
+/// Llama-2 instruction format (delegates to [`instruction`]).
 pub(super) fn llama2(messages: &[ChatMessage], system: Option<&str>) -> String {
     instruction(messages, system)
 }
 
+/// Mistral instruction format — identical shape to llama2.
 pub(super) fn mistral(messages: &[ChatMessage], system: Option<&str>) -> String {
     instruction(messages, system)
 }
 
+/// Mixtral instruction format — identical shape to llama2.
 pub(super) fn mixtral(messages: &[ChatMessage], system: Option<&str>) -> String {
     instruction(messages, system)
 }
 
+/// The shared `[INST]` renderer: folds the system prompt into the first
+/// user turn's `<<SYS>>` block, separates assistant turns with ` </s>`,
+/// and opens the prompt with `<s>`.
 fn instruction(messages: &[ChatMessage], system: Option<&str>) -> String {
     let mut rendered = String::new();
     let mut system_message = system.map(str::to_owned);
@@ -82,6 +92,9 @@ fn instruction(messages: &[ChatMessage], system: Option<&str>) -> String {
     rendered
 }
 
+/// Llama-3 header format: `<|begin_of_text|>` plus
+/// `<|start_header_id|>{role}<|end_header_id|>` turns closed by
+/// `<|eot_id|>`, then the assistant header tail.
 pub(super) fn llama3(messages: &[ChatMessage], system: Option<&str>) -> String {
     let mut rendered = String::from("<|begin_of_text|>");
     if let Some(system) = system {
@@ -100,6 +113,8 @@ pub(super) fn llama3(messages: &[ChatMessage], system: Option<&str>) -> String {
     rendered
 }
 
+/// Phi-2 format: `<|system|>` / `<|user|>` / `<|assistant|>` turns closed
+/// by `<|end|>`, with an assistant prompt tail.
 pub(super) fn phi(messages: &[ChatMessage], system: Option<&str>) -> String {
     let mut rendered = String::new();
     if let Some(system) = system {

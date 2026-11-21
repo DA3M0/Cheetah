@@ -106,6 +106,7 @@ impl RunError {
 }
 
 impl std::fmt::Display for RunError {
+    /// Renders both error kinds through one presentation: the message text itself (the kind only changes the exit code).
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Usage(message) | Self::Runtime(message) => formatter.write_str(message),

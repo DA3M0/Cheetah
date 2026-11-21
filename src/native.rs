@@ -150,12 +150,12 @@ impl InitProgress {
     }
 }
 
-/// Raw declarations from `cheetah_init.c`.
-///
-/// These are the only preparation symbols linked from the Rust side. The
-/// foreign signatures use C ABI types (`*const c_char`, `usize`, `void*`) and
-/// return `i32` status codes. Wrappers below add path/string conversion,
-/// locking, and progress management; they never change pointer ownership.
+// Raw declarations from `cheetah_init.c`.
+//
+// These are the only preparation symbols linked from the Rust side. The
+// foreign signatures use C ABI types (`*const c_char`, `usize`, `void*`) and
+// return `i32` status codes. Wrappers below add path/string conversion,
+// locking, and progress management; they never change pointer ownership.
 unsafe extern "C" {
     /// Prepare a model with periodic progress callbacks.
     ///
@@ -210,15 +210,15 @@ pub struct AntFfiSettings {
     pub allow_vram_swap: i32,
 }
 
-/// Raw declarations from `cheetah_memory.c` for the Ant memory manager.
-///
-/// Every `ant` parameter is an opaque pointer previously returned by
-/// `cheetah_ant_new`; passing null or a pointer that has already been deleted
-/// is undefined behavior. The wrappers in this module preserve that contract
-/// and expose safe-looking Rust signatures, but they cannot validate pointer
-/// provenance. Status-returning functions use 0 for success and negative
-/// values for failure, matching the C header. Functions taking `*const`
-/// handles are logically read-only but may still update internal caches.
+// Raw declarations from `cheetah_memory.c` for the Ant memory manager.
+//
+// Every `ant` parameter is an opaque pointer previously returned by
+// `cheetah_ant_new`; passing null or a pointer that has already been deleted
+// is undefined behavior. The wrappers in this module preserve that contract
+// and expose safe-looking Rust signatures, but they cannot validate pointer
+// provenance. Status-returning functions use 0 for success and negative
+// values for failure, matching the C header. Functions taking `*const`
+// handles are logically read-only but may still update internal caches.
 unsafe extern "C" {
     /// Allocate a new Ant memory manager.
     ///
@@ -931,9 +931,13 @@ pub mod vulkan {
     static VULKAN_LOCK: Mutex<()> = Mutex::new(());
 
     unsafe extern "C" {
+        // Initializes the C Vulkan backend (device selection + memory pool).
         fn init_vulkan_device() -> c_int;
+        // Tears the backend down; all uploads must be released first.
         fn shutdown_vulkan_device();
+        // Builds the shader pipelines the qwen operator set needs.
         fn vk_qwen_prepare() -> c_int;
+        // Row-major f32 matmul C[M,N] = A[M,K] · B[K,N].
         fn vk_matmul_checked(
             a: *const f32,
             b: *const f32,
@@ -942,6 +946,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Matmul against the transpose view of a row-major f32 weight.
         fn vk_matmul_transposed_checked(
             a: *const f32,
             b: *const f32,
@@ -950,6 +955,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // FP32 activation × row-major BF16 weight matmul.
         fn vk_matmul_bf16_checked(
             a: *const f32,
             b: *const u16,
@@ -958,6 +964,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // FP32 activation × transpose-of-BF16 weight matmul.
         fn vk_matmul_bf16_transposed_checked(
             a: *const f32,
             b: *const u16,
@@ -966,12 +973,17 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Uploads BF16 bits into the resident bucket; returns the handle.
         fn cheetah_vulkan_weight_upload_bf16(weights: *const u16, element_count: u64) -> u64;
+        // Uploads a q8 buffer (scale head + padded int8 rows).
         fn cheetah_vulkan_weight_upload_q8(bytes: *const u8, byte_size: u64, row_bytes: u32)
         -> u64;
+        // Uploads a q4 buffer (scale head + padded nibble rows).
         fn cheetah_vulkan_weight_upload_q4(bytes: *const u8, byte_size: u64, row_bytes: u32)
         -> u64;
+        // Releases one resident upload handle.
         fn cheetah_vulkan_weight_release(handle: u64) -> c_int;
+        // Resident bf16 matmul reading the uploaded weight in place.
         fn vk_matmul_bf16_transposed_resident_checked(
             handle: u64,
             a: *const f32,
@@ -980,6 +992,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Streaming q8 matmul (weights staged through the pool per tile).
         fn vk_matmul_q8_transposed_checked(
             a: *const f32,
             q8: *const u8,
@@ -988,6 +1001,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Streaming q4 matmul.
         fn vk_matmul_q4_transposed_checked(
             a: *const f32,
             q4: *const u8,
@@ -996,6 +1010,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Resident q4 matmul from the uploaded handle.
         fn vk_matmul_q4_transposed_resident_checked(
             handle: u64,
             a: *const f32,
@@ -1004,6 +1019,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Resident q8 matmul from the uploaded handle.
         fn vk_matmul_q8_transposed_resident_checked(
             handle: u64,
             a: *const f32,
@@ -1012,6 +1028,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // FP32 × transpose-of-FP16 matmul (shared 16-bit pipeline, fp16 decode).
         fn vk_matmul_fp16_transposed_checked(
             a: *const f32,
             b: *const u16,
@@ -1020,6 +1037,7 @@ pub mod vulkan {
             k: c_int,
             n: c_int,
         ) -> c_int;
+        // Embedding gather: one row per token id, optional sqrt(hidden) scale.
         fn vk_qwen_gather(
             token_ids: *const u32,
             table: *const c_void,
@@ -1030,6 +1048,7 @@ pub mod vulkan {
             hidden_size: usize,
             scale: u32,
         ) -> c_int;
+        // Adds a bias tensor per `period` lanes in place.
         fn vk_qwen_bias_add(
             values: *const f32,
             bias: *const c_void,
@@ -1038,6 +1057,7 @@ pub mod vulkan {
             period: usize,
             output: *mut f32,
         ) -> c_int;
+        // RMSNorm shader over the stored weight format.
         fn vk_qwen_rms_norm(
             input: *const f32,
             weight: *const c_void,
@@ -1047,6 +1067,7 @@ pub mod vulkan {
             width: u32,
             epsilon: f32,
         ) -> c_int;
+        // LayerNorm shader (weight + bias) over the stored weight format.
         fn vk_qwen_layer_norm(
             input: *const f32,
             weight: *const c_void,
@@ -1057,6 +1078,7 @@ pub mod vulkan {
             width: u32,
             epsilon: f32,
         ) -> c_int;
+        // Two-operand elementwise shader (add / silu-mul / gelu-mul).
         fn vk_qwen_elementwise(
             a: *const f32,
             b: *const f32,
@@ -1064,6 +1086,7 @@ pub mod vulkan {
             count: usize,
             operation: u32,
         ) -> c_int;
+        // NeoX rotate-half rotary over the leading rotary dim of each head.
         fn vk_qwen_rotary(
             query: *const f32,
             keys: *const f32,
@@ -1077,6 +1100,7 @@ pub mod vulkan {
             rotary_dim: u32,
             theta: f32,
         ) -> c_int;
+        // GQA attention shader with causal masking + sliding window.
         fn vk_qwen_attention(
             query: *const f32,
             keys: *const f32,
@@ -1162,6 +1186,8 @@ pub mod vulkan {
         })
     }
 
+    /// Multiply an FP32 activation matrix by the transpose of an FP16 weight
+    /// matrix on the shared 16-bit pipeline.
     pub fn matmul_fp16_transposed(
         a: &[f32],
         b: &[u16],
@@ -1181,6 +1207,8 @@ pub mod vulkan {
         })
     }
 
+    /// Multiply an FP32 activation matrix by the transpose of a row-major FP32
+    /// weight matrix (the f32 precision format's streaming path).
     pub fn matmul_f32_transposed(
         a: &[f32],
         b: &[f32],
@@ -1474,6 +1502,7 @@ pub mod vulkan {
         })
     }
 
+    /// RMSNorm shader with an f32 weight, f32 activations in, f32 out.
     pub fn rms_norm_f32(
         input: &[f32],
         weight: &[f32],
@@ -1492,6 +1521,7 @@ pub mod vulkan {
         )
     }
 
+    /// RMSNorm shader with a BF16 weight (weights stay in their stored width).
     pub fn rms_norm_bf16(
         input: &[f32],
         weight: &[u16],
@@ -1510,6 +1540,7 @@ pub mod vulkan {
         )
     }
 
+    /// LayerNorm shader with f32 weight and bias.
     pub fn layer_norm_f32(
         input: &[f32],
         weight: &[f32],
@@ -1531,6 +1562,7 @@ pub mod vulkan {
         )
     }
 
+    /// LayerNorm shader with FP16 weight and bias.
     pub fn layer_norm_fp16(
         input: &[f32],
         weight: &[u16],
@@ -1552,6 +1584,7 @@ pub mod vulkan {
         )
     }
 
+    /// LayerNorm shader with BF16 weight and bias.
     pub fn layer_norm_bf16(
         input: &[f32],
         weight: &[u16],
@@ -1573,6 +1606,8 @@ pub mod vulkan {
         )
     }
 
+    /// Format-generic LayerNorm dispatch behind the typed wrappers: resolves the
+    /// shared-ops weight-format code from the payload and forwards to C.
     fn layer_norm(
         input: &[f32],
         weight: *const c_void,
@@ -1618,6 +1653,7 @@ pub mod vulkan {
         Ok(output)
     }
 
+    /// RMSNorm shader with an FP16 weight.
     pub fn rms_norm_fp16(
         input: &[f32],
         weight: &[u16],
@@ -1636,6 +1672,7 @@ pub mod vulkan {
         )
     }
 
+    /// Format-generic RMSNorm dispatch behind the typed wrappers.
     fn rms_norm(
         input: &[f32],
         weight: *const c_void,
@@ -1677,18 +1714,22 @@ pub mod vulkan {
         Ok(output)
     }
 
+    /// Elementwise add shader (residual updates on the GPU side).
     pub fn add(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
         elementwise(a, b, 1)
     }
 
+    /// SwiGLU elementwise shader: silu(gate) ⊙ up.
     pub fn silu_mul(gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
         elementwise(gate, up, 2)
     }
 
+    /// GELU elementwise shader; `approximate` selects the tanh approximation.
     pub fn gelu_mul(gate: &[f32], up: &[f32], approximate: bool) -> Result<Vec<f32>, String> {
         elementwise(gate, up, if approximate { 6 } else { 5 })
     }
 
+    /// Generic two-operand elementwise dispatch behind add / silu_mul / gelu_mul.
     fn elementwise(a: &[f32], b: &[f32], operation: u32) -> Result<Vec<f32>, String> {
         if a.is_empty() || a.len() != b.len() {
             return Err("Vulkan elementwise operands must have equal non-zero lengths.".into());
@@ -1710,6 +1751,9 @@ pub mod vulkan {
         Ok(output)
     }
 
+    /// NeoX rotate-half rotary embedding over the leading rotary dim of each
+    /// head: rotates `query` and `keys` for `sequence` positions starting at
+    /// `offset`.
     pub fn rotary(
         query: &[f32],
         keys: &[f32],
@@ -1756,6 +1800,10 @@ pub mod vulkan {
         Ok((query_output, key_output))
     }
 
+    /// GQA attention shader: every `query_heads / kv_heads` query heads read one
+    /// KV head, scores use the 1/sqrt(head_dim) scale, keys older than the
+    /// sliding window are masked, and the softmax-weighted value mix is
+    /// returned for the whole sequence.
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         query: &[f32],
@@ -1803,10 +1851,12 @@ pub mod vulkan {
         Ok(output)
     }
 
+    /// usize → c_int range check for FFI dimension arguments.
     fn to_u32(value: usize) -> Result<u32, String> {
         u32::try_from(value).map_err(|_| "Vulkan dimension exceeds 32-bit indexing.".into())
     }
 
+    /// Maps a C status code to a descriptive Rust error naming the operation.
     fn check_native_result(result: c_int, operation: &str) -> Result<(), String> {
         if result == 0 {
             Ok(())

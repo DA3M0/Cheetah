@@ -314,28 +314,39 @@ impl Qwen2Native {
 }
 
 impl ModelForward for Qwen2Native {
+/// Runs the Qwen2 forward pass over `tokens` starting at absolute
+/// position `offset` and returns the final-position logits — the
+/// backend-agnostic [`ModelForward`] entry delegating to `run_forward`.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         self.run_forward(tokens, offset)
     }
 
+/// Clears the toolbox KV caches between generations.
     fn clear_cache(&mut self) {
         self.ctx.clear_kv();
     }
 
+/// Reports the constant backend label `"native-cpu"`.
     fn device_name(&self) -> &'static str {
         "native-cpu"
     }
 
+/// Exposes the family runtime for Ant page-level tier transitions — the
+/// native backend owns mmap-backed weights, so its tiers act on real pages.
     fn as_ant_tier_control(&mut self) -> Option<&mut dyn AntTierControl> {
         Some(self)
     }
 }
 
 impl AntTierControl for Qwen2Native {
+/// Ant page-in: faults one unit's pages back into the resident set; the
+/// bool reports whether the units manifest knows the unit.
     fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
         self.ctx.page_in_unit(unit_id)
     }
 
+/// Ant evict: drops one unit's pages to the disk tier; the bool reports
+/// whether the units manifest knows the unit.
     fn evict_unit(&mut self, unit_id: &str) -> bool {
         self.ctx.evict_unit(unit_id)
     }

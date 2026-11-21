@@ -14,6 +14,7 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    /// 400 error constructor for the request-validation paths.
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: 400,
@@ -194,6 +195,7 @@ pub(crate) enum PromptValue {
 }
 
 impl Default for PromptValue {
+    /// Empty-text default for the untagged `PromptValue` field.
     fn default() -> Self {
         Self::Text(String::new())
     }
@@ -213,6 +215,8 @@ enum RoleKind {
     Tool,
 }
 
+/// Role validation: system/developer (both map to system), user, assistant,
+/// tool; anything else is a 400 naming the supported set.
 fn role_kind(role: &str) -> Result<RoleKind, ApiError> {
     match role {
         "system" | "developer" => Ok(RoleKind::System),
@@ -225,6 +229,8 @@ fn role_kind(role: &str) -> Result<RoleKind, ApiError> {
     }
 }
 
+/// Joins content parts into one string; non-text parts are rejected — there
+/// is no multimodal input.
 fn parse_content(content: &Content) -> Result<String, ApiError> {
     match content {
         Content::Text(text) => Ok(text.clone()),
@@ -244,6 +250,11 @@ fn parse_content(content: &Content) -> Result<String, ApiError> {
     }
 }
 
+/// Validates and converts the OpenAI message list: `tool_calls` only in
+/// assistant messages (function type only), tool messages need ids,
+/// assistant tool-call history is serialized into the content, system and
+/// developer content is split out, and at least one chat message must
+/// remain.
 pub(crate) fn build_chat_messages(
     request: &ChatCompletionRequest,
 ) -> Result<PreparedChat, ApiError> {
@@ -307,6 +318,9 @@ pub(crate) fn build_chat_messages(
     Ok(PreparedChat { system, messages })
 }
 
+/// Tool-output resolution ladder: template-parsed `tool_calls` → compatible
+/// raw JSON shapes → free-text JSON extraction validated against the tools
+/// and choice → plain-text fallback.
 pub(crate) fn parse_tool_response(
     parsed: &str,
     raw_text: &str,
@@ -368,6 +382,9 @@ pub(crate) fn parse_tool_response(
     )
 }
 
+/// Parses tool calls from free model text (compact, OpenAI, or flat shapes)
+/// after fence/brace extraction; invalid shapes yield None so the text
+/// fallback takes over.
 pub(crate) fn parse_generated_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let json = extract_generated_tool_call_json(text)?;
     let calls: Vec<ParsedToolCall> = serde_json::from_str::<ParsedAssistantMessage>(json)
@@ -410,6 +427,8 @@ pub(crate) fn parse_generated_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         .collect()
 }
 
+/// Strips code fences and slices the outermost JSON object out of the
+/// model text.
 fn extract_generated_tool_call_json(text: &str) -> Option<&str> {
     let mut text = text.trim();
     if text.starts_with("```") {
@@ -426,6 +445,8 @@ fn extract_generated_tool_call_json(text: &str) -> Option<&str> {
     (start <= end).then(|| &text[start..=end])
 }
 
+/// Converts parsed calls to the response shape, filtering by tool existence
+/// and a named `tool_choice`; an empty result falls back to text.
 fn convert_tool_calls(
     calls: &[ParsedToolCall],
     tools: &[ToolDefinition],
@@ -463,6 +484,8 @@ fn convert_tool_calls(
         .collect()
 }
 
+/// Accepts arguments as a JSON object or a JSON-encoded object string; both
+/// validate and normalize to object text.
 fn normalize_tool_arguments(arguments: &Value) -> Option<String> {
     // OpenAI accepts arguments as an object or JSON-encoded object string; normalize both for the response.
     // OpenAI 参数既可能是对象，也可能是 JSON 字符串；这里统一校验并序列化为对象文本。
@@ -474,10 +497,14 @@ fn normalize_tool_arguments(arguments: &Value) -> Option<String> {
     arguments.is_object().then(|| arguments.to_string())
 }
 
+/// Generates `call_<hex>` ids for outgoing tool calls.
 pub(crate) fn tool_call_id() -> String {
     format!("call_{}", random_hex(12))
 }
 
+/// Validates the tool declarations (function type only, unique non-empty
+/// names, object parameters) together with the `tool_choice`, so an invalid
+/// combination never reaches generation.
 pub(crate) fn resolve_tool_choice(
     tools: &Option<Vec<ToolDefinition>>,
     tool_choice: &Option<ToolChoice>,
@@ -564,6 +591,8 @@ pub(crate) fn resolve_tool_choice(
     Ok(Some(choice))
 }
 
+/// Converts a completion prompt (text or array) into one user message;
+/// empty prompts are rejected.
 pub(crate) fn build_completion_message(
     request: &CompletionRequest,
 ) -> Result<ChatMessage, ApiError> {
@@ -577,6 +606,8 @@ pub(crate) fn build_completion_message(
     Ok(ChatMessage::new("user", text))
 }
 
+/// Merges request sampling fields into the options with range validation
+/// (temperature ≥ 0, top_p ∈ [0, 1]).
 fn apply_sampling(
     options: &mut ChatOptions,
     temperature: Option<f64>,
@@ -609,6 +640,8 @@ fn apply_sampling(
     Ok(())
 }
 
+/// Merges the chat request onto the server defaults; `max_tokens` and
+/// `max_completion_tokens` are mutually exclusive and `n > 1` is rejected.
 pub(crate) fn resolve_chat_options(
     defaults: &ChatOptions,
     request: &ChatCompletionRequest,
@@ -637,6 +670,7 @@ pub(crate) fn resolve_chat_options(
     Ok(options)
 }
 
+/// The completion variant: no top_k and `echo` unsupported.
 pub(crate) fn resolve_completion_options(
     defaults: &ChatOptions,
     request: &CompletionRequest,
@@ -656,6 +690,7 @@ pub(crate) fn resolve_completion_options(
     Ok(options)
 }
 
+/// Normalizes the untagged stop value (single string or array) into a vec.
 pub(crate) fn stop_strings(stop: &Option<StopValue>) -> Vec<String> {
     match stop {
         Some(StopValue::Single(value)) => vec![value.clone()],
@@ -675,6 +710,8 @@ pub(crate) fn ensure_model_matches(requested: &str, loaded: &str) -> Result<(), 
     Ok(())
 }
 
+/// The OpenAI error-type string per status class (invalid_request /
+/// authentication / server).
 pub(crate) fn error_kind(status: u16) -> &'static str {
     match status {
         400 | 404 | 405 => "invalid_request_error",
@@ -684,6 +721,8 @@ pub(crate) fn error_kind(status: u16) -> &'static str {
     }
 }
 
+/// Serializes the OpenAI error envelope, with a constant fallback body if
+/// serialization itself ever fails.
 pub(crate) fn error_body(status: u16, message: &str) -> String {
     serde_json::to_string(&json!({
         "error": {
@@ -709,6 +748,7 @@ pub(crate) struct Usage {
 }
 
 impl Usage {
+    /// Totals prompt + completion tokens for the usage block.
     pub(crate) fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
         Self {
             prompt_tokens,
@@ -830,14 +870,17 @@ pub(crate) struct ModelList {
     pub(crate) data: Vec<ModelEntry>,
 }
 
+/// `chatcmpl-` prefixed random response id.
 pub(crate) fn completion_id() -> String {
     format!("chatcmpl-{}", random_hex(12))
 }
 
+/// `cmpl-` prefixed random response id.
 pub(crate) fn text_completion_id() -> String {
     format!("cmpl-{}", random_hex(12))
 }
 
+/// Current UNIX seconds for the `created` field (0 pre-epoch).
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -845,6 +888,7 @@ pub(crate) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// `cheetah-` prefixed 16-byte hex API key.
 pub(crate) fn generate_api_key() -> String {
     format!("cheetah-{}", random_hex(16))
 }
@@ -861,6 +905,8 @@ fn random_hex(bytes: usize) -> String {
     out
 }
 
+/// Entropy source built from `RandomState` (per-process randomized hasher
+/// seed) — enough for local keys and ids, not a CSPRNG contract.
 fn random_u64() -> u64 {
     std::collections::hash_map::RandomState::new()
         .build_hasher()

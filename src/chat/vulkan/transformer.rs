@@ -5,7 +5,6 @@
 //! dispatch live in `super::weights` (the precision registry).
 
 use crate::chat::moe::select_experts;
-use crate::color::{self, Color};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -50,6 +49,10 @@ pub(crate) struct TransformerFeatures {
 }
 
 impl TransformerFeatures {
+    /// The baseline executor feature set for one family name: no attention
+    /// biases, no qk-norm, full rope, dense feed-forward, and the standard
+    /// llama-shaped tensor layout — families override pieces in their
+    /// registration files.
     pub(crate) fn standard(model_name: &'static str) -> Self {
         Self {
             model_name,
@@ -89,6 +92,8 @@ pub(crate) struct TransformerWeightLayout {
 }
 
 impl Default for TransformerWeightLayout {
+    /// The standard llama-shaped tensor naming (embedding, norms, projections,
+    /// MLP suffixes) shared by every family that does not override pieces of it.
     fn default() -> Self {
         Self {
             embedding: "model.embed_tokens.weight",
@@ -130,6 +135,10 @@ pub(crate) enum Activation {
 }
 
 impl VulkanTransformerConfig {
+    /// Config parsing + validation: derives `head_dim` and the kv-head count,
+    /// applies family defaults, honors `use_sliding_window`, maps `hidden_act`,
+    /// and fails loudly on rope scaling, inconsistent MoE counts, or any
+    /// non-positive / non-finite dimension.
     pub(crate) fn from_raw(raw: &Value, features: TransformerFeatures) -> Result<Self, String> {
         let model_name = features.model_name;
         let vocab_size = required_usize(raw, "vocab_size")?;
@@ -287,6 +296,12 @@ enum FeedForward {
 }
 
 impl FeedForward {
+    /// The feed-forward dispatch over `rows` positions: dense layers run
+    /// gate/up/activation/down; MoE layers route every row through
+    /// `select_experts`, bucket the rows BY EXPERT, run one batched matmul per
+    /// picked expert and scatter the route-weighted outputs back — and drive
+    /// the GPU-bucket expert residency (evict unpicked, upload picked), keyed
+    /// `(layer, expert)` across positions.
     fn forward(
         &mut self,
         input: &[f32],
@@ -406,6 +421,8 @@ impl FeedForward {
     }
 }
 
+/// Applies the configured activation (silu / gelu / tanh-gelu) to the
+/// gate·up pair as one shader call.
 fn apply_activation(activation: Activation, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
     match activation {
         Activation::Silu => cheetah::native::vulkan::silu_mul(gate, up),
@@ -443,18 +460,22 @@ pub(crate) struct VulkanTransformerExecutor {
 }
 
 impl crate::chat::registry::ModelForward for VulkanTransformerExecutor {
+    /// Trait entry delegating to the inherent executor forward.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         VulkanTransformerExecutor::forward(self, tokens, offset)
     }
 
+    /// Clears every layer's KV cache between generations.
     fn clear_cache(&mut self) {
         VulkanTransformerExecutor::clear_cache(self);
     }
 
+    /// Reports the constant backend label `"Vulkan"`.
     fn device_name(&self) -> &'static str {
         "Vulkan"
     }
 
+    /// Exposes the executor's GPU-bucket page control to the engine's Ant hooks.
     fn as_ant_tier_control(&mut self) -> Option<&mut dyn crate::chat::registry::AntTierControl> {
         Some(self)
     }
@@ -545,42 +566,37 @@ impl VulkanTransformerExecutor {
 }
 
 impl crate::chat::registry::AntTierControl for VulkanTransformerExecutor {
+    /// Ant GPU page-in: uploads one unit into the resident bucket (re-upload
+    /// from the authoritative host copy); the bool reports whether a layer
+    /// weight of that name was found.
     fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
         self.page_weight(unit_id, true)
     }
 
+    /// Ant GPU evict: releases one unit's resident slot (device allocation only
+    /// — the host copy stays authoritative for the next page-in).
     fn evict_unit(&mut self, unit_id: &str) -> bool {
         self.page_weight(unit_id, false)
     }
 }
 
 impl VulkanTransformerExecutor {
+    /// Public load entry: bootstraps the substrate, validates the shader
+    /// pipelines, runs [`Self::load_initialized`], and guarantees substrate
+    /// teardown on failure via [`load_with_substrate`].
     pub(crate) fn load(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
         plan: &BTreeMap<String, String>,
     ) -> Result<Self, String> {
-        let result = (|| {
-            cheetah::native::vulkan::initialize()?;
-            cheetah::native::vulkan::prepare()?;
-            Self::load_initialized(paths, config, plan)
-        })();
-        if result.is_err()
-            && let Err(shutdown_error) = cheetah::native::vulkan::shutdown()
-        {
-            eprintln!(
-                "{}",
-                color::stderr(
-                    &format!(
-                        "cheetah: Vulkan cleanup after model startup failure also failed ({shutdown_error})."
-                    ),
-                    Color::Red
-                )
-            );
-        }
-        result
+        super::load_with_substrate(|| Self::load_initialized(paths, config, plan))
     }
 
+    /// The load graph: take the embedding and final norm (offset applied per
+    /// feature), resolve tied-vs-untied lm head, then per layer take the norms
+    /// (q/k norms by declaration or checkpoint presence), the projections and
+    /// the dense-or-MoE feed-forward — with Ant-bucket resident uploads for
+    /// VRAM-tier units per the plan.
     fn load_initialized(
         paths: &[PathBuf],
         config: &VulkanTransformerConfig,
@@ -753,6 +769,7 @@ impl VulkanTransformerExecutor {
         })
     }
 
+    /// Per-layer KV reset backing the trait impl.
     fn clear_cache(&mut self) {
         for layer in &mut self.layers {
             layer.keys.clear();
@@ -760,6 +777,11 @@ impl VulkanTransformerExecutor {
         }
     }
 
+    /// The transformer graph: validates ids / positions / cache-offset
+    /// consistency, gathers embeddings as a shader, then per layer: input
+    /// RMSNorm → q/k/v (+ optional qk-norm) → rotary → cache append → attention
+    /// (sliding window) → o_proj → residual → post norm → feed-forward →
+    /// residual; final norm + lm head on the last position.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         let sequence = tokens.len();
         if sequence == 0 {
@@ -896,6 +918,8 @@ const MOE_GATE_LAYOUT: &str = "w1";
 const MOE_UP_LAYOUT: &str = "w3";
 const MOE_DOWN_LAYOUT: &str = "w2";
 
+/// Loads the Mixtral-style sparse feed-forward (router + per-expert
+/// gate/up/down) under the fixed MOE_* layout constants.
 fn load_moe_feed_forward(
     weights: &mut HashMap<String, NamedWeight>,
     plan: &BTreeMap<String, String>,
@@ -1382,9 +1406,5 @@ mod q8_tests {
         // SAFETY: test-scoped process env mutation.
         unsafe { std::env::remove_var("CHEETAH_QUANT_Q8") };
         cheetah::native::vulkan::shutdown().unwrap();
-    }
-
-    fn config_bytes(dst: &std::path::Path) -> Vec<u8> {
-        std::fs::read(dst.join("config.json")).unwrap()
     }
 }

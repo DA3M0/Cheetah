@@ -26,6 +26,7 @@ pub const DEFAULT_REPEAT_PENALTY: f32 = 1.0;
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a concise assistant. Respond in English.";
 
 // Serde uses this function when loading archives written before ctx_size was introduced.
+/// Serde default for archives written before `ctx_size` was introduced (returns [`DEFAULT_CONTEXT_TOKENS`]).
 fn default_context_tokens() -> usize {
     DEFAULT_CONTEXT_TOKENS
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// through the precision registry (`chat::precision`) by the payload's
 /// registered format id.
 #[derive(Clone)]
-pub(super) enum WeightData {
+pub(crate) enum WeightData {
     F32(Arc<[f32]>),
     F16(Arc<[u16]>),
     BF16(Arc<[u16]>),
@@ -30,6 +30,9 @@ pub(super) enum WeightData {
 }
 
 impl WeightData {
+    /// Converts a Safetensors tensor view into the typed payload (F32 / F16 /
+    /// BF16); any other dtype is rejected loudly — the Vulkan shaders serve
+    /// those three storage widths only.
     fn from_view(name: &str, view: &TensorView<'_>) -> Result<Self, String> {
         let bytes = view.data();
         match view.dtype() {
@@ -96,7 +99,10 @@ impl WeightData {
         }
     }
 
-    pub(super) fn value(&self, index: usize) -> f32 {
+    /// Flat scalar access, dequantized to f32; a quantized payload falls back to
+    /// row 0 — flat accessors only serve diagnostics, real reads go through the
+    /// operator tables.
+    pub(crate) fn value(&self, index: usize) -> f32 {
         match self {
             Self::F32(values) => values[index],
             Self::F16(values) => half::f16::from_bits(values[index]).to_f32(),
@@ -110,7 +116,8 @@ impl WeightData {
         }
     }
 
-    pub(super) fn add_one(&self) -> Self {
+    /// Builds the `(1 + weight)` offset copy that gemma's norms apply.
+    pub(crate) fn add_one(&self) -> Self {
         Self::F32(
             (0..self.len())
                 .map(|index| self.value(index) + 1.0)
@@ -118,7 +125,8 @@ impl WeightData {
         )
     }
 
-    pub(super) fn len(&self) -> usize {
+    /// Logical element count of the payload.
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::F32(values) => values.len(),
             Self::F16(values) | Self::BF16(values) => values.len(),
@@ -130,7 +138,7 @@ impl WeightData {
     /// Format encoding matches shared_ops.comp: 0 = f32, 2 = f16, 3 = bf16;
     /// quantized formats report their registered code (q8 = 4) — they are
     /// only served by their dedicated matmul pipeline, not shared_ops.
-    pub(super) fn ffi_parts(&self) -> (*const std::os::raw::c_void, u32, usize) {
+    pub(crate) fn ffi_parts(&self) -> (*const std::os::raw::c_void, u32, usize) {
         match self {
             Self::F32(values) => (values.as_ptr().cast(), 0, values.len()),
             Self::F16(values) => (values.as_ptr().cast(), 2, values.len()),
@@ -148,7 +156,10 @@ impl WeightData {
         }
     }
 
-    pub(super) fn rms_norm(
+    /// RMSNorm shader per stored weight format; a quantized payload is an error
+    /// — quantization applies to linear projections only, norms stay in their
+    /// original precision.
+    pub(crate) fn rms_norm(
         &self,
         input: &[f32],
         rows: usize,
@@ -172,8 +183,9 @@ impl WeightData {
         }
     }
 
-    #[allow(dead_code)]
-    pub(super) fn layer_norm(
+    /// LayerNorm shader (weight + bias, dtypes must match); quantized payloads
+    /// error the same way as [`WeightData::rms_norm`].
+    pub(crate) fn layer_norm(
         &self,
         bias: &Self,
         input: &[f32],
@@ -203,7 +215,11 @@ impl WeightData {
         }
     }
 
-    pub(super) fn linear(
+    /// The streaming matmul core: row tiles (≤64) × column tiles (bounded by a
+    /// 16M-element weight tile) for original precisions, one full-buffer pass
+    /// per row tile for quantized formats (the C operator has no column offset);
+    /// dimensions are validated up front.
+    pub(crate) fn linear(
         &self,
         input: &[f32],
         rows: usize,
@@ -305,36 +321,38 @@ impl WeightData {
     }
 }
 
-pub(super) struct NamedWeight {
-    pub(super) shape: Vec<usize>,
-    pub(super) data: WeightData,
+pub(crate) struct NamedWeight {
+    pub(crate) shape: Vec<usize>,
+    pub(crate) data: WeightData,
 }
 
 /// Ant residency slot for one weight tensor: Some = resident in the GPU
 /// bucket (device-local when available, persistent host-coherent otherwise);
 /// None = streaming path (weights re-staged per matmul from host memory).
 #[derive(Clone)]
-#[allow(dead_code)]
-pub(super) struct VulkanWeightSlot {
-    pub(super) handle: u64,
-    pub(super) element_count: usize,
-    pub(super) device_local: bool,
+pub(crate) struct VulkanWeightSlot {
+    /// Opaque handle returned by the format's registered `upload` operator;
+    /// released through `weight_release` on eviction.
+    pub(crate) handle: u64,
 }
 
 #[derive(Clone)]
-pub(super) struct Linear {
-    pub(super) name: String,
-    pub(super) input_size: usize,
-    pub(super) output_size: usize,
-    pub(super) weight: WeightData,
-    pub(super) bias: Option<WeightData>,
-    pub(super) slot: Option<VulkanWeightSlot>,
+pub(crate) struct Linear {
+    pub(crate) name: String,
+    pub(crate) input_size: usize,
+    pub(crate) output_size: usize,
+    pub(crate) weight: WeightData,
+    pub(crate) bias: Option<WeightData>,
+    pub(crate) slot: Option<VulkanWeightSlot>,
 }
 
 const MAX_ROW_TILE: usize = 64;
 
 impl Linear {
-    pub(super) fn forward(&self, input: &[f32], rows: usize) -> Result<Vec<f32>, String> {
+    /// Linear dispatch: the resident-bucket path when a slot is bound (the
+    /// format's registered resident matmul, row-tiled), otherwise the streaming
+    /// path through [`WeightData::linear`]; adds the bias per row when present.
+    pub(crate) fn forward(&self, input: &[f32], rows: usize) -> Result<Vec<f32>, String> {
         let expected = rows
             .checked_mul(self.input_size)
             .ok_or_else(|| format!("Input size overflow in '{}'.", self.name))?;
@@ -398,20 +416,19 @@ impl Linear {
 /// padded per-row stride); returns None when the backend cannot serve it
 /// (then the streaming path stays active). Original precisions without a
 /// registered upload (f32/f16) always stream.
-pub(super) fn resident_upload(weight: &WeightData, row_bytes: usize) -> Option<(u64, usize)> {
+pub(crate) fn resident_upload(weight: &WeightData, row_bytes: usize) -> Option<u64> {
     let ops = precision::vulkan_ops_for_format(weight.format_id())?;
     let upload = ops.upload?;
-    let handle = upload(weight.as_bytes(), row_bytes)?;
-    Some((handle, weight.len()))
+    upload(weight.as_bytes(), row_bytes)
 }
 
 /// `resident_upload` with the Ant page-in diagnostic line.
-pub(super) fn upload_slot(
+pub(crate) fn upload_slot(
     name: &str,
     weight: &WeightData,
     row_bytes: usize,
 ) -> Option<VulkanWeightSlot> {
-    resident_upload(weight, row_bytes).map(|(handle, element_count)| {
+    resident_upload(weight, row_bytes).map(|handle| {
         eprintln!(
             "{}",
             color::stderr(
@@ -419,15 +436,13 @@ pub(super) fn upload_slot(
                 Color::Green
             )
         );
-        VulkanWeightSlot {
-            handle,
-            element_count,
-            device_local: true,
-        }
+        VulkanWeightSlot { handle }
     })
 }
 
-pub(super) fn load_weights(paths: &[PathBuf]) -> Result<HashMap<String, NamedWeight>, String> {
+/// Mmaps every shard, deserializes Safetensors, skips internal padding
+/// tensors, and rejects duplicate tensor names across shards.
+pub(crate) fn load_weights(paths: &[PathBuf]) -> Result<HashMap<String, NamedWeight>, String> {
     let mut weights = HashMap::new();
     for path in paths {
         let file = File::open(path).map_err(|error| {
@@ -468,7 +483,8 @@ pub(super) fn load_weights(paths: &[PathBuf]) -> Result<HashMap<String, NamedWei
     Ok(weights)
 }
 
-pub(super) fn take_weight(
+/// Removes one tensor from the pool with exact shape validation.
+pub(crate) fn take_weight(
     weights: &mut HashMap<String, NamedWeight>,
     name: &str,
     expected_shape: &[usize],
@@ -485,7 +501,8 @@ pub(super) fn take_weight(
     Ok(weight)
 }
 
-pub(super) fn validate_shape(
+/// Shape assertion helper with a descriptive error.
+pub(crate) fn validate_shape(
     name: &str,
     actual: &[usize],
     expected: &[usize],
@@ -498,7 +515,12 @@ pub(super) fn validate_shape(
     Ok(())
 }
 
-pub(super) fn take_linear(
+/// Builds a [`Linear`]: shape-validated weight (plus a required bias when
+/// `with_bias`), load-time quantization when a precision format is selected
+/// (norms / biases / the embedding never quantize), and the Ant-bucket
+/// resident upload for VRAM-tier units — upload failures fall back to the
+/// streaming path with a warning.
+pub(crate) fn take_linear(
     weights: &mut HashMap<String, NamedWeight>,
     plan: &BTreeMap<String, String>,
     prefix: &str,

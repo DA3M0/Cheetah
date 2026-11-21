@@ -1,7 +1,7 @@
 # Coding standards & complete function reference
 
 This document defines Cheetah's coding conventions and contains the analysis
-of **every function in the codebase** (section 10): 870 functions across 37
+of **every function in the codebase** (section 10): 871 functions across 36
 source files — runtime functions, FFI declarations, and tests — each with a
 one-entry explanation of what it does and why it exists the way it does.
 
@@ -489,8 +489,7 @@ enforces — the source doc comments carry the same story in place.
 | `ModelRegistration::loader_for(backend)` | Backend loader by name, case-insensitive. |
 | `ModelRegistration::backend_names()` | Registered backend names in declared order (what the banner reports). |
 | `registration_for_architecture(arch)` | The lookup entry: finds the registration serving a normalized architecture name or lists all registered families in the error. |
-| `native_backends()` *(test-support)* | Lists architectures served by the native backend, derived from the registration table. |
-| `vulkan_backends()` *(test-support)* | Same for the Vulkan backend. |
+| `vulkan_backends()` *(test-support, vulkan)* | Lists the architectures served by the Vulkan backend, derived from the registration table (the native side asserts capability through `backend_loader_for_architecture` directly). |
 | `architectures_serving(backend)` | Shared derivation behind the two views above. |
 | `architecture_has_backend(arch, backend)` | Bool probe used by capability tests and the Vulkan fallback check. |
 | `normalize_architecture(architecture)` | Lowercases and strips the `ForCausalLM` suffix so `Qwen2ForCausalLM` and `qwen2` resolve identically. |
@@ -550,6 +549,7 @@ Each file has the same skeleton; only the family-specific pieces differ.
 | `<family>_native_loader(dir, bytes, raw, plan, family)` (all 7) | The registration's native entry: `OpsToolbox::open` (store → config resolve → Ant plan install) → family struct → `Box<dyn ModelForward>`. |
 | `<family>_vulkan_config(raw)` (llama/qwen2/qwen3/mistral/gemma/mixtral) | Builds the family's `TransformerFeatures` (biases, qk-norm, head-dim override, norm offsets, MoE counts, tied head) and validates the config for the generic Vulkan executor. |
 | `<family>_vulkan_loader(paths, bytes, raw, plan)` (all 7) | The registration's Vulkan entry: phi builds the dedicated `VulkanPhiExecutor`; the others build the generic transformer executor around their feature set. |
+| phi vulkan executor: `VulkanPhiConfig::parse` / `PhiNorm::forward` / `take_phi_norm` / `PhiLayer` / `VulkanPhiExecutor::load` / `load_initialized` / `forward` (+ trait impls) | phi's dedicated GPU compute graph, hosted in the family file (one family, one file on both backends): biased LayerNorms, parallel residual `x + attn + mlp`, partial rotary, plain `fc1`/`fc2` GELU MLP, split projections with `dense` output; bootstraps the substrate through `load_with_substrate` and dispatches operators through the shared weights layer |
 | family Vulkan tests *(test)* | Per-family feature assertions: qwen2 bias/tie + dimension rejection, qwen3 dense layout / window disable / rope-scaling rejection / attention bias, gemma norm+embedding defaults, mixtral MoE layout + count rejection. |
 
 ### 10.15 `src/chat/native/ops.rs` — the OpsToolbox (48 runtime + 14 tests)
@@ -692,12 +692,15 @@ Shared module (21 runtime + 8 tests), then one file per format.
 
 ### 10.19 `src/chat/vulkan/` — the Vulkan backend
 
-`mod.rs` (1 runtime), `transformer.rs` (17 runtime + 9 tests), `phi.rs`
-(9 runtime), `weights.rs` (17 runtime + 1 test).
+`mod.rs` (2 runtime), `transformer.rs` (17 runtime + 9 tests), `weights.rs`
+(17 runtime + 1 test). The phi executor lives in its registration file
+(`src/chat/registrations/phi.rs`, section 10.14) — one family, one file, on
+both backends.
 
 | Function | Analysis |
 |---|---|
 | `required_usize(config, name)` | Reads a required usize field from a model config, with a uniform error message. |
+| `load_with_substrate(load_initialized)` (vulkan) | Bootstraps the Vulkan substrate for one executor load and guarantees symmetric teardown: initialize → validate pipelines → run the caller's loader → shut the substrate down on any failure (reporting a second failure if the cleanup itself errors). Both executors' `load` entries call this. |
 | `TransformerFeatures::standard(model_name)` | The baseline executor feature set for one family name (no biases, no qk-norm, dense FFN, default weight layout). |
 | `TransformerWeightLayout::default()` | The standard llama-shaped tensor naming (embedding/norms/projections/MLP suffixes) — families override pieces via their registration. |
 | `VulkanTransformerConfig::from_raw(raw, features)` | Config parsing + validation: derives head_dim/kv heads, applies family defaults, honors `use_sliding_window`, maps `hidden_act`, rejects RoPE scaling and inconsistent MoE counts, and fails loudly on any non-positive or non-finite dimension. |
@@ -715,15 +718,6 @@ Shared module (21 runtime + 8 tests), then one file per format.
 | `VulkanTransformerExecutor::forward(tokens, offset)` (inherent) | The transformer graph: validates ids/positions/cache-offset consistency, embedding gather as a shader, then per layer: input RMSNorm → q/k/v (+ optional qk-norm) → rotary → cache append → attention (sliding window) → o_proj → residual → post norm → feed-forward → residual; final norm + lm head on the last position. |
 | `load_moe_feed_forward(weights, plan, prefix, config, experts, top_k)` | Loads the Mixtral-style sparse feed-forward (router + per-expert gate/up/down) under the fixed MOE_* layout constants. |
 | 9 tests *(test)* | Cover common + MoE config parsing, feature overrides, MoE weight loading from the configured layout, row-tile bounding, tiny dense/MoE forward + cache reset, the env-gated q8 resident forward, and fixture config bytes. |
-| `VulkanPhiConfig::parse(raw)` | Phi config parsing: derives head_dim + rotary_dim from `partial_rotary_factor`, maps `hidden_act`, validates dimensions/rotary evenness and rejects rope scaling. |
-| `PhiNorm::forward(input, rows, width, eps)` | One biased LayerNorm through the shared weight layer (weight + bias pair). |
-| `take_phi_norm(weights, prefix, width)` | Extracts a `{prefix}.weight` + `{prefix}.bias` pair with shape validation. |
-| `VulkanPhiExecutor::forward` (ModelForward impl) | Trait entry delegating to the inherent forward. |
-| `VulkanPhiExecutor::clear_cache` | Clears every phi layer's KV cache. |
-| `VulkanPhiExecutor::device_name` | Reports `"Vulkan"`. |
-| `VulkanPhiExecutor::load(paths, config)` | Phi load with the same initialize/prepare/cleanup-on-failure discipline as the transformer executor. |
-| `VulkanPhiExecutor::load_initialized(paths, config)` | Phi load graph: embedding, final LayerNorm pair, tied-or-separate lm head (bias required on every phi linear), per-layer norms/qk-layernorms/projections/dense/fc1/fc2. |
-| `VulkanPhiExecutor::forward(tokens, offset)` (inherent) | The phi graph: host-side embedding gather, per layer input LayerNorm → q/k/v (+ optional qk LayerNorm) → partial rotary → cache → attention → dense → **parallel** feed-forward (fc1 → activation → fc2) → the single `x + attn + mlp` residual update; final LayerNorm + lm head. |
 | `WeightData::from_view(name, view)` | Converts a Safetensors tensor view into the typed payload (F32/F16/BF16); other dtypes are rejected loudly. |
 | `WeightData::format_id()` | The registered precision id this payload resolves to (quantized buffers report their own). |
 | `WeightData::as_bytes()` | The raw byte view (no copy) the precision-registry operator tables consume. |
@@ -833,9 +827,11 @@ Shared module (21 runtime + 8 tests), then one file per format.
 
 ### 10.21 Coverage notes & regeneration
 
-- **Coverage**: the tables above cover all 870 functions extracted from
-  `src/` — 648 runtime functions (including the 36 `extern` FFI declarations
-  that bind the C substrate) and 222 tests. Where a
+- **Coverage**: the tables above cover all 871 functions extracted from
+  `src/` — 649 runtime functions (including the 36 `extern` FFI declarations
+  that bind the C substrate) and 222 tests. Every runtime function carries an
+  English `///` doc comment in source (extern declarations a `//` line), per
+  section 3. Where a
   codebase repeats one shape across families (the 7 × 6 trait-impl methods in
   the registration files, the per-family backend tables) the reference lists
   the repeated rows explicitly with the family named, so every function is
@@ -859,7 +855,7 @@ Shared module (21 runtime + 8 tests), then one file per format.
 
 Section 10 groups test suites into analyzed rows; this index names every
 one of the 222 test functions so the reference covers the full
-870-function inventory (648 runtime + 222 tests).
+871-function inventory (649 runtime + 222 tests).
 
 **`src/ant.rs`** (9):
   `unit` `layered_unit` `plan_residency_assigns_vram_then_ram_then_disk`

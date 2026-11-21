@@ -996,14 +996,17 @@ impl Engine {
         })
     }
 
+    /// The loaded model's display id (file stem or directory name).
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
 
+    /// The resolved architecture name from the model config; `None` when nothing was named.
     pub fn model_architecture(&self) -> Option<&str> {
         self.architecture.as_deref()
     }
 
+    /// Backend device label forwarded from the boxed [`ModelForward`] runtime.
     pub fn device_name(&self) -> &'static str {
         let loaded = self
             .model
@@ -1040,6 +1043,8 @@ impl Engine {
         }
     }
 
+    /// Locks the Ant bookkeeping mutex, recovering poisoned locks instead of
+    /// panicking the server or REPL.
     fn ant_lock_runtime(&self) -> std::sync::MutexGuard<'_, AntRuntimeState> {
         self.ant_runtime
             .lock()
@@ -1156,6 +1161,9 @@ impl Engine {
         }
     }
 
+    /// Generation hook: applies per-request resident-unit overrides — units the
+    /// request pins that sit on the disk tier or were evicted are swapped back
+    /// in (budget-checked, evictions allowed).
     fn apply_ant_request_overrides(&self, overrides: &HashSet<String>) -> Result<(), String> {
         let Some(settings) = self.ant_settings.as_ref() else {
             return Ok(());
@@ -1198,6 +1206,9 @@ impl Engine {
         Ok(())
     }
 
+    /// Generation hook: swaps up to `prefetch_stages` evicted resident-tier
+    /// units back in, ordered by tier priority then layer id — every swap
+    /// re-checks the budget before it executes.
     fn prefetch_ant_units(&self) -> Result<(), String> {
         let Some(settings) = self.ant_settings.as_ref() else {
             return Ok(());
@@ -1276,6 +1287,9 @@ impl Engine {
         }
     }
 
+    /// Generation hook: pages evicted resident-tier units back in, then evicts
+    /// lowest-priority residents (RAM first, highest layers first; pinned units
+    /// never move) until the VRAM+RAM occupancy holds the configured budget.
     fn enforce_ant_budget(&self) {
         let Some(settings) = self.ant_settings.as_ref() else {
             return;
@@ -1387,10 +1401,18 @@ impl Engine {
         }
     }
 
+    /// Creates an inference context. The context is a stateless placeholder —
+    /// the KV state lives inside the model runtime — but the signature keeps
+    /// the generation API backend-shaped.
     pub fn new_context(&self) -> Result<InferenceContext, String> {
         Ok(InferenceContext)
     }
 
+    /// Renders and tokenizes one chat turn, truncating oldest turns (with a
+    /// warning) until the input plus reserved generation tokens fits the
+    /// context limit; a single turn that cannot fit is a hard error.
+    ///
+    /// Returns the prompt tokens and how many turns were dropped.
     pub fn prepare(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -1428,6 +1450,10 @@ impl Engine {
         }
     }
 
+    /// Builds the tool-calling prompt: injects the JSON tool instruction per
+    /// `ToolChoice` (none / auto / required) ahead of the messages, maps the
+    /// `developer` role to `system`, and tokenizes through [`Engine::prepare`].
+    /// Returns the tokens plus the chat params carrying the template stop list.
     pub fn prepare_tool_chat(
         &self,
         messages_json: &str,
@@ -1483,6 +1509,8 @@ impl Engine {
         ))
     }
 
+    /// Public generation entry (the context placeholder is ignored); delegates
+    /// to [`Engine::generate_inner`].
     pub fn generate(
         &self,
         _context: &mut InferenceContext,
@@ -1495,6 +1523,8 @@ impl Engine {
         self.generate_inner(prompt, options, extra_stop, sink, resident_overrides)
     }
 
+    /// Generation entry that extends the stop list with the chat template's own
+    /// stop markers carried in [`ChatParams`].
     pub fn generate_with_chat_params(
         &self,
         context: &mut InferenceContext,
@@ -1512,6 +1542,14 @@ impl Engine {
         self.generate(context, prompt, options, &stops, sink, resident_overrides)
     }
 
+    /// The core generation loop.
+    ///
+    /// Validates the context/token limits, runs the four Ant hooks (request
+    /// overrides → prefetch → promote → enforce), clones the model out of the
+    /// mutex, clears the KV cache, prefills the prompt, then samples token by
+    /// token: stop markers are matched on the incrementally decoded text with
+    /// character-boundary guards, each accepted token feeds back at its absolute
+    /// position, and emitted deltas stream through the sink.
     fn generate_inner(
         &self,
         prompt: &[u32],
@@ -1630,6 +1668,8 @@ impl Engine {
     }
 }
 
+/// Resolves the weight paths and manifest stop markers for a model path
+/// (directory or safetensors file).
 fn resolve_model_files(path: &Path) -> Result<(Vec<PathBuf>, Option<Vec<String>>), String> {
     let model_dir = if path.is_dir() {
         path
@@ -1736,6 +1776,8 @@ fn synth_config_from_manifest(
         .map_err(|error| format!("Failed to synthesize config.json from the manifest: {error}"))
 }
 
+/// Reads `cheetah_manifest.json` when present (`None` otherwise); parse
+/// errors are loud rather than silently ignored.
 fn read_model_manifest(model_dir: &Path) -> Result<Option<serde_json::Value>, String> {
     let manifest_path = model_dir.join("cheetah_manifest.json");
     if !manifest_path.is_file() {
@@ -1749,6 +1791,8 @@ fn read_model_manifest(model_dir: &Path) -> Result<Option<serde_json::Value>, St
     Ok(Some(manifest))
 }
 
+/// Extracts the manifest's `stop_markers` list; a missing list or a
+/// non-string marker is an error.
 fn parse_manifest_stop_markers(manifest: &serde_json::Value) -> Result<Vec<String>, String> {
     let markers = manifest
         .get("stop_markers")
@@ -1765,6 +1809,9 @@ fn parse_manifest_stop_markers(manifest: &serde_json::Value) -> Result<Vec<Strin
         .collect()
 }
 
+/// Weight resolution chain: direct `.safetensors` file → manifest shards
+/// (path-traversal checked, sorted, deduplicated) →
+/// `model.safetensors.index.json` weight map → single `model.safetensors`.
 fn resolve_weight_files(
     path: &Path,
     manifest: Option<&serde_json::Value>,
@@ -1853,6 +1900,8 @@ fn resolve_weight_files(
     ))
 }
 
+/// Clock-derived sampling seed (nanoseconds since epoch; 0 pre-epoch) for
+/// runs that did not pin `--seed`.
 fn random_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1860,6 +1909,12 @@ fn random_seed() -> u64 {
         .unwrap_or_default()
 }
 
+/// Sampling pipeline over the full vocabulary: repeat penalty on the last 64
+/// tokens → greedy argmax when temperature is 0 → temperature scaling →
+/// optional top-k → top-p nucleus truncation → weighted sample.
+///
+/// Note: this top-k is generation sampling, unrelated to the MoE expert
+/// routing top-k.
 fn sample_token(
     logits: &[f32],
     history: &[u32],
@@ -1919,6 +1974,9 @@ fn sample_token(
     Ok(candidates[distribution.sample(rng)].0 as u32)
 }
 
+/// Interactive chat entry: validates that the path is a model directory or
+/// safetensors file, loads the engine, prints the banner, and enters the
+/// REPL loop.
 pub(super) fn chat(
     path: &Path,
     options: ChatOptions,
@@ -1950,18 +2008,22 @@ pub(super) fn chat(
 struct StdoutSink;
 
 impl TextSink for StdoutSink {
+    /// Prints one streamed chunk and flushes stdout; write failures surface as generation errors.
     fn push(&mut self, text: &str) -> Result<(), String> {
         print!("{text}");
         std::io::Write::flush(&mut std::io::stdout())
             .map_err(|error| format!("Failed to write response: {error}"))
     }
 
+    /// Ends the turn with a newline.
     fn finish(&mut self) -> Result<(), String> {
         println!();
         Ok(())
     }
 }
 
+/// Formats the post-turn stats line (tokens + tok/s, or "speed unavailable"
+/// when the decode window could not be measured).
 fn format_generation_stats(generation: &Generation) -> String {
     match generation.tokens_per_second() {
         Some(tokens_per_second) => format!(
@@ -1975,6 +2037,9 @@ fn format_generation_stats(generation: &Generation) -> String {
     }
 }
 
+/// The interactive REPL: slash commands (`/exit`, `/help`, `/clear`,
+/// `/save <name>`), history replay from the archive, and per-turn
+/// prepare → generate → stats with archive bookkeeping.
 fn chat_loop(
     engine: &Engine,
     options: ChatOptions,

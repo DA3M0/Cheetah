@@ -46,7 +46,6 @@ cheetah/
 │   │   │                       (f32/f16/bf16/q4/q8 → native+vulkan ops; build.rs → generated REGISTRY)
 │   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
 │   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
-│   │       ├── phi.rs          phi executor (parallel residual, fused projections)
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue)
@@ -177,7 +176,7 @@ run_init_command      src/main.rs:90
 | generated `REGISTRY` include | mod.rs | build.rs → `OUT_DIR/model_registry.rs`; the `<family>_registration` modules are children of `chat`, so registration files reach the boundary types via `super::` |
 | `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | registry.rs | lookups derived from the generated `REGISTRY` |
 | `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
-| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan/transformer.rs, vulkan/phi.rs | Candle-free Vulkan executors (Ant GPU-bucket residency) |
+| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan/transformer.rs; registrations/phi.rs | Candle-free Vulkan executors (Ant GPU-bucket residency); the phi executor lives in the phi registration file — one family, one file on both backends |
 | `WeightData` / `Linear` / `take_linear` / resident upload | vulkan/weights.rs | shared weight layer; streaming/resident matmuls dispatch through the precision registry |
 
 ### `src/chat/precision.rs` + `src/chat/precision/` — weight-precision operator registry

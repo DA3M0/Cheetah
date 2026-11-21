@@ -375,6 +375,7 @@ pub(crate) fn selected_native_ops() -> Option<NativeOps> {
     })
 }
 
+/// All registered format ids in registry order — the fixed-point assertion for the registry-content tests.
 #[cfg(test)]
 pub(crate) fn registered_format_ids() -> Vec<&'static str> {
     REGISTRY

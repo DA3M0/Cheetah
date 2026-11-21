@@ -44,7 +44,9 @@ pub(crate) trait ModelForward: ModelForwardClone + Send {
     /// Run the model over `tokens` starting at absolute position `offset` and
     /// return the logits of the final position. Backend-agnostic inference boundary.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String>;
+    /// Drops the runtime's KV state between generations.
     fn clear_cache(&mut self);
+    /// Backend label for the startup banner and log lines.
     fn device_name(&self) -> &'static str;
     /// Ant: real tier transitions on backends that own mmap-backed weights
     /// (the native CPU backend); host-resident backends report None.
@@ -55,11 +57,16 @@ pub(crate) trait ModelForward: ModelForwardClone + Send {
 
 /// Ant: tier mutations that act on real memory pages, not just bookkeeping.
 pub(crate) trait AntTierControl {
+    /// Faults one unit's pages back into the resident set; the bool reports whether the units manifest knows the unit.
     fn page_in_unit(&mut self, unit_id: &str, tier: i32) -> bool;
+    /// Drops one unit's pages to the disk tier; the bool reports whether the units manifest knows the unit.
     fn evict_unit(&mut self, unit_id: &str) -> bool;
 }
 
 pub(crate) trait ModelForwardClone {
+    /// Blanket impl: any `ModelForward + Clone + 'static` type can be duplicated
+    /// through the trait object, which is what makes `Box<dyn ModelForward>`
+    /// clonable for the engine's per-generation clone.
     fn clone_box(&self) -> Box<dyn ModelForward>;
 }
 
@@ -67,12 +74,14 @@ impl<T> ModelForwardClone for T
 where
     T: ModelForward + Clone + 'static,
 {
+    /// The dyn-side entry the `Clone for Box<dyn ModelForward>` impl forwards to.
     fn clone_box(&self) -> Box<dyn ModelForward> {
         Box::new(self.clone())
     }
 }
 
 impl Clone for Box<dyn ModelForward> {
+    /// Clones the boxed runtime via [`ModelForwardClone::clone_box`].
     fn clone(&self) -> Self {
         self.clone_box()
     }
@@ -141,6 +150,9 @@ pub(crate) struct ModelFamily {
 }
 
 impl ModelFamily {
+    /// Looks up the family's `(q_heads, kv_heads, head_dim)` profile for a known
+    /// `(hidden_size, vocab_size)` pair; the vocab key disambiguates families
+    /// that share one hidden size (llama2-7B MHA vs llama3-8B GQA).
     pub(super) fn profile_for(
         &self,
         hidden_size: usize,
@@ -225,23 +237,18 @@ pub(crate) fn registration_for_architecture(
         })
 }
 
-/// Architectures served by the native mmap + Ant tiering backend, derived
-/// from the declarative registrations (every registration that carries a
-/// native loader). Test-support view: the load path consults the
-/// registration table directly.
-#[cfg(test)]
-pub(super) fn native_backends() -> Vec<&'static str> {
-    architectures_serving("native")
-}
-
-/// Architectures served by the Vulkan compute path, derived the same way —
-/// every registration that carries a Vulkan loader. Test-support view.
-#[cfg(test)]
+/// Architectures served by the Vulkan compute path, derived from the
+/// declarative registrations — every registration that carries a Vulkan
+/// loader. Test-support view for the vulkan-gated capability tests; the
+/// native side asserts capability through `backend_loader_for_architecture`
+/// directly.
+#[cfg(all(test, feature = "vulkan"))]
 pub(super) fn vulkan_backends() -> Vec<&'static str> {
     architectures_serving("vulkan")
 }
 
-#[cfg(test)]
+/// Shared derivation behind the test-support listing view.
+#[cfg(all(test, feature = "vulkan"))]
 fn architectures_serving(backend: &str) -> Vec<&'static str> {
     super::REGISTRY
         .iter()
@@ -250,7 +257,9 @@ fn architectures_serving(backend: &str) -> Vec<&'static str> {
         .collect()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// Bool probe used by the Vulkan capability tests and the fallback check in
+/// `load_vulkan_or_fallback`.
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 fn architecture_has_backend(architecture: &str, backend: &str) -> bool {
     registration_for_architecture(architecture)
         .map(|registration| registration.loader_for(backend).is_some())
@@ -275,6 +284,8 @@ pub(crate) fn registered_backends(architecture: &str) -> Vec<&'static str> {
         .unwrap_or_default()
 }
 
+/// Loader-table probe: returns one backend's loader function for an
+/// architecture, straight from the generated REGISTRY.
 pub(crate) fn backend_loader_for_architecture(
     architecture: &str,
     backend: &str,
@@ -308,6 +319,9 @@ pub(crate) fn stop_markers_for_architecture(architecture: &str) -> &'static [&'s
         .unwrap_or(&[])
 }
 
+/// The `CHEETAH_DEVICE` dispatch entry: `cpu` surfaces the native-backend
+/// guidance error (the Candle CPU path is retired), `vulkan` delegates to
+/// `load_vulkan_or_fallback`.
 pub(crate) fn load_model(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
@@ -338,6 +352,8 @@ fn no_native_backend_message(architecture: &str) -> String {
     )
 }
 
+/// Maps a device name to the [`Device`] descriptor; both registered backends
+/// are host-resident today, so both report [`Device::Cpu`].
 pub(crate) fn backend_device(selected: &str) -> Result<Device, String> {
     let registration = BACKENDS
         .iter()
@@ -349,6 +365,8 @@ pub(crate) fn backend_device(selected: &str) -> Result<Device, String> {
     }
 }
 
+/// Device-parameterized load used by the engine; the `CHEETAH_DEVICE`
+/// environment override still wins for Vulkan selection.
 pub(crate) fn load_model_for_device(
     weight_paths: &[PathBuf],
     config_bytes: &[u8],
@@ -376,6 +394,9 @@ pub(super) fn vulkan_loader_for_architecture(architecture: &str) -> Option<Backe
     backend_loader_for_architecture(architecture, "vulkan")
 }
 
+/// Loads the Vulkan executor for one architecture: capability check against
+/// the registration table, loader invocation, failure diagnostics — and the
+/// CPU-guidance error as the fallback outcome when the Vulkan load fails.
 #[cfg_attr(not(feature = "vulkan"), allow(unused_variables, unused_mut))]
 fn load_vulkan_or_fallback(
     weight_paths: &[PathBuf],

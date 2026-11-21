@@ -308,28 +308,39 @@ impl PhiNative {
 }
 
 impl ModelForward for PhiNative {
+/// Runs the Phi forward pass over `tokens` starting at absolute
+/// position `offset` and returns the final-position logits — the
+/// backend-agnostic [`ModelForward`] entry delegating to `run_forward`.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
         self.run_forward(tokens, offset)
     }
 
+/// Clears the toolbox KV caches between generations.
     fn clear_cache(&mut self) {
         self.ctx.clear_kv();
     }
 
+/// Reports the constant backend label `"native-cpu"`.
     fn device_name(&self) -> &'static str {
         "native-cpu"
     }
 
+/// Exposes the family runtime for Ant page-level tier transitions — the
+/// native backend owns mmap-backed weights, so its tiers act on real pages.
     fn as_ant_tier_control(&mut self) -> Option<&mut dyn AntTierControl> {
         Some(self)
     }
 }
 
 impl AntTierControl for PhiNative {
+/// Ant page-in: faults one unit's pages back into the resident set; the
+/// bool reports whether the units manifest knows the unit.
     fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
         self.ctx.page_in_unit(unit_id)
     }
 
+/// Ant evict: drops one unit's pages to the disk tier; the bool reports
+/// whether the units manifest knows the unit.
     fn evict_unit(&mut self, unit_id: &str) -> bool {
         self.ctx.evict_unit(unit_id)
     }
@@ -364,9 +375,481 @@ fn phi_vulkan_loader(
     raw_config: Value,
     _plan: &BTreeMap<String, String>,
 ) -> Result<Box<dyn ModelForward>, String> {
-    let config = crate::chat::vulkan::phi::VulkanPhiConfig::parse(&raw_config)?;
-    Ok(Box::new(crate::chat::vulkan::phi::VulkanPhiExecutor::load(
-        weight_paths,
-        &config,
-    )?))
+    let config = VulkanPhiConfig::parse(&raw_config)?;
+    Ok(Box::new(VulkanPhiExecutor::load(weight_paths, &config)?))
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan executor (the family's GPU compute graph — phi runs its own block
+// topology, so unlike the llama-shaped families it does not parameterize the
+// generic transformer executor; the substrate bootstrap and the operator
+// dispatch come from `crate::chat::vulkan`).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "vulkan")]
+use crate::chat::vulkan::required_usize;
+#[cfg(feature = "vulkan")]
+use crate::chat::vulkan::transformer::Activation;
+#[cfg(feature = "vulkan")]
+use crate::chat::vulkan::weights::{
+    Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight,
+};
+#[cfg(feature = "vulkan")]
+use std::collections::HashMap;
+#[cfg(feature = "vulkan")]
+use std::path::PathBuf;
+
+#[cfg(feature = "vulkan")]
+#[derive(Clone, Debug)]
+#[cfg(feature = "vulkan")]
+pub(crate) struct VulkanPhiConfig {
+    vocab_size: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    max_position_embeddings: usize,
+    layer_norm_eps: f32,
+    rope_theta: f32,
+    qk_layernorm: bool,
+    tie_word_embeddings: bool,
+    activation: Activation,
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanPhiConfig {
+    /// Phi config parsing: derives `head_dim` and `rotary_dim` from
+    /// `partial_rotary_factor`, maps `hidden_act`, reads `layer_norm_eps` /
+    /// `qk_layernorm` / tie choice, and rejects inconsistent dimensions, odd
+    /// rotary spans and rope scaling.
+#[cfg(feature = "vulkan")]
+    pub(crate) fn parse(raw: &Value) -> Result<Self, String> {
+        let vocab_size = required_usize(raw, "vocab_size")?;
+        let hidden_size = required_usize(raw, "hidden_size")?;
+        let intermediate_size = required_usize(raw, "intermediate_size")?;
+        let num_hidden_layers = required_usize(raw, "num_hidden_layers")?;
+        let num_attention_heads = required_usize(raw, "num_attention_heads")?;
+        let num_key_value_heads = raw
+            .get("num_key_value_heads")
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "num_key_value_heads does not fit usize.".to_string())?
+            .unwrap_or(num_attention_heads);
+        let max_position_embeddings = required_usize(raw, "max_position_embeddings")?;
+        let layer_norm_eps = raw
+            .get("layer_norm_eps")
+            .and_then(Value::as_f64)
+            .unwrap_or(1e-5) as f32;
+        let rope_theta = raw
+            .get("rope_theta")
+            .and_then(Value::as_f64)
+            .unwrap_or(10_000.0) as f32;
+        let partial_rotary_factor = raw
+            .get("partial_rotary_factor")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.5);
+        let activation = match raw.get("hidden_act").and_then(Value::as_str) {
+            Some("gelu") => Activation::Gelu,
+            Some("gelu_new") => Activation::NewGelu,
+            Some("silu") => Activation::Silu,
+            _ => return Err("Vulkan Phi does not support the configured activation.".into()),
+        };
+        let head_dim = if num_attention_heads == 0 {
+            0
+        } else {
+            hidden_size / num_attention_heads
+        };
+        let rotary_dim = (partial_rotary_factor * head_dim as f64) as usize;
+        if vocab_size == 0
+            || hidden_size == 0
+            || intermediate_size == 0
+            || num_hidden_layers == 0
+            || num_attention_heads == 0
+            || num_key_value_heads == 0
+            || hidden_size % num_attention_heads.max(1) != 0
+            || num_attention_heads % num_key_value_heads.max(1) != 0
+            || head_dim == 0
+            || rotary_dim == 0
+            || rotary_dim > head_dim
+            || rotary_dim % 2 != 0
+            || max_position_embeddings == 0
+            || !partial_rotary_factor.is_finite()
+            || !layer_norm_eps.is_finite()
+            || layer_norm_eps <= 0.0
+            || !rope_theta.is_finite()
+            || rope_theta <= 0.0
+            || raw
+                .get("rope_scaling")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err("Vulkan Phi model dimensions or RoPE settings are inconsistent.".into());
+        }
+        Ok(Self {
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            rotary_dim,
+            max_position_embeddings,
+            layer_norm_eps,
+            rope_theta,
+            qk_layernorm: raw
+                .get("qk_layernorm")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            tie_word_embeddings: raw
+                .get("tie_word_embeddings")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            activation,
+        })
+    }
+}
+
+#[cfg(feature = "vulkan")]
+#[derive(Clone)]
+#[cfg(feature = "vulkan")]
+struct PhiNorm {
+    weight: WeightData,
+    bias: WeightData,
+}
+
+#[cfg(feature = "vulkan")]
+impl PhiNorm {
+    /// One biased LayerNorm pass (weight + bias pair) through the shared weight
+    /// layer — phi's norms are LayerNorms, not RMSNorms.
+#[cfg(feature = "vulkan")]
+    fn forward(
+        &self,
+        input: &[f32],
+        rows: usize,
+        width: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>, String> {
+        self.weight
+            .layer_norm(&self.bias, input, rows, width, epsilon)
+    }
+}
+
+/// Extracts a `{prefix}.weight` + `{prefix}.bias` pair with shape validation.
+#[cfg(feature = "vulkan")]
+fn take_phi_norm(
+    weights: &mut HashMap<String, NamedWeight>,
+    prefix: &str,
+    width: usize,
+) -> Result<PhiNorm, String> {
+    let weight_name = format!("{prefix}.weight");
+    let bias_name = format!("{prefix}.bias");
+    Ok(PhiNorm {
+        weight: take_weight(weights, &weight_name, &[width])?.data,
+        bias: take_weight(weights, &bias_name, &[width])?.data,
+    })
+}
+
+#[cfg(feature = "vulkan")]
+#[derive(Clone)]
+#[cfg(feature = "vulkan")]
+struct PhiLayer {
+    input_norm: PhiNorm,
+    q_norm: Option<PhiNorm>,
+    k_norm: Option<PhiNorm>,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    dense: Linear,
+    fc1: Linear,
+    fc2: Linear,
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+#[cfg(feature = "vulkan")]
+#[derive(Clone)]
+#[cfg(feature = "vulkan")]
+pub(crate) struct VulkanPhiExecutor {
+    config: VulkanPhiConfig,
+    embedding: WeightData,
+    layers: Vec<PhiLayer>,
+    final_norm: PhiNorm,
+    lm_head: Linear,
+}
+
+#[cfg(feature = "vulkan")]
+impl crate::chat::registry::ModelForward for VulkanPhiExecutor {
+    /// Trait entry delegating to the inherent executor forward.
+#[cfg(feature = "vulkan")]
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        VulkanPhiExecutor::forward(self, tokens, offset)
+    }
+
+    /// Clears every phi layer's KV cache between generations.
+#[cfg(feature = "vulkan")]
+    fn clear_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.keys.clear();
+            layer.values.clear();
+        }
+    }
+
+    /// Reports the constant backend label `"Vulkan"`.
+#[cfg(feature = "vulkan")]
+    fn device_name(&self) -> &'static str {
+        "Vulkan"
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanPhiExecutor {
+    /// Public load entry: bootstraps the substrate and guarantees teardown on
+    /// failure via [`load_with_substrate`].
+#[cfg(feature = "vulkan")]
+    pub(crate) fn load(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
+        crate::chat::vulkan::load_with_substrate(|| Self::load_initialized(paths, config))
+    }
+
+    /// The phi load graph: embedding, final LayerNorm pair, tied-or-separate lm
+    /// head, then per layer the input norm, optional q/k layernorms, split
+    /// q/k/v projections, `dense` output projection and `fc1`/`fc2` MLP — every
+    /// phi linear carries its bias.
+#[cfg(feature = "vulkan")]
+    fn load_initialized(paths: &[PathBuf], config: &VulkanPhiConfig) -> Result<Self, String> {
+        let mut weights = load_weights(paths)?;
+        let embedding = take_weight(
+            &mut weights,
+            "model.embed_tokens.weight",
+            &[config.vocab_size, config.hidden_size],
+        )?
+        .data;
+        let final_norm = take_phi_norm(&mut weights, "model.final_layernorm", config.hidden_size)?;
+        let lm_head = if weights.contains_key("lm_head.weight") {
+            take_linear(
+                &mut weights,
+                &BTreeMap::new(),
+                "lm_head",
+                config.hidden_size,
+                config.vocab_size,
+                true,
+            )?
+        } else if config.tie_word_embeddings {
+            Linear {
+                name: "lm_head".into(),
+                input_size: config.hidden_size,
+                output_size: config.vocab_size,
+                weight: embedding.clone(),
+                slot: None,
+                bias: None,
+            }
+        } else {
+            return Err("Vulkan Phi checkpoint is missing tensor 'lm_head.weight'.".into());
+        };
+        let qk_norm_size = config.head_dim;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for index in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{index}");
+            let attention = format!("{prefix}.self_attn");
+            let input_norm = take_phi_norm(
+                &mut weights,
+                &format!("{prefix}.input_layernorm"),
+                config.hidden_size,
+            )?;
+            let (q_norm, k_norm) = if config.qk_layernorm {
+                (
+                    Some(take_phi_norm(
+                        &mut weights,
+                        &format!("{attention}.q_layernorm"),
+                        qk_norm_size,
+                    )?),
+                    Some(take_phi_norm(
+                        &mut weights,
+                        &format!("{attention}.k_layernorm"),
+                        qk_norm_size,
+                    )?),
+                )
+            } else {
+                (None, None)
+            };
+            layers.push(PhiLayer {
+                input_norm,
+                q_norm,
+                k_norm,
+                q_proj: take_linear(
+                    &mut weights,
+                    &BTreeMap::new(),
+                    &format!("{attention}.q_proj"),
+                    config.hidden_size,
+                    config.num_attention_heads * config.head_dim,
+                    true,
+                )?,
+                k_proj: take_linear(
+                    &mut weights,
+                    &BTreeMap::new(),
+                    &format!("{attention}.k_proj"),
+                    config.hidden_size,
+                    config.num_key_value_heads * config.head_dim,
+                    true,
+                )?,
+                v_proj: take_linear(
+                    &mut weights,
+                    &BTreeMap::new(),
+                    &format!("{attention}.v_proj"),
+                    config.hidden_size,
+                    config.num_key_value_heads * config.head_dim,
+                    true,
+                )?,
+                dense: take_linear(
+                    &mut weights,
+                    &BTreeMap::new(),
+                    &format!("{attention}.dense"),
+                    config.num_attention_heads * config.head_dim,
+                    config.hidden_size,
+                    true,
+                )?,
+                fc1: take_linear(
+                    &mut weights,
+                    &BTreeMap::new(),
+                    &format!("{prefix}.mlp.fc1"),
+                    config.hidden_size,
+                    config.intermediate_size,
+                    true,
+                )?,
+                fc2: take_linear(
+                    &mut weights,
+                    &BTreeMap::new(),
+                    &format!("{prefix}.mlp.fc2"),
+                    config.intermediate_size,
+                    config.hidden_size,
+                    true,
+                )?,
+                keys: Vec::new(),
+                values: Vec::new(),
+            });
+        }
+        Ok(Self {
+            config: config.clone(),
+            embedding,
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+
+    /// The phi graph: host-side embedding gather, then per layer input
+    /// LayerNorm → q/k/v (+ optional qk LayerNorm) → partial rotary → cache →
+    /// attention → dense → feed-forward (fc1 → activation → fc2) → the single
+    /// parallel-residual update `x + attn + mlp`; final LayerNorm + lm head.
+#[cfg(feature = "vulkan")]
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        let sequence = tokens.len();
+        if sequence == 0 {
+            return Err("Vulkan Phi currently requires a non-empty batch of size one.".into());
+        }
+        let last_position = offset
+            .checked_add(sequence)
+            .ok_or_else(|| "Vulkan Phi sequence position overflow.".to_string())?;
+        if last_position > self.config.max_position_embeddings {
+            return Err("Vulkan Phi input exceeds max_position_embeddings.".into());
+        }
+        let expected_cache = offset
+            .checked_mul(self.config.num_key_value_heads)
+            .and_then(|count| count.checked_mul(self.config.head_dim))
+            .ok_or_else(|| "Vulkan Phi cache size overflow.".to_string())?;
+        if self
+            .layers
+            .first()
+            .is_some_and(|layer| layer.keys.len() != expected_cache)
+        {
+            return Err("Vulkan Phi KV cache position does not match the input offset.".into());
+        }
+        let hidden = self.config.hidden_size;
+        let mut activations = Vec::with_capacity(sequence * hidden);
+        for token_id in tokens {
+            let token = *token_id as usize;
+            if token >= self.config.vocab_size {
+                return Err(format!("Token ID {token} exceeds the Phi vocabulary."));
+            }
+            let start = token * hidden;
+            activations.extend((0..hidden).map(|index| self.embedding.value(start + index)));
+        }
+
+        for layer in &mut self.layers {
+            let residual = activations.clone();
+            let normalized = layer.input_norm.forward(
+                &activations,
+                sequence,
+                hidden,
+                self.config.layer_norm_eps,
+            )?;
+            let mut query = layer.q_proj.forward(&normalized, sequence)?;
+            let mut keys = layer.k_proj.forward(&normalized, sequence)?;
+            let values = layer.v_proj.forward(&normalized, sequence)?;
+            if let Some(norm) = &layer.q_norm {
+                query = norm.forward(
+                    &query,
+                    sequence * self.config.num_attention_heads,
+                    self.config.head_dim,
+                    self.config.layer_norm_eps,
+                )?;
+            }
+            if let Some(norm) = &layer.k_norm {
+                keys = norm.forward(
+                    &keys,
+                    sequence * self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.layer_norm_eps,
+                )?;
+            }
+            (query, keys) = cheetah::native::vulkan::rotary(
+                &query,
+                &keys,
+                sequence,
+                offset,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                self.config.rotary_dim,
+                self.config.rope_theta,
+            )?;
+            layer.keys.extend_from_slice(&keys);
+            layer.values.extend_from_slice(&values);
+            let attention = cheetah::native::vulkan::attention(
+                &query,
+                &layer.keys,
+                &layer.values,
+                sequence,
+                offset,
+                offset + sequence,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                0,
+            )?;
+            let attention = layer.dense.forward(&attention, sequence)?;
+            let mut feed_forward = layer.fc1.forward(&normalized, sequence)?;
+            let ones = vec![1.0; feed_forward.len()];
+            feed_forward = match self.config.activation {
+                Activation::Silu => cheetah::native::vulkan::silu_mul(&feed_forward, &ones)?,
+                Activation::Gelu => cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, false)?,
+                Activation::NewGelu => {
+                    cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, true)?
+                }
+            };
+            feed_forward = layer.fc2.forward(&feed_forward, sequence)?;
+            let residual_attention = cheetah::native::vulkan::add(&residual, &attention)?;
+            activations = cheetah::native::vulkan::add(&residual_attention, &feed_forward)?;
+        }
+
+        let last = &activations[(sequence - 1) * hidden..sequence * hidden];
+        let normalized = self
+            .final_norm
+            .forward(last, 1, hidden, self.config.layer_norm_eps)?;
+        let logits = self.lm_head.forward(&normalized, 1)?;
+        Ok(logits)
+    }
 }

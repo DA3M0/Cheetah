@@ -131,8 +131,9 @@ All of these derive from `REGISTRY` — none of them hardcode family data:
 - `family_for_architecture(arch) -> Option<ModelFamily>`
 - `vulkan_loader_for_architecture(arch) -> Option<BackendLoader>` (feature
   `vulkan`) — reads the same backend table
-- `native_backends()` / `vulkan_backends()` — test-support views listing the
-  architectures that declare each loader
+- `vulkan_backends()` — test-support view (vulkan-gated) listing the
+  architectures that declare a Vulkan loader; the native side asserts
+  capability through `backend_loader_for_architecture` directly
 - `chat_template_for_architecture(arch)` / `stop_markers_for_architecture(arch)`
   (in `mod.rs`) — derived from the registration
 
@@ -178,14 +179,16 @@ The only static table left in `registry.rs` is the **device selection** table
 
 ### 4.4 A Vulkan model executor
 
-The executor implementations live in `src/chat/vulkan/` — `transformer.rs` /
-`phi.rs` own the compute graphs and the Ant GPU-bucket residency, and
-`weights.rs` is the shared weight layer whose streaming/resident matmuls
-dispatch through the precision registry (`crate::chat::precision`). There is
-no central loader: each registration file owns its `<family>_vulkan_loader`
-(plus its feature-selection config fn and tests), building the generic
-transformer executor around the family's feature set, or the phi executor
-for phi. Keep the executors Candle-free (the shared shader library lives in
+The generic executor machinery lives in `src/chat/vulkan/` —
+`transformer.rs` owns the generic compute graph (llama-shaped families,
+parameterized by each registration's feature set) and `weights.rs` is the
+shared weight layer whose streaming/resident matmuls dispatch through the
+precision registry (`crate::chat::precision`). There is no central loader:
+each registration file owns its `<family>_vulkan_loader`, building the
+generic transformer executor around the family's feature set — and a family
+with a different block topology hosts its own executor in its registration
+file (phi's executor lives in `registrations/phi.rs`), keeping
+one-family-one-file true on both backends. Keep the executors Candle-free (the shared shader library lives in
 `*.comp` at the repo root; shaders are discovered from `src/chat/registrations/` at
 build time).
 
