@@ -1,7 +1,7 @@
 # Coding standards & complete function reference
 
 This document defines Cheetah's coding conventions and contains the analysis
-of **every function in the codebase** (section 10): 871 functions across 36
+of **every function in the codebase** (section 10): 917 functions across 39
 source files — runtime functions, FFI declarations, and tests — each with a
 one-entry explanation of what it does and why it exists the way it does.
 
@@ -62,7 +62,9 @@ rename them; extend the toolbox with new names instead.
 
 ## 3. Comment & documentation conventions (English)
 
-Every runtime function carries an English `///` doc comment. The rules:
+Every runtime function carries an English `///` doc comment (extern FFI
+declarations carry `//` lines — doc comments never attach inside extern
+blocks). The rules:
 
 1. **One summary line first.** A single sentence, third person, that says
    what the function does — never a restatement of the name
@@ -163,6 +165,13 @@ Every runtime function carries an English `///` doc comment. The rules:
    `num_local_experts > 0`; the sliding window is resolved config data
    flowing into the attention op. `DenseFeatures` remains only as
    resolution metadata for the parameter fallback chain.
+6. **Tools have one protocol shape and one execution point.** The OpenAI
+   function-calling JSON shapes live in `chat/toolcalls.rs` (shared by the
+   HTTP API, the REPL, and the MCP layer); tool EXECUTION lives in the MCP
+   client (`mcp.rs`) — the engine's agentic loop
+   (`Engine::generate_tool_chat`) is MCP-agnostic and only routes calls to
+   `Option<&McpRegistry>`. Client-declared (non-MCP) tool calls keep the
+   client-driven OpenAI contract: they return to the caller.
 
 ## 8. Testing conventions
 
@@ -248,7 +257,7 @@ enforces — the source doc comments carry the same story in place.
 | `parse_float_option(args, i, option, min)` | Parses a float with a lower bound `min` (NaN rejected). |
 | `parse_bounded_float_option(args, i, option, min, max)` | Parses a float constrained to the inclusive range `[min, max]`. |
 | `parse_float_raw(args, i, option)` | Parses the next argument as a finite f64, rejecting NaN up front. |
-| 26 `parses_*` / `rejects_*` / `accepts_*` tests *(test)* | Cover every parser: chat speed/sampling/system flags, deterministic defaults, out-of-range rejections, Ant flag shapes (bare flag, `=value`, preset override, `--setup` aliases), context commands, serve defaults + overrides + ephemeral port + key generation, mutually exclusive keys, invalid ports/limits, multiple models, inspect output options, and the usage-error variant mapping. |
+| 29 `parses_*` / `rejects_*` / `accepts_*` tests *(test)* | Cover every parser: chat speed/sampling/system flags, deterministic defaults, out-of-range rejections, Ant flag shapes (bare flag, `=value`, preset override, `--setup` aliases), context commands, serve defaults + overrides + ephemeral port + key generation, mutually exclusive keys, invalid ports/limits, multiple models, inspect output options, and the usage-error variant mapping. |
 
 ### 10.3 `src/color.rs` — terminal coloring (4 runtime + 1 test)
 
@@ -690,7 +699,52 @@ Shared module (21 runtime + 8 tests), then one file per format.
 | `q8::precision_backends` | Backend table: native quantize+gemv, Vulkan full operator set. |
 | format tests *(test)* | FFI layout contracts, quantize round-trips within one quantization step, nibble column parity, size-mismatch rejection. |
 
-### 10.19 `src/chat/vulkan/` — the Vulkan backend
+### 10.19 `src/chat/toolcalls.rs` — shared tool-call shapes (9 runtime + 2 tests)
+
+The OpenAI function-calling JSON shapes are the de-facto tool protocol for
+both the HTTP API and the local REPL; this module holds those shapes and the
+shape-tolerant parsing, pure serde_json + std (no HTTP types), so the engine
+layer runs tool loops without reaching into `serve`. `serve/openai.rs`
+re-exports the surface.
+
+| Function | Analysis |
+|---|---|
+| `parse_tool_response(parsed, raw_text, tools, choice)` | Tool-output resolution ladder: template-parsed `tool_calls` → compatible raw JSON shapes → free-text JSON extraction validated against the tools and choice → plain-text fallback. |
+| `parse_generated_tool_calls(text)` | Parses tool calls from free model text (compact, OpenAI, or flat shapes) after fence/brace extraction. |
+| `extract_generated_tool_call_json(text)` | Strips code fences and slices the outermost JSON object. |
+| `convert_tool_calls(calls, tools, choice)` | Converts parsed calls to the response shape, filtering by tool existence and a named `tool_choice`. |
+| `normalize_tool_arguments(arguments)` | Accepts arguments as a JSON object or a JSON-encoded string; both validate to object text. |
+| `tool_call_id()` | Generates `call_<hex>` ids for outgoing tool calls. |
+| `random_hex(bytes)` | OS-entropy-seeded hex string (keys and ids). |
+| `next_tool_round(messages_json, calls, results)` | Builds the next tool-loop round's messages: the assistant's serialized tool calls (the same history convention the request parser applies) plus one `role: "tool"` result per call. |
+| types (`ToolDefinition` / `FunctionDefinition` / `ResolvedToolChoice` / `ToolResponse` / `ToolCall` / `ToolCallFunction` / `Parsed*`) | The request/response/history tool shapes, moved verbatim from `serve/openai.rs` when the REPL gained tools. |
+| 2 tests *(test)* | Cover the next-round message shape (assistant serialization + tool results) and invalid-history rejection. |
+
+### 10.20 `src/mcp.rs` + `src/mcp/client.rs` — MCP client (25 runtime + 14 tests)
+
+The Model Context Protocol client: Cheetah connects to local MCP servers
+over stdio, discovers their tools, exposes them to the model, and executes
+their tool calls in the agentic loop (`Engine::generate_tool_chat`).
+
+| Function | Analysis |
+|---|---|
+| `parse_server_spec(spec)` | Parses one `--mcp-server` spec: `name=command args...` (whitespace-split; quoted arguments belong in a config file). |
+| `server_configs(specs, config_file)` | Resolves the configured servers: flag specs plus the `--mcp-config` JSON file entries; names unique across both. |
+| `registry_from_flags(specs, config_file)` | `None` when nothing is configured (the zero-cost MCP-free posture); otherwise connects everything. |
+| `McpRegistry::connect(configs)` | Spawns every server, runs the `initialize` handshake, lists tools; any failure fails the whole registry loudly — a half-configured tool surface would silently corrupt tool calls. |
+| `McpRegistry::tool_definitions()` | Renders discovered tools as OpenAI-style definitions (`inputSchema` → `parameters`). |
+| `McpRegistry::has_tool(name)` | Whether a call targets a connected MCP server. |
+| `McpRegistry::call(name, arguments)` | Executes `tools/call` on the owning server (per-client mutex serializes calls; `Arc`-shared across request workers); MCP-level `isError` surfaces as `[error] ...` text the model can react to. |
+| `McpRegistry::shutdown()` + `Drop` | Kills every child; `Drop` guarantees no leaked processes. |
+| `McpClient::connect(config)` | Spawns the server and runs the handshake. |
+| `McpClient::request(method, params)` | JSON-RPC request with id correlation over the newline transport; notifications ignored, server→client requests answered with a protocol error (so well-behaved servers never stall), 30s deadline. |
+| `McpClient::initialize()` | The `initialize` handshake + `notifications/initialized` acknowledgment. |
+| `McpClient::list_tools()` | `tools/list` with `nextCursor` pagination. |
+| `McpClient::call_tool(name, arguments)` | `tools/call`, text content blocks joined. |
+| `LineTransport` / `ChildTransport` | The newline transport trait + the real child-piped implementation (reader thread pumps stdout so a slow server never blocks past the deadline; stderr inherits). |
+| 14 tests *(test)* | Scripted-transport protocol tests (handshake shape, pagination, content joining, `isError`, protocol-error replies, server-error rejection) + config/spec parsing + a real-stdio end-to-end test against a live Python MCP server (gated on python3). |
+
+### 10.21 `src/chat/vulkan/` — the Vulkan backend
 
 `mod.rs` (2 runtime), `transformer.rs` (17 runtime + 9 tests), `weights.rs`
 (17 runtime + 1 test). The phi executor lives in its registration file
@@ -737,7 +791,7 @@ both backends.
 | `take_linear(weights, plan, prefix, in, out, with_bias)` | Builds a `Linear`: shape-validated weight (+ required bias when `with_bias`), load-time quantization when a format is selected (norms/biases/embedding never quantize), and the Ant-bucket resident upload for VRAM-tier units (fallback to streaming with a warning). |
 | `quantized_formats_match_across_backends` *(test)* | The cross-backend contract: every registered quantized format must agree across Vulkan streaming, Vulkan resident and the native gemv. |
 
-### 10.20 `src/serve/` — OpenAI-compatible API (82 runtime + 39 tests)
+### 10.22 `src/serve/` — OpenAI-compatible API (82 runtime + 39 tests)
 
 `mod.rs` (9 runtime), `http.rs` (37 runtime), `openai.rs` (27 runtime),
 `queue.rs` (10 runtime).
@@ -825,13 +879,13 @@ both backends.
 | `FifoQueue::default()` | One-slot queue (single concurrent generation). |
 | 39 serve tests *(test)* | Cover constant-time token comparison, context-overflow status mapping, routing (known/405/404), the SSE channel reader (EOF, chunk pumping, batching, heartbeat, unblocking on drop), sink interruption after reader drop, tool-call delta fields, streaming + non-streaming chat paths, empty-chunk tolerance, request parsing (content arrays, tool histories, tool_choice validation, generated-call shapes), option resolution conflicts, completion prompt building, model matching, error bodies, id/key formats, and queue fairness/cancellation/concurrency limits. |
 
-### 10.21 Coverage notes & regeneration
+### 10.23 Coverage notes & regeneration
 
-- **Coverage**: the tables above cover all 871 functions extracted from
-  `src/` — 649 runtime functions (including the 36 `extern` FFI declarations
-  that bind the C substrate) and 222 tests. Every runtime function carries an
-  English `///` doc comment in source (extern declarations a `//` line), per
-  section 3. Where a
+- **Coverage**: the tables above cover all 917 functions extracted from
+  `src/` — 677 runtime functions (including the 36 `extern` FFI declarations
+  that bind the C substrate) and 240 test-context functions. Every runtime
+  function carries an English `///` doc comment in source (extern
+  declarations a `//` line), per section 3. Where a
   codebase repeats one shape across families (the 7 × 6 trait-impl methods in
   the registration files, the per-family backend tables) the reference lists
   the repeated rows explicitly with the family named, so every function is
@@ -851,11 +905,11 @@ both backends.
   A PR that changes behavior without touching the corresponding row here is
   incomplete.
 
-### 10.22 Test-function index (every test named)
+### 10.24 Test-function index (every test named)
 
 Section 10 groups test suites into analyzed rows; this index names every
-one of the 222 test functions so the reference covers the full
-871-function inventory (649 runtime + 222 tests).
+one of the 240 test functions so the reference covers the full
+917-function inventory (677 runtime + 240 tests).
 
 **`src/ant.rs`** (9):
   `unit` `layered_unit` `plan_residency_assigns_vram_then_ram_then_disk`
@@ -990,6 +1044,21 @@ one of the 222 test functions so the reference covers the full
   `safetensors_file` `inspects_safetensors_header_and_tensor_shapes`
   `hides_internal_aligned_shard_padding_tensors` `rejects_invalid_safetensors_files`
   `resolves_manifest_shards_for_inspection`
+
+**`src/chat/toolcalls.rs`** (2):
+  `next_tool_round_appends_calls_and_results` `next_tool_round_rejects_invalid_history`
+
+**`src/mcp.rs`** (3):
+  `parses_server_specs_and_config_files` `connects_to_a_real_stdio_server_end_to_end`
+  `tool_definitions_map_and_duplicate_names_reject`
+
+**`src/mcp/client.rs`** (5):
+  `initialize_sends_handshake_and_notification` `list_tools_extracts_and_paginates`
+  `call_tool_joins_text_and_flags_errors` `server_requests_are_answered_with_protocol_error`
+  `server_error_rejects_the_request`
+
+**`src/cli.rs`** — MCP flag tests (3, inside the cli tests group):
+  `parses_mcp_flags_for_chat` `rejects_repeated_mcp_config` `parses_mcp_flags_for_serve`
 
 **`src/main.rs`** (4):
   `inspect_text_export_limits_tensors_by_default`

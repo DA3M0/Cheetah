@@ -1,6 +1,5 @@
 //! HTTP routing, authentication, and streaming for `cheetah serve`.
 
-use crate::chat::ChatParams;
 use crate::chat::{Engine, Generation, TextSink, ToolChoice};
 use crate::color::{self, Color};
 use crate::options::ChatOptions;
@@ -26,6 +25,9 @@ pub(crate) struct ServerState {
     pub(crate) api_key: Option<String>,
     pub(crate) generation_queue: Arc<super::queue::FifoQueue>,
     pub(crate) created: u64,
+    /// Connected MCP servers (`None` when none are configured): their tools
+    /// join every chat request and their calls execute in the agentic loop.
+    pub(crate) mcp: Option<Arc<crate::mcp::McpRegistry>>,
 }
 
 /// Whether an incoming request is a generation endpoint (POST
@@ -328,13 +330,34 @@ fn handle_chat_completions(
         respond_error(request, error.status, &error.message);
         return;
     }
-    let tool_choice = match resolve_tool_choice(&api_request.tools, &api_request.tool_choice) {
+    let mut tool_choice = match resolve_tool_choice(&api_request.tools, &api_request.tool_choice) {
         Ok(choice) => choice,
         Err(error) => {
             respond_error(request, error.status, &error.message);
             return;
         }
     };
+    // MCP tools join every request once servers are configured: the merged
+    // tool list feeds the prompt, and MCP-named calls execute in the agentic
+    // loop (client-declared tools keep their client-driven contract).
+    let mut tools: Vec<ToolDefinition> = api_request.tools.clone().unwrap_or_default();
+    let declared: HashSet<String> = tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
+    let mcp_definitions = state
+        .mcp
+        .as_ref()
+        .map(|mcp| mcp.tool_definitions())
+        .unwrap_or_default();
+    tools.extend(
+        mcp_definitions
+            .into_iter()
+            .filter(|tool| !declared.contains(&tool.function.name)),
+    );
+    if state.mcp.is_some() && tool_choice.is_none() && api_request.tool_choice.is_none() {
+        tool_choice = Some(ResolvedToolChoice::Auto);
+    }
 
     let prepared = match build_chat_messages(&api_request) {
         Ok(p) => p,
@@ -369,10 +392,10 @@ fn handle_chat_completions(
     let created = openai::now_unix();
 
     // Tool-enabled requests use the same chat prompt path and are parsed from model output.
-    if let (Some(tool_choice), Some(tools)) = (tool_choice, api_request.tools.as_ref()) {
+    if let Some(tool_choice) = tool_choice.filter(|_| !tools.is_empty()) {
         let (messages_json, tools_json) = match build_tool_prompt_inputs(
             &api_request,
-            tools,
+            &tools,
             tool_choice.clone(),
             state.default_options.system.as_deref(),
         ) {
@@ -383,22 +406,10 @@ fn handle_chat_completions(
             }
         };
         let guard = generation_ticket.acquire();
-        let engine_choice = match tool_choice {
+        let engine_choice = match &tool_choice {
             ResolvedToolChoice::Auto => ToolChoice::Auto,
             ResolvedToolChoice::None => ToolChoice::None,
             ResolvedToolChoice::Required | ResolvedToolChoice::Named(_) => ToolChoice::Required,
-        };
-        let (tokens, chat_params) = match state.engine.prepare_tool_chat(
-            &messages_json,
-            &tools_json,
-            engine_choice,
-            options.max_tokens,
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                respond_error(request, prompt_error_status(&error), &error);
-                return;
-            }
         };
         if api_request.stream {
             let heartbeat_frame =
@@ -418,13 +429,14 @@ fn handle_chat_completions(
                     &gen_state,
                     guard,
                     ToolChatInput {
-                        tokens,
-                        chat_params,
-                        tools: &requested_tools,
-                        choice: &tool_choice,
-                        options: &options,
-                        stop: &stop,
-                        resident_overrides: &resident_overrides,
+                        messages_json,
+                        tools_json,
+                        tools: requested_tools,
+                        choice: tool_choice.clone(),
+                        engine_choice,
+                        options,
+                        stop,
+                        resident_overrides,
                     },
                 );
                 match result {
@@ -487,13 +499,14 @@ fn handle_chat_completions(
                 &state,
                 guard,
                 ToolChatInput {
-                    tokens,
-                    chat_params,
+                    messages_json,
+                    tools_json,
                     tools,
-                    choice: &tool_choice,
-                    options: &options,
-                    stop: &stop,
-                    resident_overrides: &resident_overrides,
+                    choice: tool_choice.clone(),
+                    engine_choice,
+                    options,
+                    stop,
+                    resident_overrides,
                 },
             ) {
                 Ok((generation, result)) => {
@@ -524,7 +537,7 @@ fn handle_chat_completions(
                     .unwrap_or_default();
                     respond_json(request, StatusCode(200), body);
                 }
-                Err(error) => respond_error(request, 500, &error),
+                Err(error) => respond_error(request, prompt_error_status(&error), &error),
             }
         }
         return;
@@ -688,46 +701,42 @@ fn build_tool_prompt_inputs(
     Ok((messages_json, tools_json))
 }
 
-struct ToolChatInput<'a> {
-    tokens: Vec<u32>,
-    chat_params: ChatParams,
-    tools: &'a [ToolDefinition],
-    choice: &'a ResolvedToolChoice,
-    options: &'a ChatOptions,
-    stop: &'a [String],
-    resident_overrides: &'a HashSet<String>,
+/// Everything one tool-mode request needs: the serialized conversation +
+/// merged tool list, the resolved tool choice (for parsing) and its engine
+/// instruction form, and the generation options.
+struct ToolChatInput {
+    messages_json: String,
+    tools_json: String,
+    tools: Vec<ToolDefinition>,
+    choice: ResolvedToolChoice,
+    engine_choice: ToolChoice,
+    options: ChatOptions,
+    stop: Vec<String>,
+    resident_overrides: HashSet<String>,
 }
 
-/// Runs a tool-mode generation into a null sink, parses the output through
-/// the chat template parser, then through `parse_tool_response` → text or
-/// tool calls.
+/// Runs one tool-mode request through the engine's agentic loop (shared with
+/// the chat REPL): MCP tool calls execute in place, client-declared calls
+/// return to the client. The null sink keeps intermediate rounds quiet — the
+/// caller emits the final text or tool calls.
 fn generate_tool_chat(
     state: &ServerState,
     _guard: QueueGuard,
-    input: ToolChatInput<'_>,
+    input: ToolChatInput,
 ) -> Result<(Generation, ToolResponse), String> {
-    let mut context = state.engine.new_context()?;
-    let mut stop = input.stop.to_vec();
-    let template_stops: Vec<String> =
-        serde_json::from_str(&input.chat_params.additional_stops_json)
-            .map_err(|error| format!("Failed to parse template stop markers: {error}"))?;
-    stop.extend(template_stops);
-    let mut sink = NullSink;
-    let generation = state.engine.generate_with_chat_params(
-        &mut context,
-        &input.tokens,
-        input.options,
-        &stop,
-        &mut sink,
-        &input.chat_params,
-        input.resident_overrides,
-    )?;
-    let parsed = input
-        .chat_params
-        .parse(&generation.text, false)
-        .unwrap_or_else(|_| generation.text.clone());
-    let result = parse_tool_response(&parsed, &generation.text, input.tools, input.choice);
-    Ok((generation, result))
+    state.engine.generate_tool_chat(
+        &input.messages_json,
+        &input.tools_json,
+        &input.tools,
+        input.engine_choice,
+        &input.choice,
+        input.options.max_tokens,
+        &input.options,
+        &input.stop,
+        &mut NullSink,
+        &input.resident_overrides,
+        state.mcp.as_deref(),
+    )
 }
 
 // ---- completions (legacy) ----

@@ -23,7 +23,11 @@ pub fn serve(
     options: ServeOptions,
     chat_options: ChatOptions,
     ant_options: &AntCliOptions,
+    mcp_options: &crate::cli::McpCliOptions,
 ) -> Result<(), String> {
+    // MCP: connect the configured servers before the engine loads, so a
+    // broken server fails fast with its own diagnostic.
+    let mcp = crate::mcp::registry_from_flags(&mcp_options.servers, mcp_options.config.as_deref())?;
     // Refuse unauthenticated non-loopback listeners to prevent accidental network exposure.
     // 未启用鉴权时拒绝监听非回环地址，避免服务意外暴露到网络。
     if options.api_key.is_none() && !options.generate_key && !is_loopback(&options.host) {
@@ -110,6 +114,7 @@ pub fn serve(
         api_key,
         generation_queue: Arc::new(queue::FifoQueue::new(options.max_concurrent_generations)?),
         created,
+        mcp: mcp.map(std::sync::Arc::new),
     });
 
     loop {

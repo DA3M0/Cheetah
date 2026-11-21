@@ -27,9 +27,10 @@ cheetah/
 │   ├── ant.rs                  AntSettings/AntUnit/Ant manager, residency planner, FFI wrappers
 │   ├── chat/
 │   │   ├── mod.rs              chat entry (chat()), model_metadata_for_init, generated REGISTRY include
-│   │   ├── engine.rs           ★ Engine: load pipeline, generation loop, Ant hooks, sampling
+│   │   ├── engine.rs           ★ Engine: load pipeline, generation loop, Ant hooks, MCP tool loop, sampling
 │   │   ├── context.rs          conversation archive/store (persistence)
 │   │   ├── moe.rs              shared MoE routing (`select_experts`: softmax → top-k → renormalize)
+│   │   ├── toolcalls.rs        shared tool-call shapes + parsing (engine ↔ serve ↔ MCP)
 │   │   ├── registry.rs         ★ ModelForward trait + BackendLoader + ModelRegistration + derived lookups
 │   │   ├── templates.rs        chat template renderers
 │   │   ├── registrations/      ★ one file per family: declarative capability (build.rs → generated REGISTRY)
@@ -47,6 +48,7 @@ cheetah/
 │   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
 │   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
+│   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs)
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
 │   ├── serve/                  OpenAI-compatible API (mod/http/openai/queue)
 │   ├── inspect.rs              model inspection (load/inspect command)
@@ -81,7 +83,7 @@ main.rs::run (dispatch)                      src/main.rs
                               DecoderConfig::resolve     native/decoder.rs (config→units→family)
                               apply_tiers(plan)          madvise per unit
                           <Family>Native::new          the family's ModelForward (layer stacking)
-          → chat_loop                        engine.rs:1500 (REPL)
+          → chat_loop                        engine.rs (REPL; with --mcp-*: agentic tool loop)
               → generate_inner               engine.rs:1188
                   apply_ant_request_overrides → prefetch → promote → enforce
                   model.forward(&tokens, offset)     ← backend-agnostic boundary (Box<dyn ModelForward>)
@@ -166,6 +168,14 @@ run_init_command      src/main.rs:90
 | `ant_swap_fit` | pure swap decision (used by the engine's budget-checked swap) |
 | `ant_filter_known_units` | wizard unit-id validation |
 | `run_interactive_setup` | the `--setup` wizard |
+
+### `src/mcp.rs` + `src/mcp/client.rs` — MCP client
+
+| Item | File | Role |
+|------|------|------|
+| `McpServerConfig` / `parse_server_spec` / `server_configs` / `registry_from_flags` | mcp.rs | `--mcp-server name=command args...` + `--mcp-config <file>` parsing; registry construction (spawn → initialize → tools/list); `None` when nothing configured |
+| `McpRegistry` | mcp.rs | Connected servers + flattened tool list; `tool_definitions()` renders OpenAI-style definitions, `call()` routes `tools/call` to the owning server (per-client mutex, `Arc`-shared across request workers); `Drop` kills children |
+| `McpClient` / `LineTransport` / `ChildTransport` | mcp/client.rs | JSON-RPC 2.0 over newline-delimited stdio: `initialize` handshake, `tools/list` (paginated), `tools/call`; id-correlated requests with a 30s deadline; reader thread pumps stdout; server→client requests answered with a protocol error |
 
 ### `src/chat/` — runtime boundary & backend resolution
 

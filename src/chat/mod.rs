@@ -6,6 +6,7 @@ pub(crate) mod native;
 pub(crate) mod precision;
 pub(crate) mod registry;
 pub(crate) mod templates;
+pub(crate) mod toolcalls;
 #[cfg(feature = "vulkan")]
 pub(crate) mod vulkan;
 
@@ -23,7 +24,7 @@ use registry::{
 include!(concat!(env!("OUT_DIR"), "/model_registry.rs"));
 
 pub(crate) use engine::{
-    ChatMessage, ChatParams, Engine, Generation, TextSink, ToolChoice, load_engine_with_progress,
+    ChatMessage, Engine, Generation, TextSink, ToolChoice, load_engine_with_progress,
 };
 
 /// Interactive chat entry: validates the model path kind, loads the engine behind a progress spinner, and runs the REPL loop (`chat_loop`) with the supplied archive + store.
@@ -33,8 +34,9 @@ pub fn chat(
     archive: crate::context::ContextArchive,
     store: crate::context::ContextStore,
     ant: Option<&crate::ant::AntSettings>,
+    mcp: Option<crate::mcp::McpRegistry>,
 ) -> Result<(), String> {
-    engine::chat(path, options, archive, store, ant)
+    engine::chat(path, options, archive, store, ant, mcp.as_ref())
 }
 
 /// Derives init-time metadata (chat template id + stop markers) from a model config's architecture name through the generated REGISTRY; `None` when the config names nothing resolvable.

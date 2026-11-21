@@ -123,11 +123,21 @@ impl std::fmt::Display for RunError {
 /// overrides from defaults.
 pub fn parse_chat_args(
     args: &[String],
-) -> Result<(PathBuf, ChatOptions, ContextCliOptions, AntCliOptions), RunError> {
+) -> Result<
+    (
+        PathBuf,
+        ChatOptions,
+        ContextCliOptions,
+        AntCliOptions,
+        McpCliOptions,
+    ),
+    RunError,
+> {
     let mut path = None;
     let mut options = ChatOptions::default();
     let mut context = ContextCliOptions::default();
     let mut ant = AntCliOptions::default();
+    let mut mcp = McpCliOptions::default();
     let mut index = 0;
     // Track explicit inference flags separately so restored archives can
     // distinguish defaults from command-line overrides.
@@ -199,6 +209,14 @@ pub fn parse_chat_args(
                     return Err(RunError::usage("--context-dir can only be specified once."));
                 }
             }
+            "--mcp-server" => {
+                index += 1;
+                mcp.add_server(parse_text_option(args, index, "--mcp-server")?.as_str());
+            }
+            "--mcp-config" => {
+                index += 1;
+                mcp.add_config(parse_text_option(args, index, "--mcp-config")?.as_str())?;
+            }
             "--ant" => {
                 if args
                     .get(index + 1)
@@ -265,7 +283,7 @@ pub fn parse_chat_args(
             "Specify a Safetensors model directory or file. Usage: cheetah <model-path> [options]. Run `cheetah help` for all options.",
         )
     })?;
-    Ok((path, options, context, ant))
+    Ok((path, options, context, ant, mcp))
 }
 
 /// Parses `cheetah context list | delete <name> [--context-dir <path>]`.
@@ -332,9 +350,12 @@ pub fn parse_context_args(
 /// (`--temperature`, `--max-tokens`, ...) populate the default
 /// [`ChatOptions`] used as the server-wide defaults for every request
 /// (requests may still override them per call).
-pub fn parse_serve_args(args: &[String]) -> Result<(ServeOptions, ChatOptions), RunError> {
+pub fn parse_serve_args(
+    args: &[String],
+) -> Result<(ServeOptions, ChatOptions, McpCliOptions), RunError> {
     let mut serve = ServeOptions::default();
     let mut options = ChatOptions::default();
+    let mut mcp = McpCliOptions::default();
     let mut max_concurrent_generations_specified = false;
     let mut index = 0;
     // Serve accepts both a positional model and the legacy --model flag,
@@ -456,6 +477,14 @@ pub fn parse_serve_args(args: &[String]) -> Result<(ServeOptions, ChatOptions), 
                 index += 1;
                 options.system = Some(parse_text_option(args, index, "--system")?);
             }
+            "--mcp-server" => {
+                index += 1;
+                mcp.add_server(parse_text_option(args, index, "--mcp-server")?.as_str());
+            }
+            "--mcp-config" => {
+                index += 1;
+                mcp.add_config(parse_text_option(args, index, "--mcp-config")?.as_str())?;
+            }
             option if option.starts_with('-') => {
                 return Err(RunError::usage(format!(
                     "Unknown option '{option}'. Run `cheetah help` for usage."
@@ -483,7 +512,7 @@ pub fn parse_serve_args(args: &[String]) -> Result<(ServeOptions, ChatOptions), 
             "--generate-key and --api-key cannot be used together.",
         ));
     }
-    Ok((serve, options))
+    Ok((serve, options, mcp))
 }
 
 /// Options for `cheetah inspect <model-path>`.
@@ -627,6 +656,32 @@ fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool
         _ => Err(RunError::usage(format!(
             "{option} expects a boolean value (true/false); received '{value}'."
         ))),
+    }
+}
+
+/// MCP (`--mcp-server` / `--mcp-config`) options shared by chat and serve.
+/// Raw strings live here; the MCP registry resolves them into live server
+/// connections at session start.
+#[derive(Debug, Clone, Default)]
+pub struct McpCliOptions {
+    /// Raw `name=command args...` specifications (repeatable flag).
+    pub servers: Vec<String>,
+    /// Optional JSON config file: `{"servers": [{"name", "command", "args"}]}`.
+    pub config: Option<PathBuf>,
+}
+
+impl McpCliOptions {
+    /// Parse one `--mcp-server` value into the options.
+    pub fn add_server(&mut self, spec: &str) {
+        self.servers.push(spec.to_owned());
+    }
+
+    /// Parse one `--mcp-config` value into the options (once).
+    pub fn add_config(&mut self, path: &str) -> Result<(), RunError> {
+        if self.config.replace(PathBuf::from(path)).is_some() {
+            return Err(RunError::usage("--mcp-config can only be specified once."));
+        }
+        Ok(())
     }
 }
 
@@ -841,7 +896,7 @@ mod tests {
             "--ctx-size",
             "16384",
         ]);
-        let (path, options, context, _ant) = parse_chat_args(&values).unwrap();
+        let (path, options, context, _ant, _mcp) = parse_chat_args(&values).unwrap();
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert!(context.chat_options_specified);
         assert_eq!(
@@ -872,7 +927,7 @@ mod tests {
             "--system",
             "You are a concise assistant.",
         ]);
-        let (_, options, _, _) = parse_chat_args(&values).unwrap();
+        let (_, options, _, _, _mcp) = parse_chat_args(&values).unwrap();
         assert_eq!(options.temperature, 0.0);
         assert_eq!(options.top_p, 1.0);
         assert_eq!(options.top_k, 40);
@@ -984,7 +1039,7 @@ mod tests {
             "--ant-resident",
             "model.embed_tokens.weight",
         ]);
-        let (path, _options, _context, ant) = parse_chat_args(&values).unwrap();
+        let (path, _options, _context, ant, _mcp) = parse_chat_args(&values).unwrap();
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert_eq!(ant.enabled, Some(false));
         assert_eq!(ant.vram_pool_bytes, Some(512));
@@ -1007,7 +1062,7 @@ mod tests {
         assert_eq!(ant.interactive, None);
 
         let values = args(&["model.safetensors", "--ant"]);
-        let (path, _options, _context, ant) = parse_chat_args(&values).unwrap();
+        let (path, _options, _context, ant, _mcp) = parse_chat_args(&values).unwrap();
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert_eq!(ant.enabled, Some(true));
     }
@@ -1040,7 +1095,7 @@ mod tests {
         assert_eq!(ant.interactive, Some(true));
 
         // A bare setup flag does not swallow a following model path.
-        let (path, _, _, ant) = parse_chat_args(&args(&[
+        let (path, _, _, ant, _mcp) = parse_chat_args(&args(&[
             "model.safetensors",
             "--setup",
             "--max-tokens",
@@ -1059,7 +1114,7 @@ mod tests {
 
     #[test]
     fn parses_context_options_and_management_commands() {
-        let (_, _, context, _) = parse_chat_args(&args(&[
+        let (_, _, context, _, _mcp) = parse_chat_args(&args(&[
             "model.safetensors",
             "--context",
             "work",
@@ -1073,7 +1128,7 @@ mod tests {
             Some(PathBuf::from("/tmp/cheetah-contexts"))
         );
         assert!(!context.chat_options_specified);
-        let (_, _, context, _) =
+        let (_, _, context, _, _mcp) =
             parse_chat_args(&args(&["model.safetensors", "--max-tokens", "256"])).unwrap();
         assert!(context.chat_options_specified);
 
@@ -1096,8 +1151,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_mcp_flags_for_chat() {
+        let (path, _, _, _, mcp) = parse_chat_args(&args(&[
+            "model.safetensors",
+            "--mcp-server",
+            "fs=npx -y @mcp/fs /tmp",
+            "--mcp-config",
+            "/tmp/mcp.json",
+        ]))
+        .unwrap();
+        assert_eq!(path, PathBuf::from("model.safetensors"));
+        assert_eq!(mcp.servers, vec!["fs=npx -y @mcp/fs /tmp".to_owned()]);
+        assert_eq!(mcp.config, Some(PathBuf::from("/tmp/mcp.json")));
+    }
+
+    #[test]
+    fn rejects_repeated_mcp_config() {
+        let error = parse_chat_args(&args(&[
+            "model.safetensors",
+            "--mcp-config",
+            "/tmp/a.json",
+            "--mcp-config",
+            "/tmp/b.json",
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("--mcp-config"));
+    }
+
+    #[test]
+    fn parses_mcp_flags_for_serve() {
+        let (serve, _, mcp) = parse_serve_args(&args(&[
+            "model.safetensors",
+            "--mcp-server",
+            "tools=./server.sh --flag",
+        ]))
+        .unwrap();
+        assert_eq!(serve.model, "model.safetensors");
+        assert_eq!(mcp.servers, vec!["tools=./server.sh --flag".to_owned()]);
+        assert!(mcp.config.is_none());
+    }
+
+    #[test]
     fn parses_serve_defaults() {
-        let (serve, options) = parse_serve_args(&args(&["qwen2.5-0.5b"])).unwrap();
+        let (serve, options, _mcp) = parse_serve_args(&args(&["qwen2.5-0.5b"])).unwrap();
         assert_eq!(serve.model, "qwen2.5-0.5b");
         assert_eq!(serve.model_dir, PathBuf::from("."));
         assert_eq!(serve.host, "127.0.0.1");
@@ -1110,7 +1206,7 @@ mod tests {
 
     #[test]
     fn parses_serve_options_and_generation_overrides() {
-        let (serve, options) = parse_serve_args(&args(&[
+        let (serve, options, _mcp) = parse_serve_args(&args(&[
             "--model",
             "qwen2.5-0.5b",
             "--model-dir",
@@ -1144,7 +1240,7 @@ mod tests {
 
     #[test]
     fn accepts_ephemeral_port_and_generate_key() {
-        let (serve, _) = parse_serve_args(&args(&[
+        let (serve, _, _mcp) = parse_serve_args(&args(&[
             "--model",
             "m.safetensors",
             "--port",
@@ -1203,7 +1299,7 @@ mod tests {
 
     #[test]
     fn parses_positional_serve_model_and_options() {
-        let (serve, options) = parse_serve_args(&args(&[
+        let (serve, options, _mcp) = parse_serve_args(&args(&[
             "m.safetensors",
             "--model-dir",
             "./models",

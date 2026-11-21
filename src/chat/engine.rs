@@ -77,8 +77,10 @@
 // chat options.
 use super::registry::{Device, ModelForward};
 use crate::ant::{Ant, AntLayerResidency, AntSettings, AntUnit, ant_swap_fit};
+use crate::chat::toolcalls::{self, ResolvedToolChoice, ToolDefinition, ToolResponse};
 use crate::color::{self, Color};
 use crate::context::{ContextArchive, ContextStore, ConversationTurn};
+use crate::mcp::McpRegistry;
 use crate::options::ChatOptions;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rand::SeedableRng;
@@ -1509,6 +1511,87 @@ impl Engine {
         ))
     }
 
+    /// Upper bound on MCP tool rounds per generation: an agent loop that
+    /// reaches it returns the last tool calls to the caller (the OpenAI
+    /// client or the REPL user) instead of continuing silently.
+    const MAX_TOOL_ROUNDS: usize = 8;
+
+    /// The agentic tool loop for MCP-backed tools.
+    ///
+    /// Each round: render the tool instruction + serialize the conversation
+    /// ([`Engine::prepare_tool_chat`]) → generate → parse the model output
+    /// into tool calls ([`toolcalls::parse_tool_response`]). When every
+    /// parsed call belongs to a connected MCP server, the calls execute
+    /// through the registry, their results join the conversation as
+    /// `role: "tool"` messages, and the loop continues; the first round with
+    /// a plain answer — or any call the MCP registry does not own — returns,
+    /// so client-declared tools keep their existing client-driven contract.
+    /// Bounded by [`MAX_TOOL_ROUNDS`].
+    pub fn generate_tool_chat(
+        &self,
+        messages_json: &str,
+        tools_json: &str,
+        tools: &[ToolDefinition],
+        choice: ToolChoice,
+        resolved: &ResolvedToolChoice,
+        max_tokens: usize,
+        options: &ChatOptions,
+        extra_stop: &[String],
+        sink: &mut dyn TextSink,
+        resident_overrides: &HashSet<String>,
+        mcp: Option<&McpRegistry>,
+    ) -> Result<(Generation, ToolResponse), String> {
+        let mut messages = messages_json.to_owned();
+        let mut context = self.new_context()?;
+        let mut rounds = 0usize;
+        loop {
+            let (tokens, chat_params) =
+                self.prepare_tool_chat(&messages, tools_json, choice, max_tokens)?;
+            let generation = self.generate_with_chat_params(
+                &mut context,
+                &tokens,
+                options,
+                extra_stop,
+                sink,
+                &chat_params,
+                resident_overrides,
+            )?;
+            let parsed = chat_params
+                .parse(&generation.text, false)
+                .unwrap_or_else(|_| generation.text.clone());
+            let response =
+                toolcalls::parse_tool_response(&parsed, &generation.text, tools, resolved);
+            if let ToolResponse::Calls(calls) = &response
+                && let Some(mcp) = mcp
+                && !calls.is_empty()
+                && calls.iter().all(|call| mcp.has_tool(&call.function.name))
+                && rounds < Self::MAX_TOOL_ROUNDS
+            {
+                rounds += 1;
+                let mut results = Vec::with_capacity(calls.len());
+                for call in calls {
+                    eprintln!(
+                        "{}",
+                        color::stderr(
+                            &format!(
+                                "[mcp] calling tool '{}' on server round {}",
+                                call.function.name, rounds
+                            ),
+                            Color::Cyan
+                        )
+                    );
+                    let text = mcp
+                        .call(&call.function.name, &call.function.arguments)
+                        .unwrap_or_else(|error| format!("[error] {error}"));
+                    results.push((call.id.clone(), text));
+                }
+                messages = toolcalls::next_tool_round(&messages, calls, &results)?;
+                continue;
+            }
+            return Ok((generation, response));
+        }
+    }
+
     /// Public generation entry (the context placeholder is ignored); delegates
     /// to [`Engine::generate_inner`].
     pub fn generate(
@@ -1983,6 +2066,7 @@ pub(super) fn chat(
     mut archive: ContextArchive,
     store: ContextStore,
     ant: Option<&AntSettings>,
+    mcp: Option<&crate::mcp::McpRegistry>,
 ) -> Result<(), String> {
     if !path.is_dir() && path.extension().and_then(|ext| ext.to_str()) != Some("safetensors") {
         return Err(format!(
@@ -2002,7 +2086,7 @@ pub(super) fn chat(
             Color::Green
         )
     );
-    chat_loop(&engine, options, &mut archive, store)
+    chat_loop(&engine, options, &mut archive, store, mcp)
 }
 
 struct StdoutSink;
@@ -2045,6 +2129,7 @@ fn chat_loop(
     options: ChatOptions,
     archive: &mut ContextArchive,
     store: ContextStore,
+    mcp: Option<&crate::mcp::McpRegistry>,
 ) -> Result<(), String> {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
@@ -2116,18 +2201,57 @@ fn chat_loop(
         }
         let user = text.to_owned();
         messages.push(ChatMessage::new("user", user.clone()));
-        let (tokens, _) =
-            engine.prepare(&mut messages, options.system.as_deref(), options.max_tokens)?;
-        let mut context = engine.new_context()?;
         let mut sink = StdoutSink;
-        match engine.generate(
-            &mut context,
-            &tokens,
-            &options,
-            &[],
-            &mut sink,
-            &HashSet::new(),
-        ) {
+        let generation = match mcp {
+            // MCP configured: the tools flow runs the agentic loop (tool
+            // calls execute server-side and the model answers with their
+            // results); the history keeps only the final text.
+            Some(mcp) => {
+                let tools = mcp.tool_definitions();
+                let tools_json = serde_json::to_string(&tools)
+                    .map_err(|error| format!("Failed to serialize MCP tools: {error}"))?;
+                let history_json = serde_json::to_string(
+                    &messages
+                        .iter()
+                        .map(|message| {
+                            serde_json::json!({"role": message.role, "content": message.content})
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| format!("Failed to serialize chat history: {error}"))?;
+                engine
+                    .generate_tool_chat(
+                        &history_json,
+                        &tools_json,
+                        &tools,
+                        ToolChoice::Auto,
+                        &toolcalls::ResolvedToolChoice::Auto,
+                        options.max_tokens,
+                        &options,
+                        &[],
+                        &mut sink,
+                        &HashSet::new(),
+                        Some(mcp),
+                    )
+                    .map(|(generation, _)| generation)
+            }
+            None => {
+                let (tokens, _) =
+                    engine.prepare(&mut messages, options.system.as_deref(), options.max_tokens)?;
+                let mut context = engine.new_context()?;
+                engine
+                    .generate(
+                        &mut context,
+                        &tokens,
+                        &options,
+                        &[],
+                        &mut sink,
+                        &HashSet::new(),
+                    )
+                    .map(|generation| generation)
+            }
+        };
+        match generation {
             Ok(generation) => {
                 println!(
                     "{}",

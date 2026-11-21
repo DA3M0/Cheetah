@@ -18,6 +18,7 @@ mod cli;
 mod color;
 mod context;
 mod inspect;
+mod mcp;
 mod options;
 mod serve;
 
@@ -57,6 +58,7 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             ChatOptions::default(),
             cli::ContextCliOptions::default(),
             cli::AntCliOptions::default(),
+            cli::McpCliOptions::default(),
         );
     };
 
@@ -82,8 +84,9 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
         "load" | "inspect" => run_inspect_command(&args[1..]),
         "init" | "prepare" => run_init_command(&args[1..]),
         "chat" => {
-            let (path, options, context_options, ant_options) = cli::parse_chat_args(&args[1..])?;
-            run_chat(&path, options, context_options, ant_options)
+            let (path, options, context_options, ant_options, mcp_options) =
+                cli::parse_chat_args(&args[1..])?;
+            run_chat(&path, options, context_options, ant_options, mcp_options)
         }
         "context" => {
             let (operation, options) = cli::parse_context_args(&args[1..])?;
@@ -91,12 +94,18 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
         }
         "serve" => {
             let (serve_args, ant_options) = split_ant_args(&args[1..])?;
-            let (serve_options, chat_options) = cli::parse_serve_args(&serve_args)?;
-            runtime(serve::serve(serve_options, chat_options, &ant_options))
+            let (serve_options, chat_options, mcp_options) = cli::parse_serve_args(&serve_args)?;
+            runtime(serve::serve(
+                serve_options,
+                chat_options,
+                &ant_options,
+                &mcp_options,
+            ))
         }
         value if !value.starts_with('-') => {
-            let (path, options, context_options, ant_options) = cli::parse_chat_args(&args)?;
-            run_chat(&path, options, context_options, ant_options)
+            let (path, options, context_options, ant_options, mcp_options) =
+                cli::parse_chat_args(&args)?;
+            run_chat(&path, options, context_options, ant_options, mcp_options)
         }
         other => Err(RunError::usage(format!(
             "Unknown command '{other}'. Run `cheetah help` for usage."
@@ -341,7 +350,14 @@ fn run_chat(
     requested_options: ChatOptions,
     context_options: cli::ContextCliOptions,
     ant_options: cli::AntCliOptions,
+    mcp_options: cli::McpCliOptions,
 ) -> Result<(), RunError> {
+    // MCP: connect the configured servers up front so a broken server fails
+    // before the model loads rather than mid-conversation.
+    let mcp = runtime(crate::mcp::registry_from_flags(
+        &mcp_options.servers,
+        mcp_options.config.as_deref(),
+    ))?;
     // Ant: resolve effective memory settings from user-managed defaults,
     // then CLI overrides.
     let settings = resolve_ant_settings(path, &ant_options)?;
@@ -368,7 +384,14 @@ fn run_chat(
     } else {
         runtime(archive.validate_for_launch(path, &requested_options, chat_options_specified))?
     };
-    runtime(chat::chat(path, options, archive, store, Some(&settings)))
+    runtime(chat::chat(
+        path,
+        options,
+        archive,
+        store,
+        Some(&settings),
+        mcp,
+    ))
 }
 
 /// `cheetah context list | delete <name>`: manage saved conversation
@@ -424,89 +447,94 @@ fn print_help() {
         "{}",
         color::stdout(
             "cheetah - Local Safetensors inference and gateway\n\
-\n\
-Usage:\n\
-  cheetah                                  Load the model in the current directory and chat\n\
-  cheetah <model-path>                      Load a model directory or Safetensors file and chat\n\
-  cheetah chat <model-path>                 Same as above\n\
-  cheetah serve <name-or-path> [options]    Run an OpenAI-compatible API server\n\
-  cheetah inspect <model-path> [options]    Inspect Safetensors weights\n\
-  cheetah load <model-path> [options]       Compatibility alias for inspect\n\
-  cheetah init <source-dir> <destination-dir>  Prepare aligned static model shards\n\
-  cheetah prepare <source-dir> <destination-dir>  Alias for init\n\
-  cheetah context list [--context-dir <path>]  List saved contexts\n\
-  cheetah context delete <name> [--context-dir <path>]  Delete a context\n\
-  cheetah formats                           List supported formats\n\
-  cheetah version                           Show the version (--version / -V)\n\
-  cheetah help                              Show this help\n\
-\n\
-Chat options:\n\
-  --threads N          Number of inference threads (default: physical core count)\n\
-  --max-tokens N       Maximum tokens to generate per turn (default: 256)\n\
-  --ctx-size N         Context window size in tokens (default: 8192)\n\
-  --temperature F      Sampling temperature (default: 0, deterministic; around 0.8 for varied output)\n\
-  --top-p F            Nucleus sampling threshold (default: 0.9; only used when temperature > 0)\n\
-  --top-k N            Number of top-k sampling candidates (default: disabled)\n\
-  --repeat-penalty F   Repetition penalty (default: 1, disabled)\n\
-  --seed N             Random seed for reproducible generation\n\
-  --system \"...\"       System prompt, included only in the first turn\n\
-  --context <name>     Resume a saved chat context\n\
-  --context-dir <path> Context archive directory (also used by /save)\n\
-\n\
-Ant memory options (cheetah init <source-dir> <destination-dir> | cheetah chat <model-path> | cheetah serve <name-or-path>):\n\
-  --setup [bool]        Interactive Ant preset wizard (bare flag or true/false; alias of --ant-setup);\n\
+    \n\
+    Usage:\n\
+    cheetah                                  Load the model in the current directory and chat\n\
+    cheetah <model-path>                      Load a model directory or Safetensors file and chat\n\
+    cheetah chat <model-path>                 Same as above\n\
+    cheetah serve <name-or-path> [options]    Run an OpenAI-compatible API server\n\
+    cheetah inspect <model-path> [options]    Inspect Safetensors weights\n\
+    cheetah load <model-path> [options]       Compatibility alias for inspect\n\
+    cheetah init <source-dir> <destination-dir>  Prepare aligned static model shards\n\
+    cheetah prepare <source-dir> <destination-dir>  Alias for init\n\
+    cheetah context list [--context-dir <path>]  List saved contexts\n\
+    cheetah context delete <name> [--context-dir <path>]  Delete a context\n\
+    cheetah formats                           List supported formats\n\
+    cheetah version                           Show the version (--version / -V)\n\
+    cheetah help                              Show this help\n\
+    \n\
+    Chat options:\n\
+    --threads N          Number of inference threads (default: physical core count)\n\
+    --max-tokens N       Maximum tokens to generate per turn (default: 256)\n\
+    --ctx-size N         Context window size in tokens (default: 8192)\n\
+    --temperature F      Sampling temperature (default: 0, deterministic; around 0.8 for varied output)\n\
+    --top-p F            Nucleus sampling threshold (default: 0.9; only used when temperature > 0)\n\
+    --top-k N            Number of top-k sampling candidates (default: disabled)\n\
+    --repeat-penalty F   Repetition penalty (default: 1, disabled)\n\
+    --seed N             Random seed for reproducible generation\n\
+    --system \"...\"       System prompt, included only in the first turn\n\
+    --context <name>     Resume a saved chat context\n\
+    --context-dir <path> Context archive directory (also used by /save)\n\
+    \n\
+    MCP options (cheetah chat <model-path> | cheetah serve <name-or-path>):\n\
+    --mcp-server name=cmd [args...]  Connect one MCP stdio server; its tools join every request\n\
+                                     and its tool calls execute server-side (repeatable)\n\
+    --mcp-config <path>  JSON file: {servers: [{name, command, args: [...]}]} (once)\n\
+    \n\
+    Ant memory options (cheetah init <source-dir> <destination-dir> | cheetah chat <model-path> | cheetah serve <name-or-path>):\n\
+    --setup [bool]        Interactive Ant preset wizard (bare flag or true/false; alias of --ant-setup);\n\
                           after setup, init/chat/serve execute with the configured settings\n\
-  --ant-setup [bool]    Same as --setup\n\
-  --ant <bool>          Enable/disable Ant memory optimization (default: true; bare --ant enables the preset)\n\
-  --ant-vram <bytes>    VRAM pool size override in bytes (default: 8GiB)\n\
-  --ant-ram <bytes>     RAM budget override in bytes (default: 16GiB)\n\
-  --ant-disk-dir <path> Disk residency directory override\n\
-  --ant-resident <id>   Repeatable unit id to keep resident\n\
-  --ant-eviction-policy <policy> Eviction policy override\n\
-  --ant-prefetch-stages <n> Prefetch stages override\n\
-  --ant-allow-vram-swap <bool> Allow VRAM swap override\n\
-User-managed defaults live in <model-dir>/cheetah_ant_settings.json.\n\
-\n\
-Server options (cheetah serve):\n\
-  --model <name>        Model name or Safetensors model path (legacy syntax)\n\
-  --model-dir <dir>     Directory to search for models by name (default: .)\n\
-  --host <address>      Address to listen on (default: 127.0.0.1)\n\
-  --port <port>         Port to listen on (default: 8080; 0 assigns a free port)\n\
-  --max-concurrent-generations <N> Maximum concurrent inference requests (default: 1)\n\
-  --generate-key        Generate and print an API key\n\
-  --api-key <KEY>       Set the API key\n\
-  These options can be combined with chat options to set server defaults.\n\
-\n\
-Inspection options (cheetah inspect):\n\
-  --all                 Show all tensors (default: at most 20)\n\
-  --json                Output JSON\n\
-  -o, --output <file>   Save the report to a file (overwrites; no terminal output)\n\
-\n\
-Server API endpoints:\n\
-  POST /v1/chat/completions    Supports streaming (SSE)\n\
-  POST /v1/completions         Non-streaming only; prompt is sent as one message\n\
-  GET  /v1/models              List loaded models\n\
-  GET  /v1/models/:id          Get a single model\n\
-  GET  /health                 Health check (no authentication required)\n\
-\n\
-Examples:\n\
-  cd /home/user/models/qwen-0.5b && cheetah\n\
-  cheetah /home/user/models/qwen-0.5b --threads 8 --max-tokens 128\n\
-  cheetah /home/user/models/qwen-0.5b --temperature 0.7 --top-k 50 --seed 42\n\
-  cheetah /home/user/models/qwen-0.5b --system \"You are a concise assistant.\"\n\
-  cheetah /home/user/models/qwen-0.5b --temperature 0\n\
-  cheetah serve qwen-0.5b --model-dir ./models --port 8080 --generate-key\n\
-  cheetah serve /home/user/models/qwen-0.5b --port 8080 --api-key secret\n\
-  cheetah inspect /home/user/models/qwen-0.5b\n\
-  cheetah inspect ./model.safetensors --json\n\
-  cheetah init ./hf-model ./prepared-model\n\
-  cargo build --release --features cuda\n\
-  CHEETAH_DEVICE=cuda ./target/release/cheetah /home/user/models/qwen-0.5b\n\
-  cargo build --release --features metal\n\
-  CHEETAH_DEVICE=metal ./target/release/cheetah /home/user/models/qwen-0.5b\n\
-\n\
-Set CHEETAH_DEVICE to cpu (default), cuda, or metal; GPU choices require building with the matching --features option.\n\
-Enter /exit to leave a chat. Press Ctrl-C to stop the server.",
+    --ant-setup [bool]    Same as --setup\n\
+    --ant <bool>          Enable/disable Ant memory optimization (default: true; bare --ant enables the preset)\n\
+    --ant-vram <bytes>    VRAM pool size override in bytes (default: 8GiB)\n\
+    --ant-ram <bytes>     RAM budget override in bytes (default: 16GiB)\n\
+    --ant-disk-dir <path> Disk residency directory override\n\
+    --ant-resident <id>   Repeatable unit id to keep resident\n\
+    --ant-eviction-policy <policy> Eviction policy override\n\
+    --ant-prefetch-stages <n> Prefetch stages override\n\
+    --ant-allow-vram-swap <bool> Allow VRAM swap override\n\
+    User-managed defaults live in <model-dir>/cheetah_ant_settings.json.\n\
+    \n\
+    Server options (cheetah serve):\n\
+    --model <name>        Model name or Safetensors model path (legacy syntax)\n\
+    --model-dir <dir>     Directory to search for models by name (default: .)\n\
+    --host <address>      Address to listen on (default: 127.0.0.1)\n\
+    --port <port>         Port to listen on (default: 8080; 0 assigns a free port)\n\
+    --max-concurrent-generations <N> Maximum concurrent inference requests (default: 1)\n\
+    --generate-key        Generate and print an API key\n\
+    --api-key <KEY>       Set the API key\n\
+    These options can be combined with chat options to set server defaults.\n\
+    \n\
+    Inspection options (cheetah inspect):\n\
+    --all                 Show all tensors (default: at most 20)\n\
+    --json                Output JSON\n\
+    -o, --output <file>   Save the report to a file (overwrites; no terminal output)\n\
+    \n\
+    Server API endpoints:\n\
+    POST /v1/chat/completions    Supports streaming (SSE)\n\
+    POST /v1/completions         Non-streaming only; prompt is sent as one message\n\
+    GET  /v1/models              List loaded models\n\
+    GET  /v1/models/:id          Get a single model\n\
+    GET  /health                 Health check (no authentication required)\n\
+    \n\
+    Examples:\n\
+    cd /home/user/models/qwen-0.5b && cheetah\n\
+    cheetah /home/user/models/qwen-0.5b --threads 8 --max-tokens 128\n\
+    cheetah /home/user/models/qwen-0.5b --temperature 0.7 --top-k 50 --seed 42\n\
+    cheetah /home/user/models/qwen-0.5b --system \"You are a concise assistant.\"\n\
+    cheetah /home/user/models/qwen-0.5b --temperature 0\n\
+    cheetah serve qwen-0.5b --model-dir ./models --port 8080 --generate-key\n\
+    cheetah serve /home/user/models/qwen-0.5b --port 8080 --api-key secret\n\
+    cheetah inspect /home/user/models/qwen-0.5b\n\
+    cheetah inspect ./model.safetensors --json\n\
+    cheetah init ./hf-model ./prepared-model\n\
+    cargo build --release --features cuda\n\
+    CHEETAH_DEVICE=cuda ./target/release/cheetah /home/user/models/qwen-0.5b\n\
+    cargo build --release --features metal\n\
+    CHEETAH_DEVICE=metal ./target/release/cheetah /home/user/models/qwen-0.5b\n\
+    \n\
+    Set CHEETAH_DEVICE to cpu (default), cuda, or metal; GPU choices require building with the matching --features option.\n\
+    Enter /exit to leave a chat. Press Ctrl-C to stop the server.",
             color::Color::Cyan
         )
     );
