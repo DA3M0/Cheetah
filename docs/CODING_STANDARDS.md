@@ -744,23 +744,25 @@ their tool calls in the agentic loop (`Engine::generate_tool_chat`).
 | `LineTransport` / `ChildTransport` | The newline transport trait + the real child-piped implementation (reader thread pumps stdout so a slow server never blocks past the deadline; stderr inherits). |
 | 14 tests *(test)* | Scripted-transport protocol tests (handshake shape, pagination, content joining, `isError`, protocol-error replies, server-error rejection) + config/spec parsing + a real-stdio end-to-end test against a live Python MCP server (gated on python3). |
 
-### 10.20b `src/mcp_server.rs` — Cheetah as an MCP server (5 runtime + 6 tests)
+### 10.20b `src/serve/mcp.rs` — the MCP endpoint of serve (8 runtime + 7 tests)
 
-`cheetah mcp <model-path>` exposes the loaded model to MCP agents over
-stdio: JSON-RPC 2.0 (newline-delimited) in, responses out. The engine loads
-through `Engine::load` directly — the protocol channel carries JSON frames
-only; diagnostics go to stderr.
+Every `cheetah serve` instance speaks MCP at `POST /mcp` with no extra
+configuration — the same HTTP server that answers the OpenAI API. One
+JSON-RPC 2.0 message per POST; the protocol layer here is HTTP-free
+(`handle_request` is generic over the invoker), and the per-request state
+borrows the shared engine instead of loading its own.
 
 | Function | Analysis |
 |---|---|
-| `run(path, options, ant, mcp)` | Server lifecycle: `Engine::load` → the stdio request loop (parse → dispatch → respond) until the agent closes stdin; malformed JSON lines answer a parse error (id null) and keep serving. `mcp` is the optional client registry (`Arc<McpRegistry>`, `None` when no `--mcp-server`/`--mcp-config` was given) shared into the state. |
-| `handle_request(message, state)` | Protocol dispatch: notifications (no id) return nothing; `initialize` → protocol version + tools capability + serverInfo; `ping` → empty result; `tools/list` → the two-tool catalog; `tools/call` → routed through the `McpServerStateLike` invoker; unknown methods → `-32601`. Generic over the invoker so tests stub generation. |
-| `McpServerState::invoke_tool(params)` (via `McpServerStateLike`) | Tool dispatch: `chat_generate` (validate messages → apply max_tokens/temperature overrides → `McpServerState::run_generation`) and `model_info` (id/architecture/device); unknown tools → `-32602`. Execution failures are `isError: true` MCP results — the agent sees them. |
-| `McpServerState::run_generation(messages, options)` | Generation routing: no connected servers → plain `prepare`/`generate` (DiscardSink); servers connected → serve's agentic loop `Engine::generate_tool_chat` with `ToolChoice::Auto` and the registry's tool definitions — model tool calls execute against the owning server, results feed back, capped at 8 rounds. A leftover `ToolResponse::Calls` (hallucinated name matching no connected tool) serializes to text. |
-| `parse_tool_messages(arguments)` | Validates the agent's `messages` array (roles/content strings, non-empty) into engine chat messages. |
+| `parse_error_response(error)` | The JSON-RPC parse-error payload (`-32700`, id null) returned for a malformed request body. |
+| `McpServeState::new(state, ticket)` | Builds the per-request state: borrows the shared engine, generation defaults, and MCP registry from `ServerState`; carries the request's queue ticket (acquired only when a call generates). |
+| `McpServeState::run_generation(messages, options)` | Acquires the request's generation ticket for the inference, then routes: no connected servers → plain `prepare`/`generate` (DiscardSink); servers connected → serve's agentic loop `Engine::generate_tool_chat` with `ToolChoice::Auto` and the registry's tool definitions — model tool calls execute against the owning server, results feed back, capped at 8 rounds. A leftover `ToolResponse::Calls` (hallucinated name matching no connected tool) serializes to text. |
+| `McpStateLike for McpServeState::invoke_tool(params)` | Tool dispatch: `chat_generate` (validate messages → apply max_tokens/temperature overrides → `run_generation`) and `model_info` (id/architecture/device); unknown tools → `-32602`. Execution failures are `isError: true` MCP results — the agent sees them. |
+| `handle_request(message, state)` | Protocol dispatch: notifications (no id) return nothing; `initialize` → protocol version + tools capability + serverInfo; `ping` → empty result; `tools/list` → the two-tool catalog; `tools/call` → routed through the `McpStateLike` invoker; unknown methods → `-32601`. Generic over the invoker so tests stub generation. |
 | `initialize_result()` / `tools_list_result()` | The static protocol payloads (protocol version, capabilities, two-tool catalog with JSON Schema). |
+| `parse_tool_messages(arguments)` | Validates the agent's `messages` array (roles/content strings, non-empty) into engine chat messages. |
 | `DiscardSink` | Drops streamed deltas — the MCP result carries `generation.text` (capture defaults to true). |
-| 6 tests *(test)* | Cover the initialize shape, the two-tool catalog, call routing through the invoker, unknown-tool/unknown-method protocol errors, notification handling, and chat_generate argument validation — all without loading a model (the invoker is stubbed). |
+| 7 tests *(test)* | Cover the initialize shape, the two-tool catalog, call routing through the invoker, unknown-tool/unknown-method protocol errors, notification handling, chat_generate argument validation, and the parse-error shape — all without loading a model (the invoker is stubbed). |
 
 ### 10.21 `src/chat/vulkan/` — the Vulkan backend
 
@@ -809,10 +811,10 @@ both backends.
 | `take_linear(weights, plan, prefix, in, out, with_bias)` | Builds a `Linear`: shape-validated weight (+ required bias when `with_bias`), load-time quantization when a format is selected (norms/biases/embedding never quantize), and the Ant-bucket resident upload for VRAM-tier units (fallback to streaming with a warning). |
 | `quantized_formats_match_across_backends` *(test)* | The cross-backend contract: every registered quantized format must agree across Vulkan streaming, Vulkan resident and the native gemv. |
 
-### 10.22 `src/serve/` — OpenAI-compatible API (82 runtime + 39 tests)
+### 10.22 `src/serve/` — OpenAI-compatible API + MCP endpoint (92 runtime + 46 tests)
 
-`mod.rs` (9 runtime), `http.rs` (37 runtime), `openai.rs` (27 runtime),
-`queue.rs` (10 runtime).
+`mod.rs` (9 runtime), `http.rs` (39 runtime), `mcp.rs` (8 runtime),
+`openai.rs` (27 runtime), `queue.rs` (10 runtime).
 
 | Function | Analysis |
 |---|---|
@@ -825,7 +827,7 @@ both backends.
 | `resolve_api_key(options)` | Explicit `--api-key` wins; `--generate-key` creates one; otherwise no auth (loopback-only enforced upstream). |
 | `is_loopback(host)` | Whether the bind address is loopback-only. |
 | `display_url(host, port)` | The startup banner URL (localhost for loopback, bracketed IPv6). |
-| `is_generation_request(request)` | Whether an incoming request is a generation endpoint (POST `/v1/chat/completions` or `/v1/completions`) — decides whether a queue ticket is taken. |
+| `is_generation_request(method, path)` | Whether an incoming request is a generation endpoint (POST `/v1/chat/completions`, `/v1/completions`, or `/mcp` — an MCP `tools/call` may generate) — decides whether a queue ticket is taken. |
 | `handle(state, request, generation_ticket)` | The request dispatcher: OPTIONS → CORS preflight, `/health` auth-free, Bearer auth check, then route to models/chat/completions handlers. |
 | `route(method, path)` | Route table: known paths with wrong methods → 405, unknown → 404. |
 | `authorized(request, expected)` | Bearer-token check; no expected key means allow. |
@@ -844,6 +846,8 @@ both backends.
 | `build_tool_prompt_inputs(request, tools, choice, default_system)` | Serializes messages (+ injected default system when none present) and the (choice-filtered) tools for the template's tool parser. |
 | `generate_tool_chat(state, guard, input)` | Runs a tool-mode generation (null sink), parses the output through the template parser, then through `parse_tool_response` → text or calls. |
 | `handle_completions(state, request, ticket)` | The legacy `/v1/completions` endpoint (non-streaming only; echo unsupported): prompt → single user message → generate → text completion response. |
+| `handle_mcp(state, request, ticket)` | The MCP endpoint: parse the JSON-RPC message (malformed JSON → the `-32700` parse error, id null), dispatch through `serve/mcp.rs` inside `spawn_blocking` (the ticket rides along for `chat_generate`), then 200 with the response or 202 for notifications. |
+| `empty_response(status)` | A bare status response with CORS headers and no body (202 notifications). |
 | `generate_chat(state, guard, tokens, options, stop, sink, resident_overrides)` | Shared generation core: new context + `Engine::generate` under the queue guard. |
 | `prompt_error_status(error)` | Maps context-overflow prompt errors to 400; everything else is 500. |
 | `NullSink::push` | Discards streamed text (non-streaming requests still stream internally). |
@@ -895,15 +899,15 @@ both backends.
 | `QueueTicket::drop()` | An unacquired dropped ticket cancels itself (abandoned requests never hold a slot). |
 | `QueueGuard::drop()` | Releases one active slot and wakes waiters. |
 | `FifoQueue::default()` | One-slot queue (single concurrent generation). |
-| 39 serve tests *(test)* | Cover constant-time token comparison, context-overflow status mapping, routing (known/405/404), the SSE channel reader (EOF, chunk pumping, batching, heartbeat, unblocking on drop), sink interruption after reader drop, tool-call delta fields, streaming + non-streaming chat paths, empty-chunk tolerance, request parsing (content arrays, tool histories, tool_choice validation, generated-call shapes), option resolution conflicts, completion prompt building, model matching, error bodies, id/key formats, and queue fairness/cancellation/concurrency limits. |
+| 46 serve tests *(test)* | Cover constant-time token comparison, context-overflow status mapping, routing (known/405/404), the SSE channel reader (EOF, chunk pumping, batching, heartbeat, unblocking on drop), sink interruption after reader drop, tool-call delta fields, streaming + non-streaming chat paths, empty-chunk tolerance, request parsing (content arrays, tool histories, tool_choice validation, generated-call shapes), option resolution conflicts, completion prompt building, model matching, error bodies, id/key formats, and queue fairness/cancellation/concurrency limits. |
 
 ### 10.23 Coverage notes & regeneration
 
-- **Coverage**: the tables above cover all 921 functions extracted from
-  `src/` — 682 runtime functions (including the 36 `extern` FFI declarations
-  that bind the C substrate) and 246 test-context functions. Every runtime
-  function carries an English `///` doc comment in source (extern
-  declarations a `//` line), per section 3. Where a
+- **Coverage**: the tables above cover all 924 functions extracted from
+  `src/` — 537 runtime functions (including the 16 `extern` FFI entry points
+  that bind the C substrate) and 387 test-context functions (test bodies and
+  their fixtures). Every runtime function carries an English `///` doc
+  comment in source (extern declarations a `//` line), per section 3. Where a
   codebase repeats one shape across families (the 7 × 6 trait-impl methods in
   the registration files, the per-family backend tables) the reference lists
   the repeated rows explicitly with the family named, so every function is
@@ -1108,6 +1112,11 @@ protocol-surface stubs).
   `chat_stream_emits_each_generated_chunk_without_copying_text`
   `non_stream_chat_converts_tool_json_and_falls_back_to_text`
   `sse_sink_ignores_empty_generated_chunks`
+
+**`src/serve/mcp.rs`** (7):
+  `initialize_returns_protocol_version_and_capability` `tools_list_catalogs_chat_generate_and_model_info`
+  `tools_call_routes_to_invoker` `unknown_tool_is_a_protocol_error` `protocol_level_cases`
+  `chat_generate_rejects_invalid_messages` `parse_error_carries_null_id`
 
 **`src/serve/mod.rs`** (10):
   `model_name_strips_safetensors` `model_id_from_stem` `loopback_checking`

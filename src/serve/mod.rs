@@ -1,6 +1,7 @@
 //! Cheetah's local OpenAI-compatible API service.
 
 mod http;
+mod mcp;
 mod openai;
 mod queue;
 

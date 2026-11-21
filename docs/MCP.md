@@ -2,67 +2,77 @@
 
 Cheetah supports MCP in **both directions**:
 
-1. **Cheetah as an MCP server** (`cheetah mcp <model-path>`): exposes the
-   loaded model to MCP agents over stdio. Any MCP client — Claude Desktop,
-   Cursor, or a scripted peer — spawns Cheetah and calls the
-   `chat_generate` tool to run generation through the model's chat template.
+1. **Cheetah as an MCP server** — built into `cheetah serve`: every serve
+   instance exposes the loaded model at `POST /mcp` (JSON-RPC 2.0) with no
+   extra configuration. Any MCP agent connects to `http://host:port/mcp`
+   and calls the `chat_generate` tool to run generation through the model's
+   chat template — the same server that answers the OpenAI API.
 2. **Cheetah as an MCP client** (`--mcp-server` / `--mcp-config` on chat and
    serve): connects to local MCP servers, lets the model call their tools,
    and executes server-side inside an agentic loop.
 
-Both directions speak the MCP stdio transport: newline-delimited JSON-RPC
-2.0 over the process's stdin/stdout.
+The server direction speaks MCP over HTTP (one JSON-RPC message per POST);
+the client direction spawns MCP servers over the stdio transport
+(newline-delimited JSON-RPC 2.0).
 
 ---
 
 ## 1. Cheetah as an MCP server (for agents)
 
 ```sh
-cheetah mcp <model-path> [--max-tokens N] [--temperature F]
-            [--mcp-server "name=command [args...]" | --mcp-config mcp.json]
+cheetah serve <model-path>   # OpenAI API + MCP protocol, nothing to configure
 ```
 
-Runs until the agent closes stdin (`Ctrl-C` also stops it). The loaded model
-is exposed as two tools:
+The loaded model is exposed as two tools:
 
 | Tool | Input | Returns |
 |---|---|---|
 | `chat_generate` | `{messages: [{role, content}], max_tokens?, temperature?}` | The assistant text, generated through the model's chat template |
 | `model_info` | `{}` | `{model_id, architecture, device}` as JSON text |
 
-### Agent configuration (Claude Desktop / any MCP client)
+### Agent configuration (any HTTP MCP client)
+
+Point the agent at the serve URL:
 
 ```json
 {
   "mcpServers": {
     "cheetah": {
-      "command": "/path/to/cheetah",
-      "args": ["mcp", "/path/to/model-prepared"]
+      "type": "streamable-http",
+      "url": "http://localhost:8080/mcp"
     }
   }
 }
 ```
 
-### Server behavior
+### Endpoint behavior
 
-- **Protocol**: JSON-RPC 2.0 over newline-delimited stdio, protocol version
-  `2024-11-05`; capabilities advertise `tools`. Malformed JSON lines answer
-  with a parse error and keep serving; unknown methods answer `-32601`.
+- **Transport**: `POST /mcp` with a JSON-RPC 2.0 message body; the response
+  is the JSON-RPC reply (`application/json`). One message per request —
+  the server is stateless, so agents need no session management. Requests
+  answer 200; notifications answer 202 with no body.
+- **Authentication**: the same Bearer contract as the OpenAI endpoints —
+  when `--api-key`/`--generate-key` is set, agents send
+  `Authorization: Bearer <key>` (loopback servers without a key accept
+  unauthenticated calls).
+- **Queue**: an MCP `tools/call` that generates holds a slot in the same
+  FIFO generation queue as the OpenAI endpoints — one model, one fair line.
+- **Protocol**: version `2024-11-05`; capabilities advertise `tools`.
+  Malformed JSON answers the JSON-RPC parse error (`-32700`, id null) and
+  keeps serving; unknown methods answer `-32601`.
 - **`tools/call` execution**: the messages render through the model's chat
   template (the agent controls `role`/`content`; the server applies the
   template and context limits). `max_tokens` and `temperature` override the
   server defaults per call. Execution failures surface as `isError: true`
   results — the agent sees them and can react.
-- **Nested tool calling**: the same `--mcp-server` / `--mcp-config` flags as
-  chat/serve work here — configured servers connect before the model loads
-  and their tools join `Engine::generate_tool_chat`, so `chat_generate` runs
-  the full agentic loop server-side (a model tool call executes against the
-  owning MCP server, the result feeds back, and the loop continues to a
-  plain answer, capped at 8 rounds). A malformed or hallucinated call that
-  matches no connected tool surfaces as plain text.
-- **stdout discipline**: the protocol channel carries JSON frames only; all
-  diagnostics go to stderr (tool executions appear as `[mcp] calling tool
-  '...'` lines).
+- **Nested tool calling**: when serve runs with `--mcp-server` /
+  `--mcp-config`, those servers' tools join the agentic loop — a model tool
+  call inside `chat_generate` executes against the owning MCP server, the
+  result feeds back, and the loop continues to a plain answer (capped at 8
+  rounds). A malformed or hallucinated call that matches no connected tool
+  surfaces as plain text.
+- **Diagnostics**: tool executions log `[mcp] calling tool '...'` lines on
+  stderr per round.
 
 ## 2. Cheetah as an MCP client (tool calling)
 
@@ -94,7 +104,8 @@ tool surface would silently corrupt tool calls.
 ## 3. How a request flows
 
 ```text
-request ──► tools = request-declared tools ∪ MCP tools (MCP names lose ties)
+OpenAI request ──► tools = request-declared tools ∪ MCP tools (MCP names lose ties)
+MCP tools/call ──► chat_generate: messages + the configured MCP tools
         ──► Engine::generate_tool_chat          (the agentic loop, ≤ 8 rounds)
               │  round r: tool instruction + conversation ──► generate
               │  parse the output into tool calls (chat::toolcalls shapes)
@@ -106,15 +117,16 @@ request ──► tools = request-declared tools ∪ MCP tools (MCP names lose t
               │     no  ──► return the calls to the caller
               │             (OpenAI clients execute them and send back
               │              role:"tool" messages — the client-driven
-              │              contract is unchanged)
+              │              contract is unchanged; the MCP endpoint
+              │              renders them as text — every tool is MCP-owned)
               └─ plain answer ──► final response
 ```
 
-- **MCP-owned calls execute server-side.** A streaming request never sees
-  the tool-call JSON: the engine's `ToolStreamSink` holds back everything
-  from the first `{` / code fence and the tool-loop round decision drops it.
-  The client only sees the final text deltas (or `tool_calls` frames for
-  client-owned calls).
+- **MCP-owned calls execute server-side.** A streaming OpenAI request never
+  sees the tool-call JSON: the engine's `ToolStreamSink` holds back
+  everything from the first `{` / code fence and the tool-loop round
+  decision drops it. The client only sees the final text deltas (or
+  `tool_calls` frames for client-owned calls).
 - **Client-declared calls keep the OpenAI contract.** If a round returns any
   call that is not an MCP tool, the calls return to the HTTP client as
   `tool_calls` — the client executes them and sends results back as
@@ -131,7 +143,7 @@ request ──► tools = request-declared tools ∪ MCP tools (MCP names lose t
 | Client | `src/mcp/client.rs` | JSON-RPC 2.0 over stdio: `initialize` handshake, `tools/list` (paginated), `tools/call`; id-correlated requests, 30s deadline, reader thread; server→client requests answered with a protocol error |
 | Registry | `src/mcp.rs` | Server configs → connected clients + flattened tool list; `tool_definitions()` renders OpenAI-style definitions; `call()` routes to the owning server (per-client mutex, `Arc`-shared across request workers); `Drop` kills children |
 | Agentic loop | `Engine::generate_tool_chat` | The round driver (MCP-agnostic — it routes calls to `Option<&McpRegistry>`) |
-| MCP **server** | `src/mcp_server.rs` | `cheetah mcp <model-path>`: exposes `chat_generate` / `model_info` tools to agents over stdio; loads the engine via `Engine::load` (protocol-only stdout) |
+| MCP **endpoint** | `src/serve/mcp.rs` | Serve's MCP surface: `POST /mcp` dispatch (`handle_request` is HTTP-free and generic over the invoker), the `chat_generate` / `model_info` catalog, per-request state borrowing the shared engine + generation ticket |
 | Streaming hold-back | `ToolStreamSink` (engine.rs) | Live text deltas with tool-call JSON held back until the round decision |
 
 The full function-level reference lives in
@@ -139,25 +151,29 @@ The full function-level reference lives in
 
 ## 5. Testing
 
-- `cargo test mcp` — protocol tests against a scripted transport (handshake
-  shape, pagination, content joining, `isError`, protocol-error replies,
-  server-error rejection), config/spec parsing, and an **end-to-end test
-  against a real stdio child process** (gated on `python3` being installed).
+- `cargo test mcp` — client protocol tests against a scripted transport
+  (handshake shape, pagination, content joining, `isError`, protocol-error
+  replies, server-error rejection), config/spec parsing, and an
+  **end-to-end test against a real stdio child process** (gated on
+  `python3` being installed).
+- `cargo test serve::mcp` — the MCP endpoint's protocol dispatch
+  (initialize shape, tools catalog, routing, notifications, unknown
+  methods/tools, argument validation) against a stubbed invoker.
 - `cargo test tool_stream` — the hold-back wrapper: braces/fences hold,
   plain text streams through, flush/drop at the round decision.
-- `cargo test mcp_server` — the server's protocol dispatch (initialize
-  shape, tools catalog, routing, notifications, unknown methods/tools,
-  argument validation) against a stubbed invoker.
 - Live verification: `cheetah serve ... --mcp-server "demo=python3
   /tmp/echo_mcp_server.py"` + a streaming request — heartbeats and content
   deltas arrive incrementally, and `[mcp] calling tool '...'` lines appear on
-  stderr per execution. Server side: pipe JSON-RPC lines into
-  `cheetah mcp <model>` (or connect any real MCP client) — see the
-  end-to-end patterns in this document.
+  stderr per execution. Server side: `POST /mcp` with an initialize /
+  tools/call line — see the patterns in §1.
 
 ## 6. Limitations
 
-- **stdio only** — no HTTP/SSE MCP transport yet.
+- **Client direction is stdio only** — no HTTP/SSE MCP client transport
+  yet. The server direction is HTTP only (no stdio spawn mode; agents
+  connect to the serve URL).
+- **Stateless server** — no MCP sessions (`Mcp-Session-Id` is neither
+  issued nor required); one JSON-RPC message per POST.
 - **Tools, not resources** — only `tools/list` / `tools/call` are consumed;
   MCP resources and prompts are ignored.
 - **No sampling** — server→client `sampling/createMessage` requests are
@@ -167,7 +183,7 @@ The full function-level reference lives in
 - **Duplicate tool names** across servers fail the registry build; an MCP
   tool name colliding with a request-declared tool is shadowed by the
   request's declaration.
-- **Server mode** (`cheetah mcp`): one model per server process; sequential
-  request processing (stdio agents issue one call at a time); nested MCP
-  servers (`--mcp-server` / `--mcp-config`) share the 8-round agentic cap;
-  Ant settings supported via the shared chat flags.
+- **Server direction** (`POST /mcp`): one model per serve instance; the MCP
+  tool calls share the OpenAI endpoints' FIFO generation queue; nested MCP
+  servers share the 8-round agentic cap; Ant settings apply via the shared
+  serve flags.

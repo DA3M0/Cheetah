@@ -11,6 +11,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,10 +36,12 @@ pub(crate) struct ServerState {
 }
 
 /// Whether an incoming request is a generation endpoint (POST
-/// `/v1/chat/completions` or `/v1/completions`, ignoring query strings and
-/// trailing slashes) — decides whether a queue ticket is taken.
+/// `/v1/chat/completions`, `/v1/completions`, or `/mcp` — an MCP
+/// `tools/call` may generate — ignoring query strings and trailing slashes)
+/// — decides whether a queue ticket is taken.
 pub(crate) fn is_generation_request(method: &Method, path: &str) -> bool {
-    method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions")
+    method == Method::POST
+        && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/mcp")
 }
 
 /// The request dispatcher: OPTIONS → CORS preflight, `/health` free of auth
@@ -117,6 +120,10 @@ pub(crate) async fn handle_any(state: Arc<ServerState>, request: Request) -> Res
             let ticket = generation_ticket.expect("generation request receives a queue ticket");
             handle_completions(state, request, ticket).await
         }
+        Ok(RouteEnum::Mcp) => {
+            let ticket = generation_ticket.expect("generation request receives a queue ticket");
+            handle_mcp(state, request, ticket).await
+        }
         Err(status) => error_response(
             status.as_u16(),
             if status == StatusCode::METHOD_NOT_ALLOWED {
@@ -137,6 +144,7 @@ enum RouteEnum {
     GetModel(String),
     ChatCompletions,
     Completions,
+    Mcp,
 }
 
 /// Route table: a known path with a wrong method is 405, anything unknown
@@ -161,12 +169,16 @@ fn route(method: &Method, path: &str) -> Result<RouteEnum, StatusCode> {
     if method == Method::POST && path == "/v1/completions" {
         return Ok(RouteEnum::Completions);
     }
+    if method == Method::POST && path == "/mcp" {
+        return Ok(RouteEnum::Mcp);
+    }
 
     let known = path == "/health"
         || path == "/v1/models"
         || path.starts_with("/v1/models/")
         || path == "/v1/chat/completions"
-        || path == "/v1/completions";
+        || path == "/v1/completions"
+        || path == "/mcp";
     if known {
         Err(StatusCode::METHOD_NOT_ALLOWED)
     } else {
@@ -245,6 +257,15 @@ fn error_response(status: u16, message: &str) -> Response {
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         error_body(status, message),
     )
+}
+
+/// A bare status response with CORS headers and no body (202 notifications).
+fn empty_response(status: StatusCode) -> Response {
+    let mut response = Response::builder().status(status);
+    for (name, value) in cors_headers() {
+        response = response.header(name, value);
+    }
+    response.body(Body::empty()).expect("empty response")
 }
 
 // ---- models endpoints ----
@@ -783,6 +804,46 @@ async fn handle_completions(
     })
     .unwrap_or_default();
     json_response(StatusCode::OK, body)
+}
+
+// ---- MCP endpoint ----
+
+/// `POST /mcp`: the MCP protocol on the same server as the OpenAI API — no
+/// flags needed. One JSON-RPC 2.0 message per request, dispatched from the
+/// same auth/queue contract (the Bearer check happened upstream; the
+/// request's ticket is acquired only when a tool call generates). Requests
+/// answer 200 with the JSON-RPC response, notifications answer 202 with no
+/// body, and malformed JSON answers the JSON-RPC parse error (id null).
+async fn handle_mcp(
+    state: Arc<ServerState>,
+    request: Request,
+    generation_ticket: QueueTicket,
+) -> Response {
+    let body = match axum::body::to_bytes(request.into_body(), BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(400, &format!("Failed to read request body: {error}"));
+        }
+    };
+    let message = match serde_json::from_slice::<Value>(&body) {
+        Ok(message) => message,
+        Err(error) => {
+            return json_response(
+                StatusCode::OK,
+                super::mcp::parse_error_response(&error).to_string(),
+            );
+        }
+    };
+    let response = tokio::task::spawn_blocking(move || {
+        let mut mcp_state = super::mcp::McpServeState::new(&state, generation_ticket);
+        super::mcp::handle_request(&message, &mut mcp_state)
+    })
+    .await
+    .expect("MCP dispatch task panicked");
+    match response {
+        Some(response) => json_response(StatusCode::OK, response.to_string()),
+        None => empty_response(StatusCode::ACCEPTED),
+    }
 }
 
 // ---- generation ----

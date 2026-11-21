@@ -1,98 +1,193 @@
-//! Cheetah as an MCP server: exposes the loaded model to MCP agents over
-//! stdio (newline-delimited JSON-RPC 2.0). Any MCP client — Claude Desktop,
-//! Cursor, or a scripted peer — spawns `cheetah mcp <model-path>` and calls
-//! the `chat_generate` tool to run generation through the model's chat
-//! template.
+//! The MCP surface of `cheetah serve`: the OpenAI-compatible HTTP API and
+//! the MCP protocol live on the same server — every serve instance exposes
+//! `POST /mcp` (JSON-RPC 2.0, one message per request) with no extra
+//! configuration, so any MCP agent can call the loaded model directly.
 //!
-//! Protocol channel discipline: **stdout carries protocol frames only.**
-//! The engine is loaded through `Engine::load` directly (the CLI wrapper's
-//! banners and spinner go elsewhere or are skipped), and every diagnostic
-//! here uses stderr.
+//! The protocol layer here (dispatch, tool catalog, argument validation) is
+//! HTTP-free: [`handle_request`] is generic over the tool-invoking state, so
+//! tests stub generation without loading a model.
 
 use crate::chat::toolcalls;
 use crate::chat::{ChatMessage, Engine, TextSink, ToolChoice};
 use crate::options::ChatOptions;
-use serde_json::Value;
-use serde_json::json;
+use crate::serve::queue::QueueTicket;
+use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io::{BufRead, StdoutLock, Write};
-use std::path::Path;
 use std::sync::Arc;
 
 /// Tools exposed to MCP agents.
 const CHAT_GENERATE_TOOL: &str = "chat_generate";
 const MODEL_INFO_TOOL: &str = "model_info";
 
-/// Per-call state: the loaded engine plus the session's generation defaults.
-pub(crate) struct McpServerState {
-    engine: Engine,
-    options: ChatOptions,
-    /// Connected MCP servers (`None` when none configured) — their tools
-    /// join the agentic loop, the same integration serve uses.
-    mcp: Option<Arc<crate::mcp::McpRegistry>>,
+/// A JSON-RPC parse-error response (id null) — a malformed request must not
+/// take the endpoint down.
+pub(crate) fn parse_error_response(error: &serde_json::Error) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": Value::Null,
+        "error": {"code": -32700, "message": format!("Parse error: {error}")},
+    })
 }
 
-/// Run the MCP stdio server: load the engine, then serve JSON-RPC requests
-/// from stdin until the stream closes (the agent exiting = shutdown).
-/// Responses are written to stdout, one per line, flushed immediately.
-pub(crate) fn run(
-    path: &Path,
-    options: &ChatOptions,
-    ant: Option<&crate::ant::AntSettings>,
-    mcp: Option<Arc<crate::mcp::McpRegistry>>,
-) -> Result<(), String> {
-    let engine = Engine::load(path, options.threads, options.ctx_size, ant)?;
-    let mut state = McpServerState {
-        engine,
-        options: options.clone(),
-        mcp,
-    };
+/// The state behind one `POST /mcp` request: borrows the server's shared
+/// model state and carries the request's generation ticket (acquired only
+/// when a tool call actually generates, so `tools/list` never holds a slot).
+pub(crate) struct McpServeState<'a> {
+    engine: &'a Engine,
+    default_options: &'a ChatOptions,
+    mcp: Option<&'a Arc<crate::mcp::McpRegistry>>,
+    ticket: Option<QueueTicket>,
+}
 
-    let stdin = std::io::stdin();
-    let mut stdout = stdout_lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|error| format!("Failed to read MCP request: {error}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: Value = match serde_json::from_str(&line) {
-            Ok(message) => message,
-            Err(error) => {
-                // Malformed JSON: answer with a parse error (id null) and
-                // keep serving — a chatty client must not kill the session.
-                let response = json!({
-                    "jsonrpc": "2.0", "id": Value::Null,
-                    "error": {"code": -32700, "message": format!("Parse error: {error}")},
-                });
-                write_response(&mut stdout, &response)?;
-                continue;
-            }
-        };
-        if let Some(response) = handle_request(&message, &mut state) {
-            write_response(&mut stdout, &response)?;
+impl<'a> McpServeState<'a> {
+    /// Builds the request state from the shared server state.
+    pub(crate) fn new(state: &'a super::http::ServerState, ticket: QueueTicket) -> Self {
+        Self {
+            engine: &state.engine,
+            default_options: &state.default_options,
+            mcp: state.mcp.as_ref(),
+            ticket: Some(ticket),
         }
     }
-    Ok(())
+
+    /// Render the conversation through the model's chat template, generate,
+    /// and return the assistant text. The generation slot is held for the
+    /// duration of the inference.
+    fn run_generation(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        options: &ChatOptions,
+    ) -> Result<String, String> {
+        let _guard = self.ticket.take().map(QueueTicket::acquire);
+
+        // When MCP servers are connected, the agentic loop runs (the model
+        // calls MCP tools server-side and the results feed back) — the same
+        // generation path the OpenAI endpoints use. Without servers, plain
+        // generation.
+        let Some(mcp) = self.mcp else {
+            let mut messages = messages;
+            let (tokens, _) =
+                self.engine
+                    .prepare(&mut messages, None, options.max_tokens)?;
+            let mut context = self.engine.new_context()?;
+            let mut sink = DiscardSink;
+            let generation = self.engine.generate(
+                &mut context,
+                &tokens,
+                options,
+                &[],
+                &mut sink,
+                &HashSet::new(),
+            )?;
+            return Ok(generation.text);
+        };
+
+        // Agentic path (shares serve's Engine::generate_tool_chat): MCP tool
+        // calls execute server-side, results feed back, the loop continues
+        // until a plain answer (or the round cap).
+        let tools = mcp.tool_definitions();
+        let tools_json = serde_json::to_string(&tools)
+            .map_err(|error| format!("Failed to serialize MCP tools: {error}"))?;
+        let messages_json = serde_json::to_string(
+            &messages
+                .iter()
+                .map(
+                    |message| serde_json::json!({"role": message.role, "content": message.content}),
+                )
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| format!("Failed to serialize messages: {error}"))?;
+        let mut sink = DiscardSink;
+        let (_, response) = self.engine.generate_tool_chat(
+            &messages_json,
+            &tools_json,
+            &tools,
+            ToolChoice::Auto,
+            &toolcalls::ResolvedToolChoice::Auto,
+            options.max_tokens,
+            options,
+            &[],
+            &mut sink,
+            &HashSet::new(),
+            Some(mcp),
+        )?;
+        // With only MCP tools available the loop always ends in a plain
+        // answer; a hallucinated call matching no connected tool surfaces as
+        // text (the agent sees what the model emitted).
+        match response {
+            crate::chat::toolcalls::ToolResponse::Text(text) => Ok(text),
+            crate::chat::toolcalls::ToolResponse::Calls(calls) => {
+                Ok(serde_json::to_string(&calls).unwrap_or_default())
+            }
+        }
+    }
 }
 
-fn write_response(stdout: &mut StdoutLock<'static>, response: &Value) -> Result<(), String> {
-    let line = serde_json::to_string(response)
-        .map_err(|error| format!("Failed to serialize MCP response: {error}"))?;
-    writeln!(stdout, "{line}")
-        .and_then(|()| stdout.flush())
-        .map_err(|error| format!("Failed to write MCP response: {error}"))
+/// The tool-invoking surface of the server state — split out so protocol
+/// tests can stub generation without loading a model.
+pub(crate) trait McpStateLike {
+    fn invoke_tool(&mut self, params: &Value) -> Result<Value, Value>;
+}
+
+impl McpStateLike for McpServeState<'_> {
+    /// Tool-call dispatch: parse the arguments, execute, and return the MCP
+    /// result. Per the MCP contract, execution failures surface as
+    /// `isError: true` results (the agent sees them); only argument/
+    /// routing problems are JSON-RPC errors.
+    fn invoke_tool(&mut self, params: &Value) -> Result<Value, Value> {
+        let name = params.get("name").and_then(Value::as_str).ok_or_else(
+            || json!({"code": -32602, "message": "tools/call is missing a tool name."}),
+        )?;
+        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+        match name {
+            CHAT_GENERATE_TOOL => {
+                let messages = parse_tool_messages(&arguments)
+                    .map_err(|message| json!({"code": -32602, "message": message}))?;
+                let mut options = self.default_options.clone();
+                if let Some(max_tokens) = arguments.get("max_tokens").and_then(Value::as_u64) {
+                    options.max_tokens = usize::try_from(max_tokens).map_err(
+                        |_| json!({"code": -32602, "message": "max_tokens does not fit usize."}),
+                    )?;
+                }
+                if let Some(temperature) = arguments.get("temperature").and_then(Value::as_f64) {
+                    if !(0.0..=2.0).contains(&temperature) {
+                        return Err(
+                            json!({"code": -32602, "message": "temperature must be between 0 and 2."}),
+                        );
+                    }
+                    options.temperature = temperature;
+                }
+                let text = self
+                    .run_generation(messages, &options)
+                    .map_err(|message| json!({"code": -32602, "message": message}))?;
+                Ok(json!({
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false,
+                }))
+            }
+            MODEL_INFO_TOOL => {
+                let info = json!({
+                    "model_id": self.engine.model_id(),
+                    "architecture": self.engine.model_architecture(),
+                    "device": self.engine.device_name(),
+                });
+                Ok(json!({
+                    "content": [{"type": "text", "text": info.to_string()}],
+                    "isError": false,
+                }))
+            }
+            other => Err(json!({
+                "code": -32602,
+                "message": format!("Unknown tool: {other}"),
+            })),
+        }
+    }
 }
 
 /// Protocol dispatch: returns the JSON-RPC response for a request, or `None`
 /// for notifications (no id → nothing to answer). The tool-invoking arm
-/// delegates to [`McpServerState::invoke_tool`].
-/// The tool-invoking surface of the server state — split out so protocol
-/// tests can stub generation without loading a model.
-trait McpServerStateLike {
-    fn invoke_tool(&mut self, params: &Value) -> Result<Value, Value>;
-}
-
-fn handle_request<S: McpServerStateLike>(message: &Value, state: &mut S) -> Option<Value> {
+/// delegates to [`McpStateLike::invoke_tool`].
+pub(crate) fn handle_request<S: McpStateLike>(message: &Value, state: &mut S) -> Option<Value> {
     let id = message.get("id").cloned()?;
     let method = message.get("method").and_then(Value::as_str)?;
     let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -160,131 +255,6 @@ fn tools_list_result() -> Value {
     ]})
 }
 
-impl McpServerState {
-    /// Render the conversation through the model's chat template, generate,
-    /// and return the assistant text.
-    fn run_generation(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        options: &ChatOptions,
-    ) -> Result<String, String> {
-        // When MCP servers are connected, the agentic loop runs (the model
-        // calls MCP tools server-side and the results feed back) — the same
-        // generation path serve uses. Without servers, plain generation.
-        let Some(mcp) = &self.mcp else {
-            let (tokens, _) =
-                self.engine
-                    .prepare(&mut messages.clone(), None, options.max_tokens)?;
-            let mut context = self.engine.new_context()?;
-            let mut sink = DiscardSink;
-            let generation = self.engine.generate(
-                &mut context,
-                &tokens,
-                options,
-                &[],
-                &mut sink,
-                &HashSet::new(),
-            )?;
-            return Ok(generation.text);
-        };
-
-        // Agentic path (shares serve's Engine::generate_tool_chat): MCP tool
-        // calls execute server-side, results feed back, the loop continues
-        // until a plain answer (or the round cap).
-        let tools = mcp.tool_definitions();
-        let tools_json = serde_json::to_string(&tools)
-            .map_err(|error| format!("Failed to serialize MCP tools: {error}"))?;
-        let messages_json = serde_json::to_string(
-            &messages
-                .iter()
-                .map(
-                    |message| serde_json::json!({"role": message.role, "content": message.content}),
-                )
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| format!("Failed to serialize messages: {error}"))?;
-        let mut sink = DiscardSink;
-        let (_, response) = self.engine.generate_tool_chat(
-            &messages_json,
-            &tools_json,
-            &tools,
-            ToolChoice::Auto,
-            &toolcalls::ResolvedToolChoice::Auto,
-            options.max_tokens,
-            options,
-            &[],
-            &mut sink,
-            &HashSet::new(),
-            Some(mcp),
-        )?;
-        // In MCP server mode every tool is MCP-owned, so the loop always
-        // ends with a plain answer; a hallucinated non-MCP call surfaces as
-        // text (the agent sees what the model emitted).
-        match response {
-            crate::chat::toolcalls::ToolResponse::Text(text) => Ok(text),
-            crate::chat::toolcalls::ToolResponse::Calls(calls) => {
-                Ok(serde_json::to_string(&calls).unwrap_or_default())
-            }
-        }
-    }
-}
-
-impl McpServerStateLike for McpServerState {
-    /// Tool-call dispatch: parse the arguments, execute, and return the MCP
-    /// result. Per the MCP contract, execution failures surface as
-    /// `isError: true` results (the agent sees them); only argument/
-    /// routing problems are JSON-RPC errors.
-    fn invoke_tool(&mut self, params: &Value) -> Result<Value, Value> {
-        let name = params.get("name").and_then(Value::as_str).ok_or_else(
-            || json!({"code": -32602, "message": "tools/call is missing a tool name."}),
-        )?;
-        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-        match name {
-            CHAT_GENERATE_TOOL => {
-                let messages = parse_tool_messages(&arguments)
-                    .map_err(|message| json!({"code": -32602, "message": message}))?;
-                let mut options = self.options.clone();
-                if let Some(max_tokens) = arguments.get("max_tokens").and_then(Value::as_u64) {
-                    options.max_tokens = usize::try_from(max_tokens).map_err(
-                        |_| json!({"code": -32602, "message": "max_tokens does not fit usize."}),
-                    )?;
-                }
-                if let Some(temperature) = arguments.get("temperature").and_then(Value::as_f64) {
-                    if !(0.0..=2.0).contains(&temperature) {
-                        return Err(
-                            json!({"code": -32602, "message": "temperature must be between 0 and 2."}),
-                        );
-                    }
-                    options.temperature = temperature;
-                }
-                let text = self
-                    .run_generation(messages, &options)
-                    .map_err(|message| json!({"code": -32602, "message": message}))?;
-                Ok(json!({
-                    "content": [{"type": "text", "text": text}],
-                    "isError": false,
-                }))
-            }
-            MODEL_INFO_TOOL => {
-                let info = json!({
-                    "model_id": self.engine.model_id(),
-                    "architecture": self.engine.model_architecture(),
-                    "device": self.engine.device_name(),
-                });
-                Ok(json!({
-                    "content": [{"type": "text", "text": info.to_string()}],
-                    "isError": false,
-                }))
-            }
-            other => Err(json!({
-                "code": -32602,
-                "message": format!("Unknown tool: {other}"),
-            })),
-        }
-    }
-}
-
 /// Discards streamed deltas — the MCP tool result carries `generation.text`
 /// (captured because [`TextSink::capture_text`] defaults to true).
 struct DiscardSink;
@@ -340,7 +310,7 @@ mod tests {
         }
     }
 
-    impl McpServerStateLike for StubInvoker {
+    impl McpStateLike for StubInvoker {
         fn invoke_tool(&mut self, params: &Value) -> Result<Value, Value> {
             let name = params
                 .get("name")
@@ -460,10 +430,13 @@ mod tests {
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].role, "user");
     }
-}
 
-/// Hold the process-wide stdout lock for the whole session (the MCP loop is
-/// the only writer; a scoped lock would fight the `stdin.lock()` lifetime).
-fn stdout_lock() -> StdoutLock<'static> {
-    std::io::stdout().lock()
+    /// A malformed request yields the JSON-RPC parse error with id null.
+    #[test]
+    fn parse_error_carries_null_id() {
+        let error = serde_json::from_str::<Value>("{not json").unwrap_err();
+        let response = parse_error_response(&error);
+        assert_eq!(response["id"], Value::Null);
+        assert_eq!(response["error"]["code"], -32700);
+    }
 }
