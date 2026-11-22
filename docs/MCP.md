@@ -50,7 +50,10 @@ Point the agent at the serve URL:
 - **Transport**: `POST /mcp` with a JSON-RPC 2.0 message body; the response
   is the JSON-RPC reply (`application/json`). One message per request —
   the server is stateless, so agents need no session management. Requests
-  answer 200; notifications answer 202 with no body.
+  answer 200; notifications answer 202 with no body; `GET /mcp` answers
+  405 (there is no SSE listen channel — agents must use an HTTP MCP client
+  that accepts plain-JSON replies, e.g. a `streamable-http`-type
+  connection; SSE-only 2024-11-05 clients cannot interop).
 - **Authentication**: the same Bearer contract as the OpenAI endpoints —
   when `--api-key`/`--generate-key` is set, agents send
   `Authorization: Bearer <key>` (loopback servers without a key accept
@@ -61,10 +64,18 @@ Point the agent at the serve URL:
   Malformed JSON answers the JSON-RPC parse error (`-32700`, id null) and
   keeps serving; unknown methods answer `-32601`.
 - **`tools/call` execution**: the messages render through the model's chat
-  template (the agent controls `role`/`content`; the server applies the
-  template and context limits). `max_tokens` and `temperature` override the
-  server defaults per call. Execution failures surface as `isError: true`
-  results — the agent sees them and can react.
+  template with no system-prompt injection (the agent owns `role`/`content`;
+  the server applies the template and context limits). `max_tokens`
+  overrides the server budget per call; `temperature` must be within
+  `0..=2` (out-of-range values answer `-32602`). Execution failures
+  surface as `isError: true` results — the agent sees them and can react.
+- **Performance**: serve warms the model up before binding, and generation
+  runs through the KV prefix cache — a `chat_generate` call whose messages
+  extend a recently prefilled conversation skips re-prefilling the shared
+  history. Measured on qwen-0.5b (~1.4k-token prompt): repeat/multi-turn
+  calls answer in ~0.2–0.5 s where a cold prompt takes ~75 s
+  (docs/CODEBASE.md §2.2 has the full numbers). The cache is engine-level
+  (LRU, ≤ 4 entries), so agents get the reuse without any session protocol.
 - **Nested tool calling**: when serve runs with `--mcp-server` /
   `--mcp-config`, those servers' tools join the agentic loop — a model tool
   call inside `chat_generate` executes against the owning MCP server, the
@@ -147,7 +158,7 @@ MCP tools/call ──► chat_generate: messages + the configured MCP tools
 | Streaming hold-back | `ToolStreamSink` (engine.rs) | Live text deltas with tool-call JSON held back until the round decision |
 
 The full function-level reference lives in
-[CODING_STANDARDS.md](CODING_STANDARDS.md) §10.19–10.20.
+[CODING_STANDARDS.md](CODING_STANDARDS.md) §10.19–10.20b.
 
 ## 5. Testing
 
@@ -171,9 +182,11 @@ The full function-level reference lives in
 
 - **Client direction is stdio only** — no HTTP/SSE MCP client transport
   yet. The server direction is HTTP only (no stdio spawn mode; agents
-  connect to the serve URL).
+  connect to the serve URL; `GET /mcp` is 405 — no SSE listen channel).
 - **Stateless server** — no MCP sessions (`Mcp-Session-Id` is neither
-  issued nor required); one JSON-RPC message per POST.
+  issued nor required); one JSON-RPC message per POST. Engine-level KV
+  prefix reuse still applies across calls automatically (see §1
+  Performance) — reuse is keyed on the token prefix, not on a session.
 - **Tools, not resources** — only `tools/list` / `tools/call` are consumed;
   MCP resources and prompts are ignored.
 - **No sampling** — server→client `sampling/createMessage` requests are

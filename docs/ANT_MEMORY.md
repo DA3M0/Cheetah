@@ -590,8 +590,29 @@ Lessons worth keeping:
 | Vulkan GT 730M, BF16 bucketed residency | 0.47 | resident matmul skips weight copy |
 | Vulkan GT 730M, Q8 bucketed residency | ~0.5 (est.) | halved weight footprint; Kepler shader-limited |
 
-Memory (16M/32M tiered): steady RSS **123 MB**, inference peak **152 MB**
-(lm_head chunked with per-chunk page release), vs Candle 2,497/3,704 MB.
+Memory is an idle baseline that inference climbs away from slowly — not a
+single steady number (serve, qwen-0.5b-prepared, ~1.4k-token prompt, v1.2.0):
+
+| Plan | idle RSS | warmup transient (HWM) | inference peak (HWM) | after request |
+|------|----------|------------------------|----------------------|---------------|
+| 16M/32M tiered (rest disk) | **123 MB** | 152 MB (per-layer drop releases it before the listener binds) | **~255 MB** | ~210 MB |
+| RAM-tier plan: 16M VRAM / 512M RAM (rest disk) | **~603 MB** | ~630 MB | **~735 MB** | ~689 MB |
+| **default** — full-resident, 8G/16G budgets (measured via a model preset and with no preset file — identical; Ant is enabled by default) | **~1.0 GB** | ≈ idle | **~1.12 GB** | ~1.10 GB |
+
+Idle RSS ≈ resident plan bytes (VRAM + RAM tiers; disk tier ≈ 0 until touched)
++ ~70 MB runtime. The growth over idle is the KV cache (~35 MB at this length)
+plus the KV prefix-cache snapshot (≤ ~25 MB), chunked-prefill working buffers
+and allocator retention. vs Candle 2,497/3,704 MB (F32 materialized).
+
+Startup timeline (0.2 s sampling, full-resident): spawn ~24 MB → load window
+~50–62 MB (weights mmap'd untouched — the transient "cold" shape one can
+catch with a monitor before warmup finishes) → warmup faults everything in →
+idle baseline, flat for 200 s idle with no memory pressure. Clean file pages
+are kernel-reclaimable under pressure and re-fault from the page cache, so a
+pressured host can see the idle baseline decay and then climb again during
+inference. The warmup raises the full-resident idle baseline from the
+~50–62 MB load shape to the resident size (TTFT-vs-idle-RAM trade); tiered
+plans keep their small idle either way.
 
 Ant tiering overhead vs full-resident: ~10 % (page-cache re-faults; per-layer
 `DONTNEED` keeps transients to one layer plus the chunked lm_head sweep).
