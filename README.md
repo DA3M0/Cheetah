@@ -268,7 +268,7 @@ cheetah /path/to/prepared-model --system "You are a concise assistant."
 | `--mcp-server name=cmd [args...]` | None | Connect one MCP stdio server; its tools are offered to the model and executed server-side in the agentic loop (repeatable) |
 | `--mcp-config <path>` | None | JSON file: `{servers: [{name, command, args: [...]}]}` (once); see [docs/MCP.md](docs/MCP.md) |
 
-After each reply, interactive chat displays the number of generated tokens and decoding speed in tokens per second. The speed excludes prompt prefill; it is unavailable when no tokens are generated.
+After each reply, interactive chat displays the number of generated tokens, the decoding speed in tokens per second, and the prefill window (prompt tokens and wall time). The speed excludes prompt prefill and queueing; it is unavailable when no tokens are generated.
 
 At the chat prompt, use `/exit` or `/quit` to leave, `/clear` to reset the conversation, `/save <name>` to save it, and `/help` to list chat commands. `Ctrl-C` interrupts the current generation; `Ctrl-D` exits.
 
@@ -387,6 +387,7 @@ Chat options can also be supplied to `serve` to set generation defaults. Without
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Chat completions, including SSE streaming with `stream: true` |
 | `POST` | `/v1/completions` | Non-streaming text completion; the prompt is treated as one user message |
+| `POST` | `/mcp` | MCP JSON-RPC 2.0 server endpoint (`initialize`, `tools/list`, `tools/call` with `chat_generate`/`model_info`); see [docs/MCP.md](docs/MCP.md) §1 |
 | `GET` | `/v1/models` | List the loaded model |
 | `GET` | `/v1/models/:id` | Get the loaded model |
 | `GET` | `/health` | Health check; no authentication required |
@@ -443,7 +444,7 @@ Model inference requires enough system or GPU memory for the weights, context, a
 Contributions are welcome — the codebase is structured so the common tasks are mechanical:
 
 - **Add a native model family** (highest value): add a registration file in `src/chat/registrations/` (build.rs picks it up and regenerates the registry) that declares the family's capability **and implements its `ModelForward` assembly** — the layer stacking composes the shared `OpsToolbox` ops, so a new shape is new composition, not core-code changes. Extend the native forward-parity tests. Step-by-step: [docs/REGISTRY.md](docs/REGISTRY.md) §4 and [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11. Reference files: llama (baseline), qwen3 (per-head q/k RMSNorm), mistral (sliding window), gemma (offset norms + embedding scale + GeGLU), phi (LayerNorm + parallel residual + fused projections), mixtral (sparse MoE).
-- **Kernels / memory control**: the hot path is the fused BF16 gemv in `src/chat/native/ops.rs` — the OpsToolbox module (AVX2 intrinsics with a portable fallback; `native/kernels.rs` re-exports it for compatibility); Ant page control lives in `native/store.rs`. Isolation tests and the native forward-parity checks guard correctness.
+- **Kernels / memory control**: the compute hot paths are the fused BF16 gemv (decode) and the blocked multi-token GEMM (chunked prefill) in `src/chat/native/ops.rs` — the OpsToolbox module (AVX2 intrinsics with a portable fallback; `native/kernels.rs` re-exports it for compatibility); Ant page control lives in `native/store.rs`. Isolation tests and the native forward-parity checks guard correctness.
 - **Server / CLI work**: `src/serve/` and `src/cli.rs` are self-contained.
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) (workflows, debugging toolbox, error-message cheat sheet, review checklist) and the [repository map](docs/CODEBASE.md). Model-specific Vulkan compute shaders (optional `src/chat/registrations/<name>.comp`) are discovered at build time and exposed through the generated shader registry.
