@@ -41,8 +41,7 @@ pub(crate) struct ServerState {
 /// `tools/call` may generate — ignoring query strings and trailing slashes)
 /// — decides whether a queue ticket is taken.
 pub(crate) fn is_generation_request(method: &Method, path: &str) -> bool {
-    method == Method::POST
-        && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/mcp")
+    method == Method::POST && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/mcp")
 }
 
 /// The request dispatcher: OPTIONS → CORS preflight, `/health` free of auth

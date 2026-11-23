@@ -456,9 +456,21 @@ unsafe fn dot_row_bf16_avx2_multi(
         // reuse lane 0 — the extra FMAs land in accumulators that are never
         // reduced into `out`.
         let base0 = x.as_ptr().add(token_start * cols);
-        let base1 = if token_count > 1 { x.as_ptr().add((token_start + 1) * cols) } else { base0 };
-        let base2 = if token_count > 2 { x.as_ptr().add((token_start + 2) * cols) } else { base0 };
-        let base3 = if token_count > 3 { x.as_ptr().add((token_start + 3) * cols) } else { base0 };
+        let base1 = if token_count > 1 {
+            x.as_ptr().add((token_start + 1) * cols)
+        } else {
+            base0
+        };
+        let base2 = if token_count > 2 {
+            x.as_ptr().add((token_start + 2) * cols)
+        } else {
+            base0
+        };
+        let base3 = if token_count > 3 {
+            x.as_ptr().add((token_start + 3) * cols)
+        } else {
+            base0
+        };
         for (chunk_index, chunk) in full.iter().enumerate() {
             let w = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
             let lo = _mm256_castsi256_si128(w);
@@ -480,16 +492,12 @@ unsafe fn dot_row_bf16_avx2_multi(
         let full_count = full.len() * 16;
         let tails = tail.as_chunks::<2>().0;
         let mut results = [0f32; GEMM_TOKEN_GROUP];
-        let accs = [
-            [a00, a01],
-            [a10, a11],
-            [a20, a21],
-            [a30, a31],
-        ];
+        let accs = [[a00, a01], [a10, a11], [a20, a21], [a30, a31]];
         // Only the active lanes reduce: inactive lanes' accumulators hold
         // recomputed lane-0 values and their x rows may not exist.
         for (token_in_group, slot) in results[..token_count].iter_mut().enumerate() {
-            let x_row = &x[(token_start + token_in_group) * cols..(token_start + token_in_group + 1) * cols];
+            let x_row = &x
+                [(token_start + token_in_group) * cols..(token_start + token_in_group + 1) * cols];
             let mut tail_total = 0f32;
             for (index, byte_pair) in tails.iter().enumerate() {
                 let x_index = full_count + index;
@@ -1385,8 +1393,16 @@ impl OpsToolbox {
                 .into_par_iter()
                 .map(|head| {
                     Self::attention_head(
-                        keys, values, q, cache_len, window_start, kv_dim, head_group, head_dim,
-                        scale, head,
+                        keys,
+                        values,
+                        q,
+                        cache_len,
+                        window_start,
+                        kv_dim,
+                        head_group,
+                        head_dim,
+                        scale,
+                        head,
                     )
                 })
                 .collect()
@@ -1394,8 +1410,16 @@ impl OpsToolbox {
             (0..q_heads)
                 .map(|head| {
                     Self::attention_head(
-                        keys, values, q, cache_len, window_start, kv_dim, head_group, head_dim,
-                        scale, head,
+                        keys,
+                        values,
+                        q,
+                        cache_len,
+                        window_start,
+                        kv_dim,
+                        head_group,
+                        head_dim,
+                        scale,
+                        head,
                     )
                 })
                 .collect()
@@ -1769,17 +1793,12 @@ mod tests {
         }
 
         // Non-bf16 dtypes fall back to per-row gemv — must match trivially.
-        let weight_f32: Vec<u8> = weight.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let weight_f32: Vec<u8> = weight
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
         let mut y_f32 = vec![0f32; n * rows];
-        gemm(
-            &weight_f32,
-            WeightDType::F32,
-            rows,
-            cols,
-            &x,
-            n,
-            &mut y_f32,
-        );
+        gemm(&weight_f32, WeightDType::F32, rows, cols, &x, n, &mut y_f32);
         for token in 0..n {
             let mut y_gemv = vec![0f32; rows];
             gemv(

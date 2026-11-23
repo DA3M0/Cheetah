@@ -1864,7 +1864,10 @@ mod forward_tests {
     /// 与逐位置路径逐比特一致，含非零 offset 续算（前缀复用的真实形态）。
     fn assert_chunked_prefill_matches_per_position(
         fixture: &Fixture,
-        make: impl Fn(DecoderConfig, Arc<crate::chat::native::store::MmapWeightStore>) -> Box<dyn crate::chat::registry::ModelForward>,
+        make: impl Fn(
+            DecoderConfig,
+            Arc<crate::chat::native::store::MmapWeightStore>,
+        ) -> Box<dyn crate::chat::registry::ModelForward>,
         cfg: impl Fn() -> DecoderConfig,
     ) {
         let tokens: Vec<u32> = (0..53u32).map(|i| (i * 7 + 3) % 32).collect();
@@ -1900,41 +1903,51 @@ mod forward_tests {
     #[test]
     fn llama_chunked_prefill_matches_per_position_bit_exact() {
         let fixture = Fixture::new("llama_chunk", FeedForward::Dense, true);
-        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
-            Box::new(LlamaNative::with_store(cfg, store))
-        }, || dense_config(0));
+        assert_chunked_prefill_matches_per_position(
+            &fixture,
+            |cfg, store| Box::new(LlamaNative::with_store(cfg, store)),
+            || dense_config(0),
+        );
     }
 
     #[test]
     fn qwen3_chunked_prefill_matches_per_position_bit_exact() {
         let fixture = Fixture::new("qwen3_chunk", FeedForward::Dense, true);
-        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
-            Box::new(Qwen3Native::with_store(cfg, store))
-        }, || dense_config(0));
+        assert_chunked_prefill_matches_per_position(
+            &fixture,
+            |cfg, store| Box::new(Qwen3Native::with_store(cfg, store)),
+            || dense_config(0),
+        );
     }
 
     #[test]
     fn mistral_chunked_prefill_matches_per_position_bit_exact() {
         let fixture = Fixture::new("mistral_chunk", FeedForward::Dense, true);
-        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
-            Box::new(MistralNative::with_store(cfg, store))
-        }, || dense_config(0));
+        assert_chunked_prefill_matches_per_position(
+            &fixture,
+            |cfg, store| Box::new(MistralNative::with_store(cfg, store)),
+            || dense_config(0),
+        );
     }
 
     #[test]
     fn gemma_chunked_prefill_matches_per_position_bit_exact() {
         let fixture = Fixture::new("gemma_chunk", FeedForward::Dense, true);
-        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
-            Box::new(GemmaNative::with_store(cfg, store))
-        }, || dense_config(0));
+        assert_chunked_prefill_matches_per_position(
+            &fixture,
+            |cfg, store| Box::new(GemmaNative::with_store(cfg, store)),
+            || dense_config(0),
+        );
     }
 
     #[test]
     fn phi_chunked_prefill_matches_per_position_bit_exact() {
         let fixture = Fixture::phi("phi_chunk", true);
-        assert_chunked_prefill_matches_per_position(&fixture, |cfg, store| {
-            Box::new(PhiNative::with_store(cfg, store))
-        }, phi_config);
+        assert_chunked_prefill_matches_per_position(
+            &fixture,
+            |cfg, store| Box::new(PhiNative::with_store(cfg, store)),
+            phi_config,
+        );
     }
     // --- 一次性性能分解基准（`cargo test --release bench_prefill -- --ignored --nocapture`）---
 
@@ -1965,7 +1978,15 @@ mod forward_tests {
         let rounds = 20;
         let started = std::time::Instant::now();
         for _ in 0..rounds {
-            ops::gemm(&weight, crate::chat::native::store::WeightDType::Bf16, rows, cols, &x, n, &mut y);
+            ops::gemm(
+                &weight,
+                crate::chat::native::store::WeightDType::Bf16,
+                rows,
+                cols,
+                &x,
+                n,
+                &mut y,
+            );
         }
         let gemm_s = started.elapsed().as_secs_f64() / rounds as f64;
         println!(
@@ -2027,5 +2048,4 @@ mod forward_tests {
             attn_macs / attn_s / 1e9
         );
     }
-
 }

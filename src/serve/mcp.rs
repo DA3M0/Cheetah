@@ -65,9 +65,9 @@ impl<'a> McpServeState<'a> {
         // generation.
         let Some(mcp) = self.mcp else {
             let mut messages = messages;
-            let (tokens, _) =
-                self.engine
-                    .prepare(&mut messages, None, options.max_tokens)?;
+            let (tokens, _) = self
+                .engine
+                .prepare(&mut messages, None, options.max_tokens)?;
             let mut context = self.engine.new_context()?;
             let mut sink = DiscardSink;
             let generation = self.engine.generate(

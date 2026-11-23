@@ -2262,9 +2262,7 @@ fn sample_token(
         // in O(V), then sort only those — a full-vocabulary sort dominated
         // per-token sampling cost at Qwen-scale vocabularies.
         let k = options.top_k;
-        order.select_nth_unstable_by(k, |left, right| {
-            scores[*right].total_cmp(&scores[*left])
-        });
+        order.select_nth_unstable_by(k, |left, right| scores[*right].total_cmp(&scores[*left]));
         order[..k].sort_unstable_by(|left, right| scores[*right].total_cmp(&scores[*left]));
         order.truncate(k);
     } else if options.top_p < 1.0 {
@@ -2781,7 +2779,11 @@ mod prefix_cache_tests {
         KvSnapshot {
             positions,
             kv_k: (0..layers)
-                .map(|layer| (0..positions * 4).map(|i| (layer * 1000 + i) as f32).collect())
+                .map(|layer| {
+                    (0..positions * 4)
+                        .map(|i| (layer * 1000 + i) as f32)
+                        .collect()
+                })
                 .collect(),
             kv_v: (0..layers)
                 .map(|layer| {
@@ -2810,7 +2812,9 @@ mod prefix_cache_tests {
         let tokens: Vec<u32> = (1..=16).collect();
         let mut cache = entry_cache(&tokens, 16);
         let prompt: Vec<u32> = (1..=20).collect();
-        let (shared, snap) = cache.longest_prefix(&prompt).expect("extended history must hit");
+        let (shared, snap) = cache
+            .longest_prefix(&prompt)
+            .expect("extended history must hit");
         assert_eq!(shared, 16);
         assert_eq!(snap.positions, 16);
 
@@ -2821,7 +2825,11 @@ mod prefix_cache_tests {
         assert_eq!(shared, 15, "full hits keep one token to forward");
 
         // Disjoint history must not match.
-        assert!(cache.longest_prefix(&(100..104).collect::<Vec<u32>>()).is_none());
+        assert!(
+            cache
+                .longest_prefix(&(100..104).collect::<Vec<u32>>())
+                .is_none()
+        );
     }
 
     /// Short shared prefixes and below-threshold prompts are rejected: reuse

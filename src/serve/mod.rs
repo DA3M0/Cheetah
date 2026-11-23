@@ -70,10 +70,7 @@ pub fn serve(
     )?;
     // Warm up before the listener binds: the first request must not pay the
     // mmap cold start.
-    eprintln!(
-        "{}",
-        color::stderr("Warming up model...", Color::Cyan)
-    );
+    eprintln!("{}", color::stderr("Warming up model...", Color::Cyan));
     engine.warmup()?;
     let api_key = resolve_api_key(&options)?;
 
