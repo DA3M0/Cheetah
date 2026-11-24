@@ -575,12 +575,7 @@ impl PrefixCache {
     /// Inserts a post-prefill snapshot for `tokens`, evicting
     /// least-recently-used entries until both budgets hold.
     fn insert(&mut self, tokens: Vec<u32>, snapshot: KvSnapshot) {
-        let bytes = snapshot
-            .kv_k
-            .iter()
-            .chain(snapshot.kv_v.iter())
-            .map(|layer| layer.len() * std::mem::size_of::<f32>())
-            .sum();
+        let bytes = snapshot.storage_bytes();
         self.entries.push_back(PrefixCacheEntry {
             tokens,
             snapshot: Arc::new(snapshot),
@@ -2792,6 +2787,7 @@ mod prefix_cache_tests {
                         .collect()
                 })
                 .collect(),
+            q8: None,
         }
     }
 
@@ -2801,6 +2797,33 @@ mod prefix_cache_tests {
         };
         cache.insert(tokens.to_vec(), snapshot(positions, 2));
         cache
+    }
+
+    /// A Q8 snapshot's prefix-cache accounting must charge the int8 codes plus
+    /// the scale head, not a phantom f32 expansion.
+    #[test]
+    fn quantized_snapshot_bytes_count_codes_and_scales() {
+        let layer = || crate::chat::registry::QuantizedKvLayer {
+            codes: vec![7; 16],
+            scales: vec![0.5; 2],
+        };
+        let snapshot = KvSnapshot {
+            positions: 2,
+            kv_k: Vec::new(),
+            kv_v: Vec::new(),
+            q8: Some(crate::chat::registry::QuantizedKvSnapshot {
+                kv_k: vec![layer()],
+                kv_v: vec![layer()],
+            }),
+        };
+        // Two layers of 16 codes + 2 scales × 4 bytes = 48 bytes.
+        assert_eq!(snapshot.storage_bytes(), 48);
+
+        let mut cache = PrefixCache {
+            entries: VecDeque::new(),
+        };
+        cache.insert(vec![1, 2, 3], snapshot);
+        assert_eq!(cache.entries[0].bytes, 48);
     }
 
     /// Longest-prefix selection: an entry that strictly prefixes the prompt

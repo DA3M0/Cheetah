@@ -331,8 +331,14 @@ logits = lm_head(hidden)                        // tied → embed rows; untied �
 drop_disk_units_of_layer(0)                     // embed/norm bucket
 ```
 
-- **KV cache**: per layer `Vec<f32>` flattened as
-  `[position * kv_heads * head_dim + index]`, f32.
+- **KV cache**: per layer, flattened as
+  `[position * kv_heads * head_dim + index]`. Default storage is f32;
+  `CHEETAH_KV_Q8=1` switches to signed int8 codes plus one f32 scale per
+  `(position, kv_head)` (symmetric per-head `max|v|/127`). `cache_append`
+  quantizes at append time, so continuation and snapshot/restore stay
+  bit-exact within one storage mode; attention expands codes in the score and
+  value loops rather than materializing an f32 cache. Snapshots carry the
+  same storage mode (`QuantizedKvSnapshot`), keeping the prefix cache compact.
 - **Optional units** are resolved by `store.contains` — attention biases and
   q/k norms are family-optional; tied-vs-untied embeddings likewise. Each
   family's runner expresses its own shape (llama: no bias, untied; qwen2:
@@ -359,9 +365,14 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
 
 - `gemv(weight_bytes, dtype, rows, cols, x, y)` — rows ≤ `GEMV_CHUNK_ROWS`
   (128) run sequentially (rayon fork/join would exceed the compute); larger
-  matrices split into 128-row rayon chunks.
-- `dot_row_bf16_fused` — the hot path. Two implementations behind one call
-  site:
+  matrices split into 128-row rayon chunks. Non-BF16 dtypes dequantize into
+  one scratch buffer per sequential call or per rayon chunk, never per row.
+- `gemv_q8` / `gemv_q4` — quantized-domain matvecs (row scale × int8/int4
+  codes in f32 accumulate). The row dot is AVX2+FMA (`_mm256_cvtepi8_epi32`
+  widening for q8; nibble unpack + 4-bit sign extension for q4) with portable
+  scalar tails, so Q8/Q4 weights stream at a fraction of the f32 bandwidth.
+- `dot_row_bf16_fused` — the hot f32-weight path. Two implementations behind
+  one call site:
   - **AVX2+FMA intrinsics** (x86_64, `is_x86_feature_detected!` guarded,
     `#[target_feature(enable = "avx2,fma")]`): one 256-bit load = 16 bf16
     lanes; each 128-bit half is zero-extended (`cvtepu16_epi32`) and shifted
@@ -375,6 +386,15 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
 - `rmsnorm`, `rope_in_place` (rotate-half; **`f32::sin_cos` returns
   `(sin, cos)` — historically swapped, guarded by a comment and tests**),
   `silu_multiply`, `softmax` (stable, in place).
+- `rope_heads` — per-head rotate-half with one sin/cos table per call (the
+  angles depend only on position, so a decode step no longer runs `powf` +
+  `sin_cos` per head per dim). `rope_in_place` remains the single-head entry
+  point and shares the same kernel.
+- `attention` — GQA over the f32 or Q8 cache. Short/decode caches run
+  sequentially and reuse the toolbox's score scratch (one allocation per
+  toolbox, not per head); heads fan out to rayon only at
+  `cache_len >= ATTENTION_PARALLEL_MIN_CACHE` (384), where the fork/join pays
+  for itself. Q8 keys/values are expanded per head inside the loops.
 
 ### 7.4 SIMD kernels — AVX2+FMA detail
 
@@ -446,6 +466,33 @@ consume the same quantized buffer layout.
 Memory: ~0.25 bytes of scale overhead per weight on top of the int8 payload —
 roughly half the footprint of BF16. The per-row symmetric quantization bounds
 the dequantization error to ±scale/2 (±max|w|/254).
+
+### 7.5.1 Q8 KV cache (activation-precision, opt-in)
+
+`CHEETAH_KV_Q8=1` switches the native KV cache from f32 to symmetric per-head
+int8: each layer stores `codes[position * kv_dim + index]` plus
+`scales[position * kv_heads + head]` (`scale = max|v|/127` for that head's
+row, zero rows use 1.0). `cache_append` quantizes each row as it is written,
+so appending keeps the same throughput profile and `kv_len`/clear/clone
+semantics. `attention` computes key scores as int8×f32 dots and the value
+mix as weighted int8 accumulations, applying scales per `(position, head)` on
+the fly — no dequantized copy of the cache ever exists. AVX2+FMA widening
+kernels handle both loops, with portable scalar fallbacks.
+
+Snapshots preserve the storage mode: `KvSnapshot::q8` carries
+`QuantizedKvSnapshot { kv_k, kv_v }` (codes + scales per layer) and leaves the
+f32 vectors empty, so the engine's prefix cache charges the int8 payload
+(plus the scale head) instead of inflating back to f32. Restore converts
+across modes when needed (Q8 snapshot → f32 cache dequantizes; f32 snapshot →
+Q8 cache re-quantizes). Within one mode, continuation and truncated restore
+remain bit-exact; Q8 vs f32 attention/logits differ only by quantization
+error (covered by kernel and decoder parity tests).
+
+Cost: int8 × f32 widening is compute-heavier per element than a pure f32 dot,
+but the cache is 4× smaller, so long-context decode reads a quarter of the
+memory. Memory: 1 byte/element + 4 bytes per `(position, kv_head)`. For
+`head_dim = 128` that is ~1.03 bytes/element versus 4 — roughly a 3.9×
+reduction.
 
 ### 7.6 Vulkan bucketed residency
 
@@ -602,7 +649,9 @@ single steady number (serve, qwen-0.5b-prepared, ~1.4k-token prompt, v1.2.0):
 Idle RSS ≈ resident plan bytes (VRAM + RAM tiers; disk tier ≈ 0 until touched)
 + ~70 MB runtime. The growth over idle is the KV cache (~35 MB at this length)
 plus the KV prefix-cache snapshot (≤ ~25 MB), chunked-prefill working buffers
-and allocator retention. vs Candle 2,497/3,704 MB (F32 materialized).
+and allocator retention. With `CHEETAH_KV_Q8=1` the live KV cache and prefix
+snapshot shrink roughly 4×; the rest of the profile is unchanged. vs Candle
+2,497/3,704 MB (F32 materialized).
 
 Startup timeline (0.2 s sampling, full-resident): spawn ~24 MB → load window
 ~50–62 MB (weights mmap'd untouched — the transient "cold" shape one can
@@ -682,6 +731,9 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   to full attention on both backends.
 - Q8 quantization changes the numerics (per-row int8 bounds the error to
   ±max|w|/254 per weight). Outputs differ from BF16/F32 runs.
+- Q8 KV cache (`CHEETAH_KV_Q8=1`) is lossy: K/V rows round to ±max|v|/254 per
+  head, so attention scores and logits differ slightly from the f32 cache.
+  Continuation and snapshot/restore stay bit-exact within Q8 mode.
 - Vulkan resident bucket (DEVICE_LOCAL) requires the VRAM-tier bytes to fit
   in the device's memory heap. Oversized uploads fall back to the
   host-coherent streaming path per weight.

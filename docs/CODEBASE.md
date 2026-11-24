@@ -110,7 +110,11 @@ it. Long prompts prefill through chunked batched-GEMM passes
 of post-prefill KV snapshots (`PrefixCache` in engine.rs) so a request whose
 history extends a recently prefilled prompt skips re-prefilling the shared
 prefix — multi-turn chat, agentic tool rounds and identical retries all hit
-it. Backends without KV snapshot support (Vulkan, currently) simply never
+it. The native KV cache can run in f32 (default) or Q8 (`CHEETAH_KV_Q8=1`):
+Q8 stores one int8 code per element plus one f32 scale per `(position,
+kv_head)`, and snapshots keep that quantized form, so both live cache and
+prefix cache shrink roughly 4× while attention expands codes on the fly.
+Backends without KV snapshot support (Vulkan, currently) simply never
 reuse; mixtral does not batch its sparse feed-forward yet. Known limitation:
 with `CHEETAH_QUANT_Q8`/`Q4`, quantized buffers start fresh per generation
 (the runtime clone resets them), so quantize-at-first-use repeats inside every
@@ -170,7 +174,7 @@ run_init_command      src/main.rs:90
 
 | Item | File | Role |
 |------|------|------|
-| `OpsToolbox` | ops.rs | shared inference state + operators: weight store access, KV caches, quantized linear dispatch (`linear`), GQA attention (`attention`, sliding-window aware), norms (`rmsnorm`/`rmsnorm_offset`/`layernorm`/`qk_norm`), `add_bias`, `embedding_row_into`, `rope_heads`, `lm_head_into` (chunked Ant sweep), expert residency, `apply_tiers`/`page_in_unit`/`evict_unit` |
+| `OpsToolbox` | ops.rs | shared inference state + operators: weight store access, f32/Q8 KV caches (Q8 via `CHEETAH_KV_Q8`), quantized linear dispatch (`linear`), GQA attention (`attention`, sliding-window aware, Q8-cache aware), norms (`rmsnorm`/`rmsnorm_offset`/`layernorm`/`qk_norm`), `add_bias`, `embedding_row_into`, `rope_heads`, `lm_head_into` (chunked Ant sweep), expert residency, `apply_tiers`/`page_in_unit`/`evict_unit` |
 | `MmapWeightStore` | store.rs | shard mmap + unit index + tier Mutex + `page_in`/`drop_pages`/`drop_range`/`drop_disk_units_of_layer` |
 | `gemv` | ops.rs | row-parallel matrix-vector; AVX2 vs portable dispatch (names frozen; `kernels.rs` re-exports the module for the precision registry) |
 | `dot_row_bf16_avx2` | ops.rs | `cvtepu16_epi32 + slli_epi32(16)` widening + FMA |
@@ -257,6 +261,7 @@ run_init_command      src/main.rs:90
 | `CHEETAH_NATIVE` | engine.rs | `0` / `1` | `0` skips native selection (surfaces the guidance error for architectures without a native backend on CPU). Kept for policy testing. |
 | `CHEETAH_QUANT_Q8` | precision registry (`chat::precision::selected_format`) → both backends | `1` / `true` | Selects the registered `q8` format: Linear projections quantize to row-wise int8 at load time through the format's registered operators — Vulkan (streaming + resident matmul) and native (quantize-at-first-use gemv, source pages released). Halves the weight footprint; norms/biases/embeddings stay in original precision. |
 | `CHEETAH_QUANT_Q4` | precision registry (`chat::precision::selected_format`) → both backends | `1` / `true` | Selects the registered `q4` format: Linear projections quantize to row-wise symmetric int4 (two codes per byte, scale = max\|w\|/7) — a quarter of the BF16 footprint. Same dual-backend operator table as q8 (`matmul_q4.comp` pipeline on Vulkan, `gemv_q4` on native). |
+| `CHEETAH_KV_Q8` | `ops::kv_q8_enabled` (native backend) | `1` / `true` (also accepts `CHEETAH_KV_QUANT_Q8`) | Stores the KV cache as signed int8 codes with one f32 scale per `(position, kv_head)`, cutting live KV and prefix-snapshot memory ~4×. Attention dequantizes per head inside the score/value loops (AVX2 widening when available); quantization is lossy, so unset it for bit-exact f32-cache behavior. |
 | `CHEETAH_PREFILL_CHUNK` | `ops::prefill_chunk_size` (native backend) | positive integer (default 256) | Rows per chunked-prefill batched-GEMM pass. Single-token decode steps are unaffected; only prefill batching changes. |
 | `RUST_LOG` | `tracing_subscriber` (serve only) | env-filter syntax (serve default `info`) | Per-request timing lines (queue wait / tokenize / prefill / TTFT / decode rate) log at `info` on stderr. |
 

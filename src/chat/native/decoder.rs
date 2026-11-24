@@ -1817,6 +1817,102 @@ mod forward_tests {
         );
     }
 
+    /// Builds a llama fixture decoder whose KV cache runs in Q8 mode,
+    /// bypassing the process-wide `CHEETAH_KV_Q8` selector so f32 and Q8
+    /// decoders can coexist in one test run.
+    fn q8_decoder(cfg: DecoderConfig, store: Arc<MmapWeightStore>) -> LlamaNative {
+        let mut decoder = LlamaNative::with_store(cfg.clone(), Arc::clone(&store));
+        decoder.ctx = ops::OpsToolbox::with_store_kv_q8(cfg, store, true);
+        decoder
+    }
+
+    /// Q8 KV continuation parity: quantizing each appended row at the same
+    /// point in both paths makes an incremental Q8 prefill bit-identical to
+    /// a full Q8 prefill (quantization is per row, so history cannot leak).
+    #[test]
+    fn kv_q8_continuation_matches_full_prefill_bit_exact() {
+        let fixture = Fixture::new("kv_q8_continuation", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+
+        let mut incremental = q8_decoder(cfg.clone(), Arc::clone(&fixture.store));
+        incremental.forward(&[1, 2, 3, 4], 0).unwrap();
+        assert_eq!(incremental.ctx.kv_len(0), 4);
+        let logits_continued = incremental.forward(&[5, 6], 4).unwrap();
+
+        let mut fresh = q8_decoder(cfg, Arc::clone(&fixture.store));
+        let logits_full = fresh.forward(&[1, 2, 3, 4, 5, 6], 0).unwrap();
+
+        assert_eq!(
+            logits_continued, logits_full,
+            "Q8 KV 前缀续算必须与全量 Q8 prefill 比特一致"
+        );
+    }
+
+    /// Q8 snapshot/restore parity: a Q8 snapshot carries codes + scales (not
+    /// an f32 expansion), and restoring a truncated prefix into another Q8
+    /// decoder then continuing is bit-identical to a full Q8 prefill.
+    #[test]
+    fn kv_q8_snapshot_restore_continuation_matches_full_prefill_bit_exact() {
+        let fixture = Fixture::new("kv_q8_snapshot", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+
+        let mut source = q8_decoder(cfg.clone(), Arc::clone(&fixture.store));
+        source.forward(&[1, 2, 3, 4, 5, 6, 7, 8], 0).unwrap();
+        let snapshot = source.ctx.kv_snapshot();
+        assert_eq!(snapshot.positions, 8);
+        assert!(snapshot.q8.is_some(), "Q8 cache must snapshot Q8 storage");
+        assert!(
+            snapshot.kv_k.is_empty() && snapshot.kv_v.is_empty(),
+            "Q8 snapshots must not carry an f32 copy"
+        );
+        let f32_bytes = 8 * (cfg.kv_heads * cfg.head_dim) * 2 * std::mem::size_of::<f32>();
+        assert!(
+            snapshot.storage_bytes() < f32_bytes,
+            "Q8 snapshot ({}) must be smaller than f32 ({f32_bytes})",
+            snapshot.storage_bytes()
+        );
+
+        let mut restored = q8_decoder(cfg.clone(), Arc::clone(&fixture.store));
+        restored.ctx.restore_kv_prefix(&snapshot, 6);
+        assert_eq!(restored.ctx.kv_len(0), 6);
+        let logits_continued = restored.forward(&[7, 8], 6).unwrap();
+
+        let mut fresh = q8_decoder(cfg, Arc::clone(&fixture.store));
+        let logits_full = fresh.forward(&[1, 2, 3, 4, 5, 6, 7, 8], 0).unwrap();
+
+        assert_eq!(
+            logits_continued, logits_full,
+            "Q8 快照恢复 + 续算必须与全量 Q8 prefill 比特一致"
+        );
+    }
+
+    /// Q8 KV logits stay close to the f32 path on the same tokens: the int8
+    /// cache is lossy, so this is a tolerance check, not bit equality.
+    #[test]
+    fn kv_q8_logits_track_f32_within_quantization_error() {
+        let fixture = Fixture::new("kv_q8_parity", FeedForward::Dense, true);
+        let cfg = dense_config(0);
+
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let mut f32_decoder = LlamaNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+        let f32_logits = f32_decoder.forward(&tokens, 0).unwrap();
+        let mut quantized = q8_decoder(cfg, Arc::clone(&fixture.store));
+        let q8_logits = quantized.forward(&tokens, 0).unwrap();
+
+        let max_error = f32_logits
+            .iter()
+            .zip(q8_logits.iter())
+            .map(|(f32_value, q8_value)| (f32_value - q8_value).abs())
+            .fold(0f32, f32::max);
+        let magnitude = f32_logits
+            .iter()
+            .fold(0f32, |acc, value| acc.max(value.abs()));
+        assert!(
+            max_error <= 5e-2 * magnitude.max(1.0),
+            "Q8 logits diverged from f32 by {max_error} (magnitude {magnitude})"
+        );
+    }
+
     /// qwen2 批量 prefill parity：GEMM 分块的 forward 必须与逐位置路径
     /// （单 token forward 累积 KV）逐比特一致；含非零 offset 续算（前缀
     /// 复用路径的真实形态）。

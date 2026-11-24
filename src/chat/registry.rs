@@ -45,13 +45,61 @@ pub(crate) type PromptRenderer = fn(&[super::ChatMessage], Option<&str>) -> Stri
 /// [`ModelForward::kv_snapshot`] right after a prefill; consumed by
 /// [`ModelForward::restore_kv_prefix`] so a later prompt sharing that token
 /// prefix skips its re-prefill.
+///
+/// The snapshot keeps the backend's storage precision: f32 backends fill
+/// `kv_k`/`kv_v`, while a Q8 KV cache fills `q8` (int8 codes plus per-head
+/// scales) and leaves the f32 vectors empty. Keeping the quantized form in
+/// the snapshot makes prefix-cache memory track the live cache instead of
+/// silently inflating back to f32.
 pub(crate) struct KvSnapshot {
     /// Number of absolute positions the captured rows cover.
     pub(crate) positions: usize,
-    /// Per-layer key rows, backend-native layout.
+    /// Per-layer key rows, backend-native layout (f32 storage).
     pub(crate) kv_k: Vec<Vec<f32>>,
-    /// Per-layer value rows, backend-native layout.
+    /// Per-layer value rows, backend-native layout (f32 storage).
     pub(crate) kv_v: Vec<Vec<f32>>,
+    /// Quantized KV storage when the backend cache ran in Q8 mode.
+    pub(crate) q8: Option<QuantizedKvSnapshot>,
+}
+
+/// Q8 KV storage captured for every layer: one int8 code per element plus
+/// one f32 scale per `(position, kv_head)`.
+pub(crate) struct QuantizedKvSnapshot {
+    /// Per-layer key rows.
+    pub(crate) kv_k: Vec<QuantizedKvLayer>,
+    /// Per-layer value rows.
+    pub(crate) kv_v: Vec<QuantizedKvLayer>,
+}
+
+/// One layer's quantized KV rows, in the native cache layout:
+/// `codes[position * kv_heads * head_dim + head * head_dim + dim]` and
+/// `scales[position * kv_heads + head]`.
+pub(crate) struct QuantizedKvLayer {
+    /// Signed int8 codes, one per element.
+    pub(crate) codes: Vec<i8>,
+    /// One f32 scale per `(position, head)`.
+    pub(crate) scales: Vec<f32>,
+}
+
+impl KvSnapshot {
+    /// Bytes the snapshot actually holds, used by the engine's prefix-cache
+    /// budget. Quantized snapshots count the int8 payload plus the scale head
+    /// rather than a dequantized f32 copy.
+    pub(crate) fn storage_bytes(&self) -> usize {
+        if let Some(q8) = &self.q8 {
+            return q8
+                .kv_k
+                .iter()
+                .chain(q8.kv_v.iter())
+                .map(|layer| layer.codes.len() + layer.scales.len() * std::mem::size_of::<f32>())
+                .sum();
+        }
+        self.kv_k
+            .iter()
+            .chain(self.kv_v.iter())
+            .map(|layer| layer.len() * std::mem::size_of::<f32>())
+            .sum()
+    }
 }
 
 pub(crate) trait ModelForward: ModelForwardClone + Send {

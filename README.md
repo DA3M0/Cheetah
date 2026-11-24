@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | 🧠 **Ant tiered memory** | per-tensor VRAM/RAM/Disk residency acting on real pages — idle RSS scales with the plan on a 0.5B model: ~123 MB (16 MB/32 MB, nearly all disk) → ~0.6 GB (RAM-tier 512 MB) → ~1.0 GB full-resident — and climbs slowly to the inference peak from that baseline (vs 2.5 GB untiered) |
-| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B; chunked prefill runs batched GEMMs (`CHEETAH_PREFILL_CHUNK`), an LRU KV-prefix cache skips re-prefilling shared history across turns, and serve warms the model up before binding |
+| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B; chunked prefill runs batched GEMMs (`CHEETAH_PREFILL_CHUNK`), an optional int8 KV cache (`CHEETAH_KV_Q8`) cuts cache and prefix-snapshot memory ~4×, an LRU KV-prefix cache skips re-prefilling shared history across turns, and serve warms the model up before binding |
 | 🧩 **declarative model registry** | one registration file per family — architecture, chat template, stop markers, both backends, family constants; build.rs generates the registry, lookups derive from it |
 | 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
 | 🧰 **MCP, both directions** | **Server**: built into `cheetah serve` — the model is exposed at `POST /mcp` for any MCP agent, no flags needed. **Client**: `--mcp-server` / `--mcp-config` connects MCP servers whose tools the model calls in an agentic loop. Guide: [docs/MCP.md](docs/MCP.md) |
@@ -107,7 +107,8 @@ Key variables (full list in [docs/CODEBASE.md](docs/CODEBASE.md) §4):
 | Variable | Values | Default |
 |----------|--------|---------|
 | `CHEETAH_DEVICE` | `cpu` / `vulkan` | `cpu` (native backend) |
-| `CHEETAH_QUANT_Q8` | `1` / `0` | `0` (full precision; Vulkan only) |
+| `CHEETAH_QUANT_Q8` | `1` / `0` | `0` (full precision; both backends) |
+| `CHEETAH_KV_Q8` | `1` / `0` | `0` (f32 KV cache; native backend) |
 | `CHEETAH_PREFILL_CHUNK` | positive integer | `256` (rows per chunked-prefill GEMM batch, native backend) |
 | `RUST_LOG` | env-filter | `info` in serve (per-request TTFT/prefill timing on stderr) |
 | `CHEETAH_VRAM_POOL_SIZE` | bytes | `838860800` (800 MiB; Vulkan C substrate pool) |
@@ -303,7 +304,7 @@ Ant is Cheetah's fine-grained model memory optimization for local inference. Aft
 - **RAM (tier 1):** resident — pages stay faulted in.
 - **Disk (tier 2):** cold — pages dropped with `madvise(DONTNEED)` and streamed back in per step.
 
-Set `export CHEETAH_QUANT_Q8=1` (or inline `CHEETAH_QUANT_Q8=1 cheetah ...`) to quantize linear projections to row-wise int8 on the Vulkan backend (halves the weight footprint; norms, biases and embeddings stay in original precision). The native CPU backend currently loads weights in their original F32/F16/BF16 precision.
+Set `export CHEETAH_QUANT_Q8=1` (or inline `CHEETAH_QUANT_Q8=1 cheetah ...`) to quantize linear projections to row-wise int8 on both backends (roughly half the weight footprint; norms, biases and embeddings stay in original precision; the native backend quantizes at first use and releases the source pages). Add `CHEETAH_KV_Q8=1` to also store the native KV cache as int8 codes with one scale per `(position, kv_head)` — about a quarter of the f32 cache bytes, with prefix-cache snapshots kept in the same quantized form. KV Q8 is lossy (attention scores/values are rounded per head), so leave it unset when bit-exact f32 cache parity matters.
 
 On the default CPU path (the native backend), tiers act on **real memory pages**: a disk-tier unit contributes ~0 resident bytes, and the OS page cache absorbs re-reads. Memory is not a single steady number — RSS sits at an idle baseline and **climbs slowly during inference** as the KV cache, the prefix-cache snapshot and per-chunk working sets accumulate. Measured on qwen-0.5b (serve, ~1.4k-token prompt, post-warmup):
 
@@ -467,7 +468,7 @@ Run the native backend tests (`cargo test native_`) — if the backend tests pas
 No — the native CPU path is the primary backend and needs no GPU. The Vulkan backend can use a GPU but keeps weights in host memory (HOST_COHERENT design); on small models the native CPU path is often faster.
 
 **How do I enable Q8 quantization?**
-Set `CHEETAH_QUANT_Q8=1` before starting. Linear projections are quantized to row-wise int8 (roughly half the weight footprint). Norms, biases and embeddings stay in full precision. Vulkan only — the native CPU backend loads weights in their original F32/F16/BF16 precision.
+For weights, set `CHEETAH_QUANT_Q8=1` before starting. Linear projections are quantized to row-wise int8 (roughly half the weight footprint) on both the Vulkan and native CPU backends. Norms, biases and embeddings stay in full precision. For the native KV cache, set `CHEETAH_KV_Q8=1` as well: key/value rows become int8 codes with per-head scales (~4× smaller cache and prefix snapshots), at a small loss of attention precision.
 
 **Why does CHEETAH_DEVICE=VULKAN (uppercase) fail?**
 Older builds used case-sensitive device lookup. This was fixed — all casing now works (`vulkan`, `VULKAN`, `Vulkan`). If you still see `Unsupported CHEETAH_DEVICE`, rebuild from the latest code.

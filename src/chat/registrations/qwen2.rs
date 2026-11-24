@@ -616,7 +616,8 @@ impl ModelForward for Qwen2Native {
     }
 
     /// Restores a cached prefix into the (freshly cleared) toolbox KV —
-    /// native caches are plain f32 rows, so any prefix restores bit-exact.
+    /// native caches restore in their own storage mode (f32 or Q8), so a
+    /// prefix captured by the same runtime restores bit-exact.
     fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) -> bool {
         self.ctx.restore_kv_prefix(snapshot, positions);
         true

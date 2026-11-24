@@ -36,12 +36,13 @@ use rayon::prelude::*;
 use super::decoder::DecoderConfig;
 use super::store::{MmapWeightStore, Tier, WeightDType};
 use crate::chat::precision::{self, PrecisionBuffer};
-use crate::chat::registry::KvSnapshot;
+use crate::chat::registry::{KvSnapshot, QuantizedKvLayer, QuantizedKvSnapshot};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Math kernels (moved verbatim from `kernels`; names are frozen).
@@ -240,28 +241,47 @@ unsafe fn dot_row_bf16_avx2(row: &[u8], x: &[f32]) -> f32 {
 ///
 /// BF16 rows take the fused widening kernel (AVX2+FMA when the CPU supports
 /// it, the portable fused loop otherwise); every other dtype dequantizes one
-/// row at a time and dots in f32. Up to `GEMV_CHUNK_ROWS` (128) rows run
-/// sequentially (a rayon fork/join would cost more than the compute), larger
-/// matrices split into 128-row rayon chunks.
+/// row at a time into a per-chunk scratch buffer and dots in f32. Up to
+/// `GEMV_CHUNK_ROWS` (128) rows run sequentially (a rayon fork/join would
+/// cost more than the compute), larger matrices split into 128-row rayon
+/// chunks. The scratch buffer is allocated once per chunk, never per row —
+/// the old per-row allocation dominated f16/f32 decode.
 pub fn gemv(weight: &[u8], dtype: WeightDType, rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), cols, "gemv input width mismatch");
     assert_eq!(y.len(), rows, "gemv output width mismatch");
     let element_size = dtype.element_size();
     let row_stride = cols * element_size;
-    let dot_row = |row_bytes: &[u8]| -> f32 {
-        match dtype {
-            WeightDType::Bf16 => dot_row_bf16_fused(row_bytes, x),
-            _ => {
-                let mut scratch = vec![0f32; cols];
-                dequant_row(row_bytes, dtype, &mut scratch);
-                dot_f32(&scratch, x)
+    if matches!(dtype, WeightDType::Bf16) {
+        let dot_row = |row_bytes: &[u8]| -> f32 { dot_row_bf16_fused(row_bytes, x) };
+        if rows <= GEMV_CHUNK_ROWS {
+            for (row, y_value) in y.iter_mut().enumerate() {
+                let row_bytes = &weight[row * row_stride..(row + 1) * row_stride];
+                *y_value = dot_row(row_bytes);
             }
+            return;
         }
+        y.par_chunks_mut(GEMV_CHUNK_ROWS)
+            .enumerate()
+            .for_each(|(chunk, out)| {
+                let row_start = chunk * GEMV_CHUNK_ROWS;
+                for (index_in_chunk, y_value) in out.iter_mut().enumerate() {
+                    let row = row_start + index_in_chunk;
+                    let row_bytes = &weight[row * row_stride..(row + 1) * row_stride];
+                    *y_value = dot_row(row_bytes);
+                }
+            });
+        return;
+    }
+    // f16/f32: one dequant scratch per sequential call or per rayon chunk.
+    let dot_row = |row_bytes: &[u8], scratch: &mut [f32]| -> f32 {
+        dequant_row(row_bytes, dtype, scratch);
+        dot_f32(scratch, x)
     };
     if rows <= GEMV_CHUNK_ROWS {
+        let mut scratch = vec![0f32; cols];
         for (row, y_value) in y.iter_mut().enumerate() {
             let row_bytes = &weight[row * row_stride..(row + 1) * row_stride];
-            *y_value = dot_row(row_bytes);
+            *y_value = dot_row(row_bytes, &mut scratch);
         }
         return;
     }
@@ -269,10 +289,11 @@ pub fn gemv(weight: &[u8], dtype: WeightDType, rows: usize, cols: usize, x: &[f3
         .enumerate()
         .for_each(|(chunk, out)| {
             let row_start = chunk * GEMV_CHUNK_ROWS;
+            let mut scratch = vec![0f32; cols];
             for (index_in_chunk, y_value) in out.iter_mut().enumerate() {
                 let row = row_start + index_in_chunk;
                 let row_bytes = &weight[row * row_stride..(row + 1) * row_stride];
-                *y_value = dot_row(row_bytes);
+                *y_value = dot_row(row_bytes, &mut scratch);
             }
         });
 }
@@ -542,13 +563,245 @@ pub(crate) fn prefill_chunk_size() -> usize {
 /// Default rows per chunked prefill batch (see [`prefill_chunk_size`]).
 const PREFILL_CHUNK_ROWS: usize = 256;
 
+/// Dot product of one int8 code row against f32 activations. Codes are
+/// sign-extended to f32 and accumulated with FMA when AVX2 is available; the
+/// portable path is the same math without explicit intrinsics.
+#[inline]
+fn dot_i8_f32(codes: &[i8], x: &[f32]) -> f32 {
+    debug_assert_eq!(codes.len(), x.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: guarded by the runtime feature detection above; the
+            // slices have equal length, so every load stays in bounds.
+            unsafe { return dot_i8_f32_avx2(codes, x) }
+        }
+    }
+    codes
+        .iter()
+        .zip(x.iter())
+        .map(|(code, value)| *code as f32 * *value)
+        .sum()
+}
+
+/// AVX2+FMA int8 dot: eight codes widen to one ymm of f32 lanes per step, so
+/// the weight traffic is a quarter of the f32 path and the conversion stays
+/// off the scalar pipeline.
+///
+/// # Safety
+/// Callers must guarantee AVX2 + FMA support (runtime detection).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_i8_f32_avx2(codes: &[i8], x: &[f32]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let mut acc = _mm256_setzero_ps();
+        let mut index = 0usize;
+        while index + 8 <= codes.len() {
+            let raw = _mm_loadl_epi64(codes.as_ptr().add(index) as *const __m128i);
+            let widened = _mm256_cvtepi8_epi32(raw);
+            let floats = _mm256_cvtepi32_ps(widened);
+            acc = _mm256_fmadd_ps(floats, _mm256_loadu_ps(x.as_ptr().add(index)), acc);
+            index += 8;
+        }
+        let mut sum = horizontal_sum(acc);
+        while index < codes.len() {
+            sum += codes[index] as f32 * x[index];
+            index += 1;
+        }
+        sum
+    }
+}
+
+/// `out += weight * codes` over an int8 row — the attention value-mix inner
+/// loop. AVX2 widens eight codes at a time; the portable fallback is scalar.
+#[inline]
+fn accumulate_i8_f32(codes: &[i8], weight: f32, out: &mut [f32]) {
+    debug_assert_eq!(codes.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: guarded by the runtime feature detection above; the
+            // slices have equal length, so every load/store stays in bounds.
+            unsafe { return accumulate_i8_f32_avx2(codes, weight, out) }
+        }
+    }
+    for (out_value, code) in out.iter_mut().zip(codes.iter()) {
+        *out_value += weight * *code as f32;
+    }
+}
+
+/// AVX2+FMA weighted int8 accumulation (see [`accumulate_i8_f32`]).
+///
+/// # Safety
+/// Callers must guarantee AVX2 + FMA support (runtime detection).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn accumulate_i8_f32_avx2(codes: &[i8], weight: f32, out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let weight_lanes = _mm256_set1_ps(weight);
+        let mut index = 0usize;
+        while index + 8 <= codes.len() {
+            let raw = _mm_loadl_epi64(codes.as_ptr().add(index) as *const __m128i);
+            let widened = _mm256_cvtepi8_epi32(raw);
+            let floats = _mm256_cvtepi32_ps(widened);
+            let current = _mm256_loadu_ps(out.as_ptr().add(index));
+            let updated = _mm256_fmadd_ps(floats, weight_lanes, current);
+            _mm256_storeu_ps(out.as_mut_ptr().add(index), updated);
+            index += 8;
+        }
+        while index < codes.len() {
+            out[index] += weight * codes[index] as f32;
+            index += 1;
+        }
+    }
+}
+
+/// Dot product of one packed int4 row (two codes per byte, low nibble = even
+/// column) against f32 activations, in the codes' signed domain.
+#[inline]
+fn dot_q4_codes(row: &[u8], cols: usize, x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: guarded by the runtime feature detection above; the
+            // packed row carries at least ceil(cols/2) bytes.
+            unsafe { return dot_q4_codes_avx2(row, cols, x) }
+        }
+    }
+    let mut sum = 0f32;
+    for (column, value) in x.iter().enumerate().take(cols) {
+        let byte = row[column / 2];
+        let nibble = if column % 2 == 0 {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        };
+        let code = if nibble >= 8 {
+            nibble as i8 - 16
+        } else {
+            nibble as i8
+        };
+        sum += code as f32 * *value;
+    }
+    sum
+}
+
+/// AVX2+FMA packed-int4 dot: 32 bytes expand to 64 nibbles per step (four
+/// 128-bit lane groups of 16 codes each, widened eight at a time).
+///
+/// # Safety
+/// Callers must guarantee AVX2 + FMA support (runtime detection) and a row
+/// slice covering `ceil(cols / 2)` packed bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q4_codes_avx2(row: &[u8], cols: usize, x: &[f32]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let mask = _mm256_set1_epi8(0x0F);
+        let sign = _mm256_set1_epi8(8);
+        let full_vecs = (cols / 2) / 32;
+        let mut acc = _mm256_setzero_ps();
+        let mut column = 0usize;
+        for vector in 0..full_vecs {
+            let packed = _mm256_loadu_si256(row.as_ptr().add(vector * 32) as *const __m256i);
+            let low = _mm256_and_si256(packed, mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask);
+            // unpacklo/hi interleave the two nibble streams back into column
+            // order; `(nibble ^ 8) - 8` sign-extends 0..15 to -8..7.
+            let even = _mm256_sub_epi8(
+                _mm256_xor_si256(_mm256_unpacklo_epi8(low, high), sign),
+                sign,
+            );
+            let odd = _mm256_sub_epi8(
+                _mm256_xor_si256(_mm256_unpackhi_epi8(low, high), sign),
+                sign,
+            );
+            let even_low = _mm256_castsi256_si128(even);
+            let even_high = _mm256_extracti128_si256::<1>(even);
+            let odd_low = _mm256_castsi256_si128(odd);
+            let odd_high = _mm256_extracti128_si256::<1>(odd);
+            // Columns: even lane 0 = 0..15, odd lane 0 = 16..31,
+            // even lane 1 = 32..47, odd lane 1 = 48..63.
+            acc = fma_i8_lane(acc, even_low, x.as_ptr().add(column));
+            acc = fma_i8_lane(
+                acc,
+                _mm_srli_si128::<8>(even_low),
+                x.as_ptr().add(column + 8),
+            );
+            acc = fma_i8_lane(acc, odd_low, x.as_ptr().add(column + 16));
+            acc = fma_i8_lane(
+                acc,
+                _mm_srli_si128::<8>(odd_low),
+                x.as_ptr().add(column + 24),
+            );
+            acc = fma_i8_lane(acc, even_high, x.as_ptr().add(column + 32));
+            acc = fma_i8_lane(
+                acc,
+                _mm_srli_si128::<8>(even_high),
+                x.as_ptr().add(column + 40),
+            );
+            acc = fma_i8_lane(acc, odd_high, x.as_ptr().add(column + 48));
+            acc = fma_i8_lane(
+                acc,
+                _mm_srli_si128::<8>(odd_high),
+                x.as_ptr().add(column + 56),
+            );
+            column += 64;
+        }
+        let mut sum = horizontal_sum(acc);
+        while column < cols {
+            let byte = row[column / 2];
+            let nibble = if column % 2 == 0 {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
+            let code = if nibble >= 8 {
+                nibble as i8 - 16
+            } else {
+                nibble as i8
+            };
+            sum += code as f32 * x[column];
+            column += 1;
+        }
+        sum
+    }
+}
+
+/// Eight signed int8 lanes from `codes` widened to f32 and FMA'd into `acc`.
+///
+/// # Safety
+/// Callers must guarantee AVX2 + FMA support and that `x` points at eight
+/// readable f32 values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_i8_lane(
+    acc: std::arch::x86_64::__m256,
+    codes: std::arch::x86_64::__m128i,
+    x: *const f32,
+) -> std::arch::x86_64::__m256 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let floats = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(codes));
+        _mm256_fmadd_ps(floats, _mm256_loadu_ps(x), acc)
+    }
+}
+
 /// Q8 matvec over the registered quantized buffer layout (`q8` in
 /// `crate::chat::precision`): a head of `rows` f32 row scales followed by
 /// row-major int8 payloads, each row padded to a multiple of four bytes. The
 /// dot runs in the quantized domain — codes are unpacked as int8 and
 /// multiplied by their row scale, f32 accumulate; the weights are never
 /// bulk-dequantized into another storage width (the same math the
-/// `matmul_q8.comp` shader performs).
+/// `matmul_q8.comp` shader performs). The row dot is AVX2+FMA when available.
 pub fn gemv_q8(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), cols, "gemv_q8 input width mismatch");
     assert_eq!(y.len(), rows, "gemv_q8 output width mismatch");
@@ -562,11 +815,10 @@ pub fn gemv_q8(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]
             weight[row * 4 + 3],
         ]);
         let codes = &weight[head_bytes + row * row_bytes..head_bytes + row * row_bytes + cols];
-        let mut sum = 0f32;
-        for (column, code) in codes.iter().enumerate() {
-            sum += scale * (*code as i8 as f32) * x[column];
-        }
-        sum
+        // SAFETY: int8 codes and f32 values have the same signed numeric
+        // domain; the slice is exactly `cols` bytes long.
+        let codes = unsafe { std::slice::from_raw_parts(codes.as_ptr().cast::<i8>(), cols) };
+        scale * dot_i8_f32(codes, x)
     };
     if rows <= GEMV_CHUNK_ROWS {
         for (row, y_value) in y.iter_mut().enumerate() {
@@ -590,7 +842,8 @@ pub fn gemv_q8(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]
 /// each row padded to a multiple of four bytes. The dot runs in the
 /// quantized domain — codes are unpacked as int4 and multiplied by their row
 /// scale, f32 accumulate; the weights are never bulk-dequantized into another
-/// storage width (the same math the `matmul_q4.comp` shader performs).
+/// storage width (the same math the `matmul_q4.comp` shader performs). The
+/// row dot is AVX2+FMA when available.
 pub fn gemv_q4(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), cols, "gemv_q4 input width mismatch");
     assert_eq!(y.len(), rows, "gemv_q4 output width mismatch");
@@ -604,22 +857,7 @@ pub fn gemv_q4(weight: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]
             weight[row * 4 + 3],
         ]);
         let row_start = head_bytes + row * row_bytes;
-        let mut sum = 0f32;
-        for (column, value) in x.iter().enumerate() {
-            let byte = weight[row_start + column / 2];
-            let nibble = if column % 2 == 0 {
-                byte & 0x0F
-            } else {
-                byte >> 4
-            };
-            let code = if nibble >= 8 {
-                nibble as i8 - 16
-            } else {
-                nibble as i8
-            };
-            sum += scale * (code as f32) * value;
-        }
-        sum
+        scale * dot_q4_codes(&weight[row_start..row_start + row_bytes], cols, x)
     };
     if rows <= GEMV_CHUNK_ROWS {
         for (row, y_value) in y.iter_mut().enumerate() {
@@ -698,6 +936,10 @@ pub fn layernorm(
 
 /// Rotary embedding (GPT-NeoX rotate-half style):
 /// for each head of dim d, split [x1 | x2] and pair angle i with both halves.
+/// Kept as the single-head entry point (the test suite and any external
+/// caller use it); [`rope_heads`] drives the multi-head path with one shared
+/// angle table.
+#[allow(dead_code)]
 pub fn rope_in_place(
     values: &mut [f32],
     heads: usize,
@@ -705,21 +947,7 @@ pub fn rope_in_place(
     position: usize,
     theta: f32,
 ) {
-    let half = head_dim / 2;
-    for head in 0..heads {
-        let base = head * head_dim;
-        for i in 0..half {
-            let freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
-            let angle = position as f32 * freq;
-            // NOTE: f32::sin_cos returns (sin, cos) — do not swap these.
-            let (sin, cos) = angle.sin_cos();
-            let first = base + i;
-            let second = base + half + i;
-            let (a, b) = (values[first], values[second]);
-            values[first] = a * cos - b * sin;
-            values[second] = b * cos + a * sin;
-        }
-    }
+    rope_span_in_place(values, heads, head_dim, head_dim, position, theta);
 }
 
 /// Rotary embedding across heads over the leading `rotary_dim` dims of each
@@ -727,6 +955,11 @@ pub fn rope_in_place(
 /// phi-style partial rotary (remaining dims pass through untouched). The
 /// per-head loop is part of the operator, so a registration file rotates a
 /// whole projection with one call.
+///
+/// The sin/cos table is computed once per call and reused by every head:
+/// a decode step used to run `powf` + `sin_cos` per head per dim (thousands
+/// of transcendental calls per token), while the angles depend only on the
+/// position and the frequency index.
 pub fn rope_heads(
     values: &mut [f32],
     heads: usize,
@@ -735,15 +968,36 @@ pub fn rope_heads(
     position: usize,
     theta: f32,
 ) {
+    rope_span_in_place(values, heads, head_dim, rotary_dim, position, theta);
+}
+
+/// Shared rotate-half kernel over `heads` heads of `head_dim`, rotating the
+/// leading `rotary_dim` lanes. One angle table per call, one rotation per
+/// head — the math is unchanged from the per-head kernel.
+fn rope_span_in_place(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    position: usize,
+    theta: f32,
+) {
+    let half = rotary_dim / 2;
+    let mut table = Vec::with_capacity(half);
+    for index in 0..half {
+        let freq = theta.powf(-2.0 * index as f32 / rotary_dim as f32);
+        let angle = position as f32 * freq;
+        table.push(angle.sin_cos());
+    }
     for head in 0..heads {
-        let start = head * head_dim;
-        rope_in_place(
-            &mut values[start..start + rotary_dim],
-            1,
-            rotary_dim,
-            position,
-            theta,
-        );
+        let base = head * head_dim;
+        for (index, (sin, cos)) in table.iter().copied().enumerate() {
+            let first = base + index;
+            let second = base + half + index;
+            let (a, b) = (values[first], values[second]);
+            values[first] = a * cos - b * sin;
+            values[second] = b * cos + a * sin;
+        }
     }
 }
 
@@ -771,6 +1025,162 @@ pub fn gelu_multiply(gate: &mut [f32], up: &[f32]) {
     gelu(gate);
     for (g, &u) in gate.iter_mut().zip(up.iter()) {
         *g *= u;
+    }
+}
+
+/// SiLU in place (`x · sigmoid(x)`), used by the Qwen3.5 gated linear
+/// attention's convolution and gated norm paths.
+pub fn silu(values: &mut [f32]) {
+    for value in values.iter_mut() {
+        *value /= 1.0 + (-*value).exp();
+    }
+}
+
+/// Numerically stable `softplus(x) = ln(1 + eˣ)`: the linear branch keeps
+/// large positive inputs from overflowing the exponential.
+pub fn softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        value.exp().ln_1p()
+    }
+}
+
+/// L2-normalize each `head_dim` slice in place:
+/// `x / sqrt(sum(x²) + eps)`, matching the FLA gated-delta-rule kernel.
+pub fn l2norm_heads(values: &mut [f32], heads: usize, head_dim: usize) {
+    const EPS: f32 = 1e-6;
+    for head in 0..heads {
+        let start = head * head_dim;
+        let norm: f32 = values[start..start + head_dim]
+            .iter()
+            .map(|value| value * value)
+            .sum();
+        let inv = (norm + EPS).sqrt().recip();
+        for value in &mut values[start..start + head_dim] {
+            *value *= inv;
+        }
+    }
+}
+
+/// Gated RMSNorm used by Qwen3.5's linear-attention output:
+/// per-head `x / rms(x) · weight · silu(gate)`. `weight` is one head wide
+/// and shared by every head; `gate` is `heads * head_dim` long.
+pub fn rmsnorm_gated(
+    values: &mut [f32],
+    gate: &[f32],
+    weight: &[f32],
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    for head in 0..heads {
+        let start = head * head_dim;
+        let slice = &mut values[start..start + head_dim];
+        let mean_square: f32 =
+            slice.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
+        let inv = (mean_square + eps).sqrt().recip();
+        for (index, value) in slice.iter_mut().enumerate() {
+            let g = gate[start + index];
+            *value *= inv * weight[index] * (g / (1.0 + (-g).exp()));
+        }
+    }
+}
+
+/// One causal depthwise-conv step for Qwen3.5's linear attention.
+///
+/// `state` is `channels × (kernel - 1)` in chronological order (oldest
+/// first) and is shifted in place; `weight` is `channels × kernel` in the
+/// safetensors `[channels, 1, kernel]` order. The produced row is
+/// `sum_k weight[channel, k] · x[t - (kernel - 1) + k]`, i.e. the exact
+/// convolution `causal_conv1d_update` computes before the caller's
+/// activation.
+pub fn causal_conv1d_step(
+    input: &[f32],
+    weight: &[f32],
+    kernel: usize,
+    state: &mut [f32],
+    output: &mut [f32],
+) {
+    let history = kernel - 1;
+    let channels = input.len();
+    for channel in 0..channels {
+        let weight_row = &weight[channel * kernel..(channel + 1) * kernel];
+        let state_row = &mut state[channel * history..(channel + 1) * history];
+        let mut value = weight_row[kernel - 1] * input[channel];
+        for index in 0..history {
+            value += weight_row[index] * state_row[index];
+        }
+        output[channel] = value;
+        if history > 0 {
+            state_row.rotate_left(1);
+            state_row[history - 1] = input[channel];
+        }
+    }
+}
+
+/// One token of Qwen3.5's gated delta rule (linear attention).
+///
+/// `query`/`key` are `num_k_heads × head_k_dim` (already L2-normalized, with
+/// the query scaled by `head_k_dim^-0.5`), `value` is
+/// `num_v_heads × head_v_dim`, and `state` is
+/// `num_v_heads × head_k_dim × head_v_dim` in `[head, key, value]` order.
+/// When the value-head count exceeds the key-head count each key head serves
+/// `num_v_heads / num_k_heads` consecutive value heads, matching HF's
+/// `repeat_interleave` grouping.
+pub fn gated_delta_step(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    gate: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    output: &mut [f32],
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) {
+    let group = num_v_heads / num_k_heads.max(1);
+    for v_head in 0..num_v_heads {
+        let k_head = v_head / group.max(1);
+        let k_base = k_head.min(num_k_heads.saturating_sub(1)) * head_k_dim;
+        let v_base = v_head * head_v_dim;
+        let state_base = v_head * head_k_dim * head_v_dim;
+        let decay = gate[v_head].exp();
+        let beta = beta[v_head];
+        // Decay the recurrent state, then project the current key through it.
+        let state_slice = &mut state[state_base..state_base + head_k_dim * head_v_dim];
+        let mut memory = vec![0f32; head_v_dim];
+        for key_index in 0..head_k_dim {
+            let k = key[k_base + key_index];
+            let row = &mut state_slice[key_index * head_v_dim..(key_index + 1) * head_v_dim];
+            for (index, entry) in row.iter_mut().enumerate() {
+                *entry *= decay;
+                memory[index] += *entry * k;
+            }
+        }
+        // Delta rule update: write only the part the old state missed.
+        let mut delta = vec![0f32; head_v_dim];
+        for index in 0..head_v_dim {
+            delta[index] = (value[v_base + index] - memory[index]) * beta;
+        }
+        for key_index in 0..head_k_dim {
+            let k = key[k_base + key_index];
+            let row = &mut state_slice[key_index * head_v_dim..(key_index + 1) * head_v_dim];
+            for index in 0..head_v_dim {
+                row[index] += k * delta[index];
+            }
+        }
+        // Read the updated state with the query.
+        let q_base = k_base;
+        for index in 0..head_v_dim {
+            let mut sum = 0f32;
+            for key_index in 0..head_k_dim {
+                sum += state_slice[key_index * head_v_dim + index] * query[q_base + key_index];
+            }
+            output[v_base + index] = sum;
+        }
     }
 }
 
@@ -981,6 +1391,234 @@ pub(crate) struct DebugCapture {
 }
 
 // ---------------------------------------------------------------------------
+// KV cache storage (f32 or opt-in Q8).
+// ---------------------------------------------------------------------------
+
+/// Whether the KV cache stores row-wise int8 codes instead of f32 values.
+/// Selected once per process through `CHEETAH_KV_Q8=1` (or the
+/// `CHEETAH_KV_QUANT_Q8` alias); unset/`0` keeps full f32 precision.
+fn kv_q8_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ["CHEETAH_KV_Q8", "CHEETAH_KV_QUANT_Q8"]
+            .iter()
+            .any(|variable| {
+                std::env::var(variable)
+                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            })
+    })
+}
+
+/// Per-layer KV storage. The layout is identical to the old f32 caches:
+/// `[position * kv_heads * head_dim + head * head_dim + dim]`; Q8 adds one
+/// f32 scale per `(position, head)`.
+enum KvStorage {
+    /// Full-precision values (default).
+    F32(Vec<f32>),
+    /// Signed int8 codes plus per-(position, head) scales.
+    Q8 { codes: Vec<i8>, scales: Vec<f32> },
+}
+
+/// One layer's key or value cache.
+pub(crate) struct KvCache {
+    storage: KvStorage,
+    /// Cached positions (rows).
+    len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+}
+
+impl KvCache {
+    /// Empty cache in the requested storage precision.
+    fn new(kv_heads: usize, head_dim: usize, q8: bool) -> Self {
+        let storage = if q8 {
+            KvStorage::Q8 {
+                codes: Vec::new(),
+                scales: Vec::new(),
+            }
+        } else {
+            KvStorage::F32(Vec::new())
+        };
+        Self {
+            storage,
+            len: 0,
+            kv_heads,
+            head_dim,
+            kv_dim: kv_heads * head_dim,
+        }
+    }
+
+    fn is_q8(&self) -> bool {
+        matches!(self.storage, KvStorage::Q8 { .. })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        match &mut self.storage {
+            KvStorage::F32(values) => values.clear(),
+            KvStorage::Q8 { codes, scales } => {
+                codes.clear();
+                scales.clear();
+            }
+        }
+        self.len = 0;
+    }
+
+    /// Reserve capacity for `positions` total cached rows (never shrinks).
+    fn reserve(&mut self, positions: usize) {
+        match &mut self.storage {
+            KvStorage::F32(values) => {
+                values.reserve(
+                    positions
+                        .saturating_mul(self.kv_dim)
+                        .saturating_sub(values.len()),
+                );
+            }
+            KvStorage::Q8 { codes, scales } => {
+                codes.reserve(
+                    positions
+                        .saturating_mul(self.kv_dim)
+                        .saturating_sub(codes.len()),
+                );
+                scales.reserve(
+                    positions
+                        .saturating_mul(self.kv_heads)
+                        .saturating_sub(scales.len()),
+                );
+            }
+        }
+    }
+
+    /// Append one position's row, quantizing per head when Q8 is selected.
+    fn append(&mut self, row: &[f32]) {
+        debug_assert_eq!(row.len(), self.kv_dim);
+        match &mut self.storage {
+            KvStorage::F32(values) => values.extend_from_slice(row),
+            KvStorage::Q8 { codes, scales } => {
+                quantize_kv_row(codes, scales, row, self.kv_heads, self.head_dim)
+            }
+        }
+        self.len += 1;
+    }
+
+    /// Restore `positions` f32 rows (converting to Q8 when this cache is Q8).
+    fn restore_f32(&mut self, values: &[f32], positions: usize) {
+        let kv_heads = self.kv_heads;
+        let head_dim = self.head_dim;
+        let kv_dim = self.kv_dim;
+        let keep = positions.min(values.len() / kv_dim.max(1));
+        match &mut self.storage {
+            KvStorage::F32(out) => {
+                out.clear();
+                out.extend_from_slice(&values[..keep * kv_dim]);
+            }
+            KvStorage::Q8 { codes, scales } => {
+                codes.clear();
+                scales.clear();
+                for position in 0..keep {
+                    let row = &values[position * kv_dim..(position + 1) * kv_dim];
+                    quantize_kv_row(codes, scales, row, kv_heads, head_dim);
+                }
+            }
+        }
+        self.len = keep;
+    }
+
+    /// Restore `positions` rows from a quantized snapshot layer, dequantizing
+    /// when this cache runs in f32 mode.
+    fn restore_q8(&mut self, layer: &QuantizedKvLayer, positions: usize) {
+        let kv_heads = self.kv_heads;
+        let head_dim = self.head_dim;
+        let kv_dim = self.kv_dim;
+        let keep = positions
+            .min(layer.codes.len() / kv_dim.max(1))
+            .min(layer.scales.len() / kv_heads.max(1));
+        match &mut self.storage {
+            KvStorage::Q8 { codes, scales } => {
+                codes.clear();
+                codes.extend_from_slice(&layer.codes[..keep * kv_dim]);
+                scales.clear();
+                scales.extend_from_slice(&layer.scales[..keep * kv_heads]);
+            }
+            KvStorage::F32(out) => {
+                out.clear();
+                out.reserve(keep * kv_dim);
+                for position in 0..keep {
+                    for head in 0..kv_heads {
+                        let scale = layer.scales[position * kv_heads + head];
+                        let base = position * kv_dim + head * head_dim;
+                        out.extend(
+                            layer.codes[base..base + head_dim]
+                                .iter()
+                                .map(|code| *code as f32 * scale),
+                        );
+                    }
+                }
+            }
+        }
+        self.len = keep;
+    }
+
+    /// Full-precision rows when this cache stores f32.
+    fn f32_values(&self) -> Option<&[f32]> {
+        match &self.storage {
+            KvStorage::F32(values) => Some(values),
+            KvStorage::Q8 { .. } => None,
+        }
+    }
+
+    /// Quantized rows when this cache stores Q8.
+    fn q8_layer(&self) -> Option<QuantizedKvLayer> {
+        match &self.storage {
+            KvStorage::Q8 { codes, scales } => Some(QuantizedKvLayer {
+                codes: codes.clone(),
+                scales: scales.clone(),
+            }),
+            KvStorage::F32(_) => None,
+        }
+    }
+
+    /// One dequantized value (tests/diagnostics).
+    #[cfg(test)]
+    fn value_at(&self, position: usize, dim: usize) -> f32 {
+        match &self.storage {
+            KvStorage::F32(values) => values[position * self.kv_dim + dim],
+            KvStorage::Q8 { codes, scales } => {
+                let head = dim / self.head_dim;
+                codes[position * self.kv_dim + dim] as f32 * scales[position * self.kv_heads + head]
+            }
+        }
+    }
+}
+
+/// Quantize one KV row head-by-head: symmetric int8 with `scale =
+/// max|value| / 127` (zero rows use scale 1.0, codes all zero).
+fn quantize_kv_row(
+    codes: &mut Vec<i8>,
+    scales: &mut Vec<f32>,
+    row: &[f32],
+    kv_heads: usize,
+    head_dim: usize,
+) {
+    for head in 0..kv_heads {
+        let values = &row[head * head_dim..(head + 1) * head_dim];
+        let max_abs = values.iter().fold(0f32, |acc, value| acc.max(value.abs()));
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        scales.push(scale);
+        codes.extend(
+            values
+                .iter()
+                .map(|value| (value / scale).round().clamp(-127.0, 127.0) as i8),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The OpsToolbox.
 // ---------------------------------------------------------------------------
 
@@ -1000,13 +1638,14 @@ pub(crate) struct OpsToolbox {
     /// Shared handle to the mapped weight store. Clones share the same
     /// mapping, so cloning a runtime does not duplicate weight pages.
     store: Arc<MmapWeightStore>,
-    /// Per-layer key cache, flattened as
-    /// [position * kv_heads * head_dim + head * head_dim + dim].
-    kv_k: Vec<Vec<f32>>,
-    /// Per-layer value cache with the same layout as `kv_k`.
-    kv_v: Vec<Vec<f32>>,
+    /// Per-layer key cache. f32 by default; `CHEETAH_KV_Q8=1` stores int8
+    /// codes plus one scale per `(position, head)`, cutting KV memory ~4x.
+    kv_k: Vec<KvCache>,
+    /// Per-layer value cache with the same storage mode as `kv_k`.
+    kv_v: Vec<KvCache>,
     /// Softmax scores for one query head, length = number of visible cached
-    /// keys. Attention-internal scratch.
+    /// keys. Reused across heads/positions so decode attention does not
+    /// allocate a score vector per head.
     scores: Vec<f32>,
     /// Selected quantization: linear units quantize at first use and compute
     /// from the quantized buffer.
@@ -1038,11 +1677,29 @@ impl Clone for OpsToolbox {
 
 impl OpsToolbox {
     /// Build a toolbox around an already-resolved config and store (test and
-    /// fixture path; the loader path uses [`OpsToolbox::open`]).
+    /// fixture path; the loader path uses [`OpsToolbox::open`]). The KV cache
+    /// precision follows the `CHEETAH_KV_Q8` selector.
     pub(crate) fn with_store(cfg: DecoderConfig, store: Arc<MmapWeightStore>) -> Self {
+        Self::with_store_kv_q8(cfg, store, kv_q8_enabled())
+    }
+
+    /// [`OpsToolbox::with_store`] with an explicit KV precision — the test
+    /// hook that lets Q8 and f32 caches be compared in one process.
+    pub(crate) fn with_store_kv_q8(
+        cfg: DecoderConfig,
+        store: Arc<MmapWeightStore>,
+        kv_q8: bool,
+    ) -> Self {
+        let kv_heads = cfg.kv_heads;
+        let head_dim = cfg.head_dim;
+        let num_layers = cfg.num_layers;
         Self {
-            kv_k: vec![Vec::new(); cfg.num_layers],
-            kv_v: vec![Vec::new(); cfg.num_layers],
+            kv_k: (0..num_layers)
+                .map(|_| KvCache::new(kv_heads, head_dim, kv_q8))
+                .collect(),
+            kv_v: (0..num_layers)
+                .map(|_| KvCache::new(kv_heads, head_dim, kv_q8))
+                .collect(),
             scores: Vec::with_capacity(4096),
             cfg,
             store,
@@ -1093,17 +1750,54 @@ impl OpsToolbox {
         token: usize,
         out: &mut Vec<f32>,
     ) -> Result<(), String> {
+        self.embedding_row_into_unit("model.embed_tokens.weight", token, out)
+    }
+
+    /// [`Self::embedding_row_into`] for a family whose embedding tensor is not
+    /// named `model.embed_tokens.weight` (Qwen3.5 wraps its text model as
+    /// `model.language_model.embed_tokens.weight`).
+    pub(crate) fn embedding_row_into_unit(
+        &self,
+        unit: &str,
+        token: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
         let (bytes, dtype, shape) = self
             .store
-            .slice("model.embed_tokens.weight")
+            .slice(unit)
             .map_err(|error| format!("Native backend: {error}"))?;
         if shape.len() != 2 || shape[1] != self.cfg.hidden_size {
-            return Err("Native backend: unexpected embedding shape.".into());
+            return Err(format!(
+                "Native backend: unexpected embedding shape for '{unit}'."
+            ));
         }
         let base = token * self.cfg.hidden_size;
         out.clear();
         out.extend((0..self.cfg.hidden_size).map(|index| scalar_at(bytes, base + index, dtype)));
         Ok(())
+    }
+
+    /// Whether the weight store carries a unit by this exact id.
+    pub(crate) fn contains_unit(&self, unit: &str) -> bool {
+        self.store.contains(unit)
+    }
+
+    /// Shape of a unit as stored in the units manifest.
+    pub(crate) fn unit_shape(&self, unit: &str) -> Option<Vec<usize>> {
+        self.store.unit_shape(unit)
+    }
+
+    /// Dequantize one unit to f32 values (small parameter tensors such as a
+    /// gated-delta `A_log`, convolution taps, or a head norm).
+    pub(crate) fn unit_values(&self, unit: &str) -> Result<Vec<f32>, String> {
+        let (bytes, dtype, shape) = self
+            .store
+            .slice(unit)
+            .map_err(|error| format!("Native backend: {error}"))?;
+        let count = shape.iter().product::<usize>();
+        Ok((0..count)
+            .map(|index| scalar_at(bytes, index, dtype))
+            .collect())
     }
 
     /// RMSNorm against the `{unit}.weight` bytes, in place on `target`.
@@ -1335,8 +2029,8 @@ impl OpsToolbox {
 
     /// Append one position's K/V rows to a layer's cache.
     pub(crate) fn cache_append(&mut self, layer: usize, k: &[f32], v: &[f32]) {
-        self.kv_k[layer].extend_from_slice(k);
-        self.kv_v[layer].extend_from_slice(v);
+        self.kv_k[layer].append(k);
+        self.kv_v[layer].append(v);
     }
 
     /// Pre-allocates every layer's KV cache for `positions` upcoming rows, so
@@ -1344,11 +2038,9 @@ impl OpsToolbox {
     /// doubling (each doubling memcpys the whole cache). Never shrinks or
     /// moves existing contents; a no-op when the capacity is already there.
     pub(crate) fn reserve_kv(&mut self, positions: usize) {
-        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
-        let needed = positions.saturating_mul(kv_dim);
         for (keys, values) in self.kv_k.iter_mut().zip(self.kv_v.iter_mut()) {
-            keys.reserve(needed.saturating_sub(keys.len()));
-            values.reserve(needed.saturating_sub(values.len()));
+            keys.reserve(positions);
+            values.reserve(positions);
         }
     }
 
@@ -1362,9 +2054,14 @@ impl OpsToolbox {
     /// all-masked row is impossible). The softmax-weighted value mix lands in
     /// `out` (pre-zeroed by the caller). This is the same math the
     /// `shared_ops.comp` attention shader runs on the GPU side.
+    ///
+    /// The cache may be f32 or Q8 (`CHEETAH_KV_Q8`); both paths produce the
+    /// same shape of result, with Q8 codes expanded on the fly so no
+    /// dequantized copy of the cache exists. The decode path reuses one score
+    /// buffer across heads instead of allocating per head.
     pub(crate) fn attention(&mut self, layer: usize, position: usize, q: &[f32], out: &mut [f32]) {
         let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
-        let cache_len = self.kv_k[layer].len() / kv_dim;
+        let cache_len = self.kv_k[layer].len();
         let head_group = self.cfg.q_heads / self.cfg.kv_heads;
         let scale = 1.0 / (self.cfg.head_dim as f32).sqrt();
         // Sparse (sliding-window) attention: the query at `position` only
@@ -1379,6 +2076,7 @@ impl OpsToolbox {
         // Never start past the cache: an all-masked softmax would be NaN.
         let window_start = window_start.min(cache_len.saturating_sub(1));
         let head_dim = self.cfg.head_dim;
+        let kv_heads = self.cfg.kv_heads;
         let q_heads = self.cfg.q_heads;
         let keys = &self.kv_k[layer];
         let values = &self.kv_v[layer];
@@ -1387,11 +2085,16 @@ impl OpsToolbox {
         // prefill, so heads fan out to rayon (short caches and single-head
         // configs run sequentially — the fork/join would cost more than the
         // math). The math per head is unchanged, so results stay bit-exact.
-        let parallel = q_heads > 1 && cache_len >= ATTENTION_PARALLEL_MIN_CACHE;
-        let head_results: Vec<(Vec<f32>, Vec<f32>)> = if parallel {
-            (0..q_heads)
+        // The debug capture hook forces the sequential path so it can keep
+        // head 0's score vector.
+        let parallel =
+            q_heads > 1 && cache_len >= ATTENTION_PARALLEL_MIN_CACHE && !self.debug_capture_armed;
+        if parallel {
+            let head_results: Vec<(Vec<f32>, Vec<f32>)> = (0..q_heads)
                 .into_par_iter()
                 .map(|head| {
+                    let mut scores = vec![f32::NEG_INFINITY; cache_len];
+                    let mut head_out = vec![0f32; head_dim];
                     Self::attention_head(
                         keys,
                         values,
@@ -1399,45 +2102,57 @@ impl OpsToolbox {
                         cache_len,
                         window_start,
                         kv_dim,
+                        kv_heads,
                         head_group,
                         head_dim,
                         scale,
                         head,
-                    )
+                        &mut scores,
+                        &mut head_out,
+                    );
+                    (scores, head_out)
                 })
-                .collect()
+                .collect();
+            for (head, (_, head_out)) in head_results.iter().enumerate() {
+                out[head * head_dim..(head + 1) * head_dim].copy_from_slice(head_out);
+            }
         } else {
-            (0..q_heads)
-                .map(|head| {
-                    Self::attention_head(
-                        keys,
-                        values,
-                        q,
-                        cache_len,
-                        window_start,
-                        kv_dim,
-                        head_group,
-                        head_dim,
-                        scale,
-                        head,
-                    )
-                })
-                .collect()
-        };
-        for (head, (_, head_out)) in head_results.iter().enumerate() {
-            out[head * head_dim..(head + 1) * head_dim].copy_from_slice(head_out);
-        }
-        if self.debug_capture_armed {
-            self.debug_capture_armed = false;
-            let head0_scores = head_results
-                .into_iter()
-                .next()
-                .map(|(scores, _)| scores)
-                .expect("armed capture always records head 0");
-            self.debug_capture_buf = Some(DebugCapture {
-                scores: head0_scores,
-                attn_out: out.to_vec(),
-            });
+            let mut scores = std::mem::take(&mut self.scores);
+            scores.clear();
+            scores.resize(cache_len, f32::NEG_INFINITY);
+            let mut head0_scores = None;
+            for head in 0..q_heads {
+                // Every head rewrites the visible window; reset the mask
+                // before the next head so stale softmax values cannot leak.
+                scores.fill(f32::NEG_INFINITY);
+                let head_out = &mut out[head * head_dim..(head + 1) * head_dim];
+                Self::attention_head(
+                    keys,
+                    values,
+                    q,
+                    cache_len,
+                    window_start,
+                    kv_dim,
+                    kv_heads,
+                    head_group,
+                    head_dim,
+                    scale,
+                    head,
+                    &mut scores,
+                    head_out,
+                );
+                if self.debug_capture_armed && head == 0 {
+                    head0_scores = Some(scores.clone());
+                }
+            }
+            self.scores = scores;
+            if self.debug_capture_armed {
+                self.debug_capture_armed = false;
+                self.debug_capture_buf = Some(DebugCapture {
+                    scores: head0_scores.expect("armed capture always records head 0"),
+                    attn_out: out.to_vec(),
+                });
+            }
         }
     }
 
@@ -1446,6 +2161,68 @@ impl OpsToolbox {
     /// per-head fan-out inside [`OpsToolbox::attention`] relies on that.
     #[allow(clippy::too_many_arguments)]
     fn attention_head(
+        keys: &KvCache,
+        values: &KvCache,
+        q: &[f32],
+        cache_len: usize,
+        window_start: usize,
+        kv_dim: usize,
+        kv_heads: usize,
+        head_group: usize,
+        head_dim: usize,
+        scale: f32,
+        head: usize,
+        scores: &mut [f32],
+        out_head: &mut [f32],
+    ) {
+        match (&keys.storage, &values.storage) {
+            (KvStorage::F32(keys), KvStorage::F32(values)) => Self::attention_head_f32(
+                keys,
+                values,
+                q,
+                cache_len,
+                window_start,
+                kv_dim,
+                head_group,
+                head_dim,
+                scale,
+                head,
+                scores,
+                out_head,
+            ),
+            (
+                KvStorage::Q8 {
+                    codes: key_codes,
+                    scales: key_scales,
+                },
+                KvStorage::Q8 {
+                    codes: value_codes,
+                    scales: value_scales,
+                },
+            ) => Self::attention_head_q8(
+                key_codes,
+                key_scales,
+                value_codes,
+                value_scales,
+                q,
+                cache_len,
+                window_start,
+                kv_dim,
+                kv_heads,
+                head_group,
+                head_dim,
+                scale,
+                head,
+                scores,
+                out_head,
+            ),
+            _ => unreachable!("key and value caches always share one storage mode"),
+        }
+    }
+
+    /// f32 attention head (the default precision).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_head_f32(
         keys: &[f32],
         values: &[f32],
         q: &[f32],
@@ -1456,11 +2233,12 @@ impl OpsToolbox {
         head_dim: usize,
         scale: f32,
         head: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
+        scores: &mut [f32],
+        out_head: &mut [f32],
+    ) {
         let kv_head = head / head_group;
         let q_base = head * head_dim;
         let kv_base = kv_head * head_dim;
-        let mut scores = vec![f32::NEG_INFINITY; cache_len];
         for pos in window_start..cache_len {
             let k_base = pos * kv_dim + kv_base;
             let score: f32 = keys[k_base..k_base + head_dim]
@@ -1470,12 +2248,12 @@ impl OpsToolbox {
                 .sum();
             scores[pos] = score * scale;
         }
-        softmax(&mut scores);
+        softmax(scores);
         // Weighted value mix: per position, one contiguous `head_dim` slice
         // of the V cache. Slices (not per-element indexing) keep this
         // auto-vectorizable — a bounds-checked `kv_v[base+index]` per element
         // ran this loop ~10x slower at long contexts.
-        let mut out_head = vec![0f32; head_dim];
+        out_head.fill(0.0);
         for pos in window_start..cache_len {
             let weight = scores[pos];
             if weight == 0.0 {
@@ -1487,7 +2265,55 @@ impl OpsToolbox {
                 *out_value += weight * v;
             }
         }
-        (scores, out_head)
+    }
+
+    /// Q8 attention head: key scores run as int8×f32 dots (per-head scale
+    /// applied after the dot), and the value mix expands int8 codes directly
+    /// into the f32 accumulator — the cache is never dequantized as a whole.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_head_q8(
+        key_codes: &[i8],
+        key_scales: &[f32],
+        value_codes: &[i8],
+        value_scales: &[f32],
+        q: &[f32],
+        cache_len: usize,
+        window_start: usize,
+        kv_dim: usize,
+        kv_heads: usize,
+        head_group: usize,
+        head_dim: usize,
+        scale: f32,
+        head: usize,
+        scores: &mut [f32],
+        out_head: &mut [f32],
+    ) {
+        let kv_head = head / head_group;
+        let q_base = head * head_dim;
+        let kv_base = kv_head * head_dim;
+        for pos in window_start..cache_len {
+            let code_base = pos * kv_dim + kv_base;
+            let raw = dot_i8_f32(
+                &key_codes[code_base..code_base + head_dim],
+                &q[q_base..q_base + head_dim],
+            );
+            let key_scale = key_scales[pos * kv_heads + kv_head];
+            scores[pos] = raw * key_scale * scale;
+        }
+        softmax(scores);
+        out_head.fill(0.0);
+        for pos in window_start..cache_len {
+            let weight = scores[pos] * value_scales[pos * kv_heads + kv_head];
+            if weight == 0.0 {
+                continue;
+            }
+            let code_base = pos * kv_dim + kv_base;
+            accumulate_i8_f32(
+                &value_codes[code_base..code_base + head_dim],
+                weight,
+                out_head,
+            );
+        }
     }
 
     /// RC2-B: routing-aware per-expert residency management. Evict the
@@ -1586,47 +2412,98 @@ impl OpsToolbox {
         Ok(())
     }
 
-    /// Cached positions in one layer's KV cache (test/diagnostics view:
-    /// `kv_k[layer].len() / kv_dim`).
+    /// Cached positions in one layer's KV cache (test/diagnostics view).
     #[cfg(test)]
     pub(crate) fn kv_len(&self, layer: usize) -> usize {
-        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
-        self.kv_k[layer].len() / kv_dim.max(1)
+        self.kv_k[layer].len()
     }
 
     /// Captures the current KV state (all layers, all stored positions) for
-    /// cross-generation prefix reuse.
+    /// cross-generation prefix reuse. A Q8 cache snapshots its codes and
+    /// scales directly, so the prefix cache does not inflate back to f32.
     pub(crate) fn kv_snapshot(&self) -> KvSnapshot {
-        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
-        let positions = self
-            .kv_k
-            .first()
-            .map(|layer| layer.len() / kv_dim.max(1))
-            .unwrap_or(0);
-        KvSnapshot {
-            positions,
-            kv_k: self.kv_k.clone(),
-            kv_v: self.kv_v.clone(),
+        let positions = self.kv_k.first().map(KvCache::len).unwrap_or(0);
+        if self.kv_k.first().is_some_and(KvCache::is_q8) {
+            let q8 = QuantizedKvSnapshot {
+                kv_k: self
+                    .kv_k
+                    .iter()
+                    .map(|cache| {
+                        cache
+                            .q8_layer()
+                            .expect("a Q8 toolbox always snapshots Q8 layers")
+                    })
+                    .collect(),
+                kv_v: self
+                    .kv_v
+                    .iter()
+                    .map(|cache| {
+                        cache
+                            .q8_layer()
+                            .expect("a Q8 toolbox always snapshots Q8 layers")
+                    })
+                    .collect(),
+            };
+            KvSnapshot {
+                positions,
+                kv_k: Vec::new(),
+                kv_v: Vec::new(),
+                q8: Some(q8),
+            }
+        } else {
+            KvSnapshot {
+                positions,
+                kv_k: self
+                    .kv_k
+                    .iter()
+                    .map(|cache| {
+                        cache
+                            .f32_values()
+                            .expect("an f32 toolbox always snapshots f32 layers")
+                            .to_vec()
+                    })
+                    .collect(),
+                kv_v: self
+                    .kv_v
+                    .iter()
+                    .map(|cache| {
+                        cache
+                            .f32_values()
+                            .expect("an f32 toolbox always snapshots f32 layers")
+                            .to_vec()
+                    })
+                    .collect(),
+                q8: None,
+            }
         }
     }
 
     /// Restores the first `positions` positions of `snapshot` into this
     /// toolbox's (freshly cleared) KV caches, truncating anything beyond.
     /// The result must be bit-equivalent to having prefilled those tokens
-    /// here — the decoder KV-continuation tests pin that property.
+    /// here — the decoder KV-continuation tests pin that property. Snapshots
+    /// and caches may use different precisions; the restore converts when
+    /// they do (Q8 snapshots into an f32 cache, or vice versa).
     pub(crate) fn restore_kv_prefix(&mut self, snapshot: &KvSnapshot, positions: usize) {
-        let kv_dim = self.cfg.kv_heads * self.cfg.head_dim;
-        let keep = positions.min(snapshot.positions).saturating_mul(kv_dim);
-        self.kv_k = snapshot
-            .kv_k
-            .iter()
-            .map(|layer| layer.iter().take(keep).copied().collect())
-            .collect();
-        self.kv_v = snapshot
-            .kv_v
-            .iter()
-            .map(|layer| layer.iter().take(keep).copied().collect())
-            .collect();
+        let keep = positions.min(snapshot.positions);
+        for cache in self.kv_k.iter_mut().chain(self.kv_v.iter_mut()) {
+            cache.clear();
+        }
+        if let Some(q8) = &snapshot.q8 {
+            for (cache, layer) in self.kv_k.iter_mut().zip(q8.kv_k.iter()) {
+                cache.restore_q8(layer, keep);
+            }
+            for (cache, layer) in self.kv_v.iter_mut().zip(q8.kv_v.iter()) {
+                cache.restore_q8(layer, keep);
+            }
+        } else {
+            for (cache, layer) in self.kv_k.iter_mut().zip(snapshot.kv_k.iter()) {
+                cache.restore_f32(layer, keep);
+            }
+            for (cache, layer) in self.kv_v.iter_mut().zip(snapshot.kv_v.iter()) {
+                cache.restore_f32(layer, keep);
+            }
+        }
     }
 
     /// Clear every layer's KV cache.
@@ -2107,5 +2984,230 @@ mod tests {
             (fused - reference).abs() / reference.abs().max(1.0) < 1e-5,
             "full-width fused ({fused}) diverges from reference ({reference})"
         );
+    }
+
+    /// Q8 KV cache round trip: per-head int8 quantization stays within half a
+    /// code step, and snapshot layers restore bit-for-bit into another Q8
+    /// cache (or convert losslessly into f32).
+    #[test]
+    fn kv_cache_q8_round_trip_and_conversion() {
+        let kv_heads = 2usize;
+        let head_dim = 4usize;
+        let kv_dim = kv_heads * head_dim;
+        let rows: Vec<Vec<f32>> = (0..5)
+            .map(|position| {
+                (0..kv_dim)
+                    .map(|dim| ((position * 7 + dim * 3) % 19) as f32 * 0.1 - 0.9)
+                    .collect()
+            })
+            .collect();
+
+        let mut f32_cache = KvCache::new(kv_heads, head_dim, false);
+        let mut q8_cache = KvCache::new(kv_heads, head_dim, true);
+        for row in &rows {
+            f32_cache.append(row);
+            q8_cache.append(row);
+        }
+        assert_eq!(q8_cache.len(), rows.len());
+        assert!(q8_cache.is_q8());
+        for position in 0..rows.len() {
+            let max_abs = rows[position]
+                .iter()
+                .fold(0f32, |acc, value| acc.max(value.abs()));
+            let half_code = (max_abs / 127.0) / 2.0;
+            for dim in 0..kv_dim {
+                let restored = q8_cache.value_at(position, dim);
+                let original = f32_cache.value_at(position, dim);
+                assert!(
+                    (restored - original).abs() <= half_code + 1e-6,
+                    "position {position} dim {dim}: {restored} vs {original}, half-code {half_code}"
+                );
+            }
+        }
+
+        let layer = q8_cache.q8_layer().expect("Q8 cache must snapshot Q8");
+        let mut restored_q8 = KvCache::new(kv_heads, head_dim, true);
+        restored_q8.restore_q8(&layer, 3);
+        assert_eq!(restored_q8.len(), 3);
+        for position in 0..3 {
+            for dim in 0..kv_dim {
+                assert_eq!(
+                    restored_q8.value_at(position, dim),
+                    q8_cache.value_at(position, dim)
+                );
+            }
+        }
+
+        let mut restored_f32 = KvCache::new(kv_heads, head_dim, false);
+        restored_f32.restore_q8(&layer, rows.len());
+        for position in 0..rows.len() {
+            for dim in 0..kv_dim {
+                assert!(
+                    (restored_f32.value_at(position, dim) - q8_cache.value_at(position, dim)).abs()
+                        < 1e-6
+                );
+            }
+        }
+
+        let values = f32_cache.f32_values().unwrap().to_vec();
+        let mut q8_from_f32 = KvCache::new(kv_heads, head_dim, true);
+        q8_from_f32.restore_f32(&values, rows.len());
+        assert_eq!(q8_from_f32.len(), rows.len());
+        assert_eq!(
+            q8_from_f32.value_at(4, 7),
+            q8_cache.value_at(4, 7),
+            "restoring the same rows must produce the same codes/scales"
+        );
+
+        q8_from_f32.clear();
+        assert_eq!(q8_from_f32.len(), 0);
+        assert!(q8_from_f32.q8_layer().unwrap().codes.is_empty());
+    }
+
+    /// Q8 attention matches the f32 path within quantization error: the same
+    /// K/V rows fed to both caches (one f32, one Q8) produce head outputs
+    /// that differ only by the int8 rounding of the keys/values. Window
+    /// masking and a cache length with an AVX2 tail are exercised.
+    #[test]
+    fn attention_q8_matches_f32_within_quantization_error() {
+        let kv_heads = 2usize;
+        let head_dim = 8usize;
+        let q_heads = 4usize;
+        let head_group = q_heads / kv_heads;
+        let kv_dim = kv_heads * head_dim;
+        let cache_len = 305usize; // 8-lane remainder 1: exercises the tails
+        let window_start = 123usize;
+
+        let keys: Vec<Vec<f32>> = (0..cache_len)
+            .map(|position| {
+                (0..kv_dim)
+                    .map(|dim| ((position * 13 + dim * 7) % 37) as f32 / 18.0 - 1.0)
+                    .collect()
+            })
+            .collect();
+        let values: Vec<Vec<f32>> = (0..cache_len)
+            .map(|position| {
+                (0..kv_dim)
+                    .map(|dim| ((position * 5 + dim * 11) % 31) as f32 / 15.0 - 1.0)
+                    .collect()
+            })
+            .collect();
+
+        let mut f32_keys = KvCache::new(kv_heads, head_dim, false);
+        let mut f32_values = KvCache::new(kv_heads, head_dim, false);
+        let mut q8_keys = KvCache::new(kv_heads, head_dim, true);
+        let mut q8_values = KvCache::new(kv_heads, head_dim, true);
+        for position in 0..cache_len {
+            f32_keys.append(&keys[position]);
+            f32_values.append(&values[position]);
+            q8_keys.append(&keys[position]);
+            q8_values.append(&values[position]);
+        }
+
+        let q: Vec<f32> = (0..q_heads * head_dim)
+            .map(|index| ((index * 3) % 17) as f32 / 8.0 - 1.0)
+            .collect();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let f32_keys = f32_keys.f32_values().unwrap();
+        let f32_values = f32_values.f32_values().unwrap();
+        let KvStorage::Q8 {
+            codes: key_codes,
+            scales: key_scales,
+        } = &q8_keys.storage
+        else {
+            panic!("Q8 cache must store codes");
+        };
+        let KvStorage::Q8 {
+            codes: value_codes,
+            scales: value_scales,
+        } = &q8_values.storage
+        else {
+            panic!("Q8 cache must store codes");
+        };
+
+        let mut max_abs_error = 0f32;
+        for head in 0..q_heads {
+            let mut f32_scores = vec![f32::NEG_INFINITY; cache_len];
+            let mut f32_out = vec![0f32; head_dim];
+            OpsToolbox::attention_head_f32(
+                f32_keys,
+                f32_values,
+                &q,
+                cache_len,
+                window_start,
+                kv_dim,
+                head_group,
+                head_dim,
+                scale,
+                head,
+                &mut f32_scores,
+                &mut f32_out,
+            );
+
+            let mut q8_scores = vec![f32::NEG_INFINITY; cache_len];
+            let mut q8_out = vec![0f32; head_dim];
+            OpsToolbox::attention_head_q8(
+                key_codes,
+                key_scales,
+                value_codes,
+                value_scales,
+                &q,
+                cache_len,
+                window_start,
+                kv_dim,
+                kv_heads,
+                head_group,
+                head_dim,
+                scale,
+                head,
+                &mut q8_scores,
+                &mut q8_out,
+            );
+
+            for dim in 0..head_dim {
+                max_abs_error = max_abs_error.max((f32_out[dim] - q8_out[dim]).abs());
+            }
+        }
+        assert!(
+            max_abs_error < 3e-2,
+            "Q8 attention diverged from f32 by {max_abs_error}"
+        );
+    }
+
+    /// Full-width Q8/Q4 matvecs exercise the AVX2 widening kernels against the
+    /// scalar dequantized reference (the small existing tests only hit the
+    /// tail paths).
+    #[test]
+    fn quantized_gemv_full_width_matches_dequant_reference() {
+        let rows = 17usize;
+        let cols = 896usize;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index * 37 % 251) as f32 - 125.0) / 64.0)
+            .collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|index| ((index * 13 % 29) as f32 - 14.0) / 16.0)
+            .collect();
+
+        for (format, gemv) in [
+            ("q8", gemv_q8 as fn(&[u8], usize, usize, &[f32], &mut [f32])),
+            ("q4", gemv_q4),
+        ] {
+            let quantize = crate::chat::precision::native_ops_for_format(format)
+                .and_then(|ops| ops.quantize)
+                .expect("quantized formats register a native quantizer");
+            let buffer = quantize(&values, rows, cols).unwrap();
+            let mut y = vec![0f32; rows];
+            gemv(buffer.buffer(), rows, cols, &x, &mut y);
+            for row in 0..rows {
+                let want: f32 = (0..cols)
+                    .map(|col| buffer.dequant_value(row, col) * x[col])
+                    .sum();
+                assert!(
+                    (y[row] - want).abs() <= 1e-3 * want.abs().max(1.0),
+                    "{format} row {row}: {} vs {want}",
+                    y[row]
+                );
+            }
+        }
     }
 }
