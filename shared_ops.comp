@@ -280,6 +280,250 @@ void run_bias_add(uint index) {
     b2.data[index] = floatBitsToUint(value);
 }
 
+// --- Generic operator catalog (xxx_ops): op codes 10..17 -------------------
+// All of these read/write raw f32 buffers directly (weight-format code is
+// unused), keeping them symmetric with the native catalog implementations.
+// Elementwise/reduction ops dispatch one thread per output element and
+// recompute their row/group/head reduction redundantly — correctness first.
+
+float gelu_tanh(float value) {
+    float inner = 0.7978845608 * (value + 0.044715 * value * value * value);
+    return 0.5 * value * (1.0 + tanh(inner));
+}
+
+// op 10: unary activation. p1 = count, p2 = sub-op, p3 = f32 param bits
+// (leaky_relu alpha; ignored otherwise). b0 = in, b2 = out.
+void run_activation(uint index) {
+    uint count = params.p1;
+    if (index >= count) {
+        return;
+    }
+    float value = uintBitsToFloat(b0.data[index]);
+    uint sub = params.p2;
+    if (sub == 0u) {
+        value = max(value, 0.0);
+    } else if (sub == 1u) {
+        float alpha = uintBitsToFloat(params.p3);
+        value = value >= 0.0 ? value : value * alpha;
+    } else if (sub == 2u) {
+        value = tanh(value);
+    } else if (sub == 3u) {
+        value = 1.0 / (1.0 + exp(-value));
+    } else if (sub == 4u) {
+        value = value / (1.0 + exp(-value));
+    } else if (sub == 5u) {
+        value = gelu_tanh(value);
+    } else if (sub == 6u) {
+        value = gelu_erf(value);
+    } else if (sub == 7u) {
+        value = value > 20.0 ? value : log(1.0 + exp(value));
+    }
+    b2.data[index] = floatBitsToUint(value);
+}
+
+// op 11: binary elementwise with rhs broadcast. p1 = count, p2 = period,
+// p3 = sub-op. b0 = lhs, b1 = rhs, b2 = out.
+void run_binary(uint index) {
+    uint count = params.p1;
+    uint period = params.p2;
+    if (index >= count) {
+        return;
+    }
+    float lhs = uintBitsToFloat(b0.data[index]);
+    float rhs = uintBitsToFloat(b1.data[index % period]);
+    uint sub = params.p3;
+    float result;
+    if (sub == 0u) {
+        result = lhs + rhs;
+    } else if (sub == 1u) {
+        result = lhs - rhs;
+    } else if (sub == 2u) {
+        result = lhs * rhs;
+    } else if (sub == 3u) {
+        result = lhs / rhs;
+    } else if (sub == 4u) {
+        result = max(lhs, rhs);
+    } else {
+        result = min(lhs, rhs);
+    }
+    b2.data[index] = floatBitsToUint(result);
+}
+
+// op 12: rms_norm with gemma-style (1 + weight) offset. p1 = rows,
+// p2 = width, p3 = f32 eps bits, p4 = weight format (0 = f32). b0 = x,
+// b1 = weight, b2 = out.
+void run_rms_norm_offset(uint index) {
+    uint rows = params.p1;
+    uint width = params.p2;
+    uint total = rows * width;
+    if (index >= total) {
+        return;
+    }
+    uint row = index / width;
+    uint start = row * width;
+    float sum = 0.0;
+    for (uint i = 0u; i < width; ++i) {
+        float value = uintBitsToFloat(b0.data[start + i]);
+        sum += value * value;
+    }
+    float inverse = inversesqrt(sum / float(width) + uintBitsToFloat(params.p3));
+    uint channel = index - start;
+    float value = uintBitsToFloat(b0.data[index]);
+    float weight = load_weight(channel, params.p4);
+    b2.data[index] = floatBitsToUint(value * inverse * (1.0 + weight));
+}
+
+// op 13: group_norm over each row's `width` channels split into `p5` groups.
+// p1 = rows, p2 = width, p3 = f32 eps bits, p4 = format (0 = f32), p5 = groups.
+// b0 = x, b1 = weight, b4 = bias (bind zeros if unused), b2 = out.
+void run_group_norm(uint index) {
+    uint rows = params.p1;
+    uint width = params.p2;
+    uint groups = params.p5;
+    uint total = rows * width;
+    if (index >= total) {
+        return;
+    }
+    uint row = index / width;
+    uint row_start = row * width;
+    uint channel = index - row_start;
+    uint group_size = width / groups;
+    uint group = channel / group_size;
+    uint group_start = row_start + group * group_size;
+    float mean = 0.0;
+    for (uint i = 0u; i < group_size; ++i) {
+        mean += uintBitsToFloat(b0.data[group_start + i]);
+    }
+    mean /= float(group_size);
+    float variance = 0.0;
+    for (uint i = 0u; i < group_size; ++i) {
+        float delta = uintBitsToFloat(b0.data[group_start + i]) - mean;
+        variance += delta * delta;
+    }
+    float inverse = inversesqrt(variance / float(group_size) + uintBitsToFloat(params.p3));
+    float normalized = (uintBitsToFloat(b0.data[index]) - mean) * inverse;
+    b2.data[index] = floatBitsToUint(normalized * load_weight(channel, params.p4) +
+                                    load_bias(channel, params.p4));
+}
+
+// op 14: per-head L2 norm. p1 = heads, p2 = head_dim. b0 = x, b2 = out.
+void run_l2_norm(uint index) {
+    uint heads = params.p1;
+    uint head_dim = params.p2;
+    uint total = heads * head_dim;
+    if (index >= total) {
+        return;
+    }
+    uint head = index / head_dim;
+    uint head_start = head * head_dim;
+    float sum = 0.0;
+    for (uint i = 0u; i < head_dim; ++i) {
+        float value = uintBitsToFloat(b0.data[head_start + i]);
+        sum += value * value;
+    }
+    float inverse = inversesqrt(sum + 1e-6);
+    b2.data[index] = floatBitsToUint(uintBitsToFloat(b0.data[index]) * inverse);
+}
+
+// op 15: row-wise softmax. p1 = rows, p2 = width. b0 = x, b2 = out.
+void run_softmax(uint index) {
+    uint rows = params.p1;
+    uint width = params.p2;
+    uint total = rows * width;
+    if (index >= total) {
+        return;
+    }
+    uint row = index / width;
+    uint row_start = row * width;
+    float max_value = -3.402823466e+38;
+    for (uint i = 0u; i < width; ++i) {
+        max_value = max(max_value, uintBitsToFloat(b0.data[row_start + i]));
+    }
+    float denominator = 0.0;
+    for (uint i = 0u; i < width; ++i) {
+        denominator += exp(uintBitsToFloat(b0.data[row_start + i]) - max_value);
+    }
+    float value = uintBitsToFloat(b0.data[index]);
+    b2.data[index] = floatBitsToUint(exp(value - max_value) / denominator);
+}
+
+// op 16: one causal depthwise-conv1d step. p1 = channels, p2 = kernel.
+// b0 = input, b1 = weight [channels*kernel], b2 = output, b3 = state
+// [channels*(kernel-1)] shifted in place. One thread per channel.
+void run_conv1d_step(uint channel) {
+    uint channels = params.p1;
+    uint kernel = params.p2;
+    if (channel >= channels) {
+        return;
+    }
+    uint history = kernel - 1u;
+    uint weight_base = channel * kernel;
+    float value = uintBitsToFloat(b1.data[weight_base + history]) *
+                  uintBitsToFloat(b0.data[channel]);
+    for (uint i = 0u; i < history; ++i) {
+        value += uintBitsToFloat(b1.data[weight_base + i]) *
+                 uintBitsToFloat(b3.data[channel * history + i]);
+    }
+    b2.data[channel] = floatBitsToUint(value);
+    if (history > 0u) {
+        for (uint i = 0u; i + 1u < history; ++i) {
+            b3.data[channel * history + i] = b3.data[channel * history + i + 1u];
+        }
+        b3.data[channel * history + history - 1u] = b0.data[channel];
+    }
+}
+
+// op 17: one gated-delta-rule (linear attention) step. One thread per value
+// head (p2). p1 = num_k_heads, p2 = num_v_heads, p3 = head_k_dim,
+// p4 = head_v_dim. Buffers: b0 = query, b1 = key, b2 = output, b3 = state
+// (read+write), b4 = packed [value | gate | beta] (value first, then
+// num_v_heads gate scalars, then num_v_heads beta scalars).
+void run_gated_delta_step(uint v_head) {
+    uint num_k_heads = params.p1;
+    uint num_v_heads = params.p2;
+    uint head_k_dim = params.p3;
+    uint head_v_dim = params.p4;
+    if (v_head >= num_v_heads) {
+        return;
+    }
+    uint group = num_v_heads / max(num_k_heads, 1u);
+    uint k_head = v_head / max(group, 1u);
+    uint k_base = min(k_head, max(num_k_heads, 1u) - 1u) * head_k_dim;
+    uint v_base = v_head * head_v_dim;
+    uint state_base = v_head * head_k_dim * head_v_dim;
+    uint value_size = num_v_heads * head_v_dim;
+    float decay = exp(uintBitsToFloat(b4.data[value_size + v_head]));
+    float beta = uintBitsToFloat(b4.data[value_size + num_v_heads + v_head]);
+
+    float b = 0.0;
+    for (uint k = 0u; k < head_k_dim; ++k) {
+        b += uintBitsToFloat(b1.data[k_base + k]) * uintBitsToFloat(b0.data[k_base + k]);
+    }
+    for (uint v_index = 0u; v_index < head_v_dim; ++v_index) {
+        float value = uintBitsToFloat(b4.data[v_base + v_index]);
+        float a = 0.0;
+        float c = 0.0;
+        for (uint k = 0u; k < head_k_dim; ++k) {
+            uint addr = state_base + k * head_v_dim + v_index;
+            float s0 = uintBitsToFloat(b3.data[addr]);
+            float sd = s0 * decay;
+            float kk = uintBitsToFloat(b1.data[k_base + k]);
+            float qq = uintBitsToFloat(b0.data[k_base + k]);
+            a += sd * kk;
+            c += sd * qq;
+            b3.data[addr] = floatBitsToUint(sd);
+        }
+        float delta = (value - a) * beta;
+        b2.data[v_base + v_index] = floatBitsToUint(c + delta * b);
+        for (uint k = 0u; k < head_k_dim; ++k) {
+            uint addr = state_base + k * head_v_dim + v_index;
+            float sd = uintBitsToFloat(b3.data[addr]);
+            float kk = uintBitsToFloat(b1.data[k_base + k]);
+            b3.data[addr] = floatBitsToUint(sd + kk * delta);
+        }
+    }
+}
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (params.op == 0u) {
@@ -302,5 +546,21 @@ void main() {
         run_embedding_gather(index);
     } else if (params.op == 9u) {
         run_bias_add(index);
+    } else if (params.op == 10u) {
+        run_activation(index);
+    } else if (params.op == 11u) {
+        run_binary(index);
+    } else if (params.op == 12u) {
+        run_rms_norm_offset(index);
+    } else if (params.op == 13u) {
+        run_group_norm(index);
+    } else if (params.op == 14u) {
+        run_l2_norm(index);
+    } else if (params.op == 15u) {
+        run_softmax(index);
+    } else if (params.op == 16u) {
+        run_conv1d_step(index);
+    } else if (params.op == 17u) {
+        run_gated_delta_step(index);
     }
 }

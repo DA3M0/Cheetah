@@ -23,6 +23,9 @@
 //! native side follows.
 
 #[cfg(feature = "vulkan")]
+#[allow(dead_code)] // additive catalog: callers arrive with model-forward adoption
+pub(crate) mod ops;
+#[cfg(feature = "vulkan")]
 pub(crate) mod transformer;
 pub(crate) mod weights;
 

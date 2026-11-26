@@ -17,7 +17,7 @@ Line numbers are approximate (they drift); function names are the anchors.
 ```
 cheetah/
 ├── Cargo.toml                  features: default={} | metal | cuda | vulkan
-├── build.rs                    shader discovery + generated shader registry
+├── build.rs                    shader discovery + generated model/precision/ops registries
 ├── cheetah_init.c/.h           native model preparation (init) + manifest/units writers
 ├── cheetah_memory.c/.h         Ant C manager: units index, tier bookkeeping (metadata)
 ├── cheetah_vulkan.c/.h         Vulkan substrate: device init, VRAM pool, matmul/rope/attention
@@ -46,8 +46,13 @@ cheetah/
 │   │   ├── precision.rs        ★ weight-precision registry: shared types, lookups, typed byte views
 │   │   ├── precision/          ★ one file per format: operators + the format's declarative registration
 │   │   │                       (f32/f16/bf16/q4/q8 → native+vulkan ops; build.rs → generated REGISTRY)
+│   │   ├── ops.rs              ★ generic operator catalog: shared types, op codes, lookups, generated REGISTRY
+│   │   ├── ops/                ★ one file per operator family: native fn pointers + Vulkan op entries
+│   │   │   ├── shaders/        custom-shader ops (.comp, shared_ops ABI; build.rs → custom_op_shaders.rs)
+│   │   │   └── ...             activations / elementwise / norms / positional / stateful / custom
 │   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
 │   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
+│   │       ├── ops.rs          generic catalog dispatch (VulkanOp → 5 buffers + 8 push constants)
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
 │   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs; docs/MCP.md)
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c
@@ -238,6 +243,19 @@ run_init_command      src/main.rs:90
 | `gemv_q8` / `gemv_q4` / `dequant_values` | native/ops.rs (re-exported by `native/kernels.rs`) | int8/int4 ×scale per-row gemv (same math as `matmul_q8.comp` / `matmul_q4.comp`) + f32 dequant feeding the quantize operators |
 | `OpsToolbox::linear` | native/ops.rs | native linear dispatch: quantize-at-first-use + registered gemv; original precisions dispatch by dtype format id |
 
+### `src/chat/ops.rs` + `src/chat/ops/` — generic operator catalog (`xxx_ops`)
+
+| Item | File | Role |
+|------|------|------|
+| `OpRegistration` / `OpEntry` / `OpBackend` | ops.rs | shared registration types; each file under `src/chat/ops/` declares one operator family and its entries; build.rs scans the directory → generated `ops_registry.rs` (`REGISTRY`) |
+| `NativeOp` | ops.rs | native operator signature families: `Unary` / `InPlaceBinop` / `Binary` / `Norm` / `NormL2` / `Softmax` / `Rope` / `Embedding` / `Conv1dStep` / `GatedDeltaStep`; stored as plain fn pointers |
+| `VulkanOp` / `CustomShader` | ops.rs | Vulkan binding: stable op code + `OpKind` + sub-op selector; op codes ≥ `CUSTOM_OP_BASE` (100) carry a `CustomShader { name, env }` instead of the shared pipeline |
+| `native_op_for` / `vulkan_op_for` / `registered_op_ids` | ops.rs | lookups derived from the generated `REGISTRY`; misses list the valid ids |
+| operator families | ops/{activations,elementwise,norms,positional,stateful}.rs | first batch: 10 activations, 6 elementwise, 6 norms, 3 position/embedding/bias, 2 stateful recurrent steps — native + Vulkan on every entry |
+| custom-shader family | ops/custom.rs + ops/shaders/*.comp | registration-supplied SPIR-V for ops that don't fit `shared_ops` (demo: `act.mish`); build.rs compiles the shader and publishes its default path, runtime env overrides it |
+| `run_vulkan_op` | vulkan/ops.rs | translates an `OpCall` into the `shared_ops` 5-buffer / 8-push-constant layout; routes custom op codes to `vk_run_custom_op` |
+| `vk_run_op` / `vk_run_custom_op` | cheetah_vulkan.c | generic dispatch on the shared layout; in-out slots (recurrent state) preserve host contents across the round trip |
+
 ### CLI/serve
 
 | Item | File | Role |
@@ -274,7 +292,8 @@ run_init_command      src/main.rs:90
 | `CHEETAH_MATMUL_BF16_SPV` | cheetah_vulkan.c | .spv path | overrides the bf16 matmul shader |
 | `CHEETAH_MATMUL_Q8_SPV` | cheetah_vulkan.c | .spv path | overrides the q8 matmul shader |
 | `CHEETAH_MATMUL_Q4_SPV` | cheetah_vulkan.c | .spv path | overrides the q4 matmul shader |
-| `CHEETAH_QWEN_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the shared_ops shader (rmsnorm/rope/attention/silu/gelu/elementwise) |
+| `CHEETAH_QWEN_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the shared_ops shader (rmsnorm/rope/attention/silu/gelu/elementwise + catalog op codes 10..17) |
+| `CHEETAH_MISH_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the custom `act.mish` shader (`src/chat/ops/shaders/mish.comp`); every `CustomShader` registration names its own override variable |
 
 ### 4.3 Build-time
 
@@ -303,8 +322,8 @@ cargo build --release --features vulkan   # + shader compilation (needs glslc) +
 cargo build --release --features cuda     # Candle CUDA (needs CUDA toolkit)
 cargo build --release --features metal    # Candle Metal (macOS)
 
-cargo test                           # default feature tests (161)
-cargo test --features vulkan         # + Vulkan executor/shader tests (180 passed, 3 device-gated ignored)
+cargo test                           # default feature tests (223 passed, 1 ignored)
+cargo test --features vulkan         # + Vulkan executor/shader/catalog parity tests (254 passed, 4 ignored)
 cargo test native_                   # all native-backend tests
 cargo test -- --test-threads=4       # parallel (some tests are timing-sensitive)
 ```
@@ -342,6 +361,11 @@ self-contained and runs anywhere.
 7. **`f32::sin_cos` returns `(sin, cos)`** — the historical rope bug.
 8. Backend capability assertions must be updated when
    a family gains/loses a backend.
+9. **The operator catalog is additive and dual-backend**: every entry in
+   `src/chat/ops/` declares both a native fn pointer and a Vulkan binding
+   (`every_registered_op_has_*_backend`); op codes are stable (`0..17` =
+   shared_ops branches, `>=100` = custom shaders), and a custom op must name a
+   `.comp` under `src/chat/ops/shaders/` (`custom_op_codes_and_shaders_are_consistent`).
 
 ## Architecture support table
 

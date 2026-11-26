@@ -51,6 +51,15 @@ const PRECISION_REGISTRY: RegistrySpec = RegistrySpec {
     index: None,
 };
 
+const OPS_REGISTRY: RegistrySpec = RegistrySpec {
+    source: "src/chat/ops",
+    out_file: "ops_registry.rs",
+    type_name: "OpRegistration",
+    module_suffix: "",
+    implementation_note: "this same module (each operator file declares its operators and its registration)",
+    index: None,
+};
+
 fn main() {
     println!("cargo:rerun-if-changed=cheetah_init.c");
     println!("cargo:rerun-if-changed=cheetah_init.h");
@@ -67,6 +76,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/chat");
     println!("cargo:rerun-if-changed=src/chat/registrations");
     println!("cargo:rerun-if-changed=src/chat/precision");
+    println!("cargo:rerun-if-changed=src/chat/ops");
+    println!("cargo:rerun-if-changed=src/chat/ops/shaders");
 
     cc::Build::new()
         .file("cheetah_init.c")
@@ -76,26 +87,32 @@ fn main() {
         .extra_warnings(true)
         .compile("cheetah_init");
 
-    let registration_sources = discover_registrations(Path::new(MODEL_REGISTRY.source));
+    let registration_sources =
+        discover_registrations(Path::new(MODEL_REGISTRY.source), "model registration");
     generate_registry(&registration_sources, &MODEL_REGISTRY);
-    let precision_sources = discover_registrations(Path::new(PRECISION_REGISTRY.source));
+    let precision_sources =
+        discover_registrations(Path::new(PRECISION_REGISTRY.source), "weight precision");
     generate_registry(&precision_sources, &PRECISION_REGISTRY);
-    let shader_sources = discover_shaders(Path::new("src/chat/registrations"));
+    let ops_sources = discover_registrations(Path::new(OPS_REGISTRY.source), "operator");
+    generate_registry(&ops_sources, &OPS_REGISTRY);
+    let shader_sources = discover_shaders(&[
+        Path::new("src/chat/registrations"),
+        Path::new("src/chat/ops/shaders"),
+    ]);
     if env::var_os("CARGO_FEATURE_VULKAN").is_some() {
         compile_vulkan(&shader_sources);
         println!("cargo:rustc-link-lib=vulkan");
     }
 }
 
-/// Collect declarative model registrations. The directory is the contract:
-/// every `.rs` file there contributes one registration — no exclusion list.
-fn discover_registrations(directory: &Path) -> Vec<(String, PathBuf)> {
+/// Collect declarative registrations from one directory. The directory is the
+/// contract: every `.rs` file there contributes one registration — no
+/// exclusion list. `label` names the registry kind in diagnostics.
+fn discover_registrations(directory: &Path, label: &str) -> Vec<(String, PathBuf)> {
     let mut sources = Vec::new();
     let mut names = HashSet::new();
     for entry in fs::read_dir(directory).expect("failed to scan registrations directory") {
-        let path = entry
-            .expect("failed to read model registration entry")
-            .path();
+        let path = entry.expect("failed to read registration entry").path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
             continue;
         }
@@ -104,16 +121,13 @@ fn discover_registrations(directory: &Path) -> Vec<(String, PathBuf)> {
             .and_then(|stem| stem.to_str())
             .map(str::to_owned)
         else {
-            panic!(
-                "model registration filename is not valid UTF-8: {}",
-                path.display()
-            );
+            panic!("{label} filename is not valid UTF-8: {}", path.display());
         };
         if !is_rust_identifier(&stem) {
-            panic!("model registration name '{stem}' must be a Rust identifier");
+            panic!("{label} name '{stem}' must be a Rust identifier");
         }
         if !names.insert(stem.clone()) {
-            panic!("duplicate model registration name '{stem}'");
+            panic!("duplicate {label} name '{stem}'");
         }
         println!("cargo:rerun-if-changed={}", path.display());
         sources.push((stem, path));
@@ -178,7 +192,7 @@ fn generate_registry(registrations: &[(String, PathBuf)], spec: &RegistrySpec) {
     fs::write(out_dir.join(spec.out_file), generated).expect("failed to write generated registry");
 }
 
-fn discover_shaders(directory: &Path) -> Vec<ShaderSource> {
+fn discover_shaders(directories: &[&Path]) -> Vec<ShaderSource> {
     let mut sources = vec![
         ShaderSource {
             name: "matmul".into(),
@@ -212,31 +226,38 @@ fn discover_shaders(directory: &Path) -> Vec<ShaderSource> {
         },
     ];
     let mut names: HashSet<String> = sources.iter().map(|shader| shader.name.clone()).collect();
-    for entry in fs::read_dir(directory).expect("failed to scan model shader directory") {
-        let path = entry.expect("failed to read model shader entry").path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("comp") {
+    for directory in directories {
+        let Ok(entries) = fs::read_dir(directory) else {
+            // A shader directory may not exist yet (e.g. no custom op shaders);
+            // that is not an error — it simply contributes no shaders.
             continue;
-        }
-        let Some(stem) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(str::to_owned)
-        else {
-            panic!("shader filename is not valid UTF-8: {}", path.display());
         };
-        if !is_rust_identifier(&stem) {
-            panic!("shader name '{stem}' must be a Rust identifier");
+        for entry in entries {
+            let path = entry.expect("failed to read model shader entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("comp") {
+                continue;
+            }
+            let Some(stem) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+            else {
+                panic!("shader filename is not valid UTF-8: {}", path.display());
+            };
+            if !is_rust_identifier(&stem) {
+                panic!("shader name '{stem}' must be a Rust identifier");
+            }
+            if !names.insert(stem.clone()) {
+                panic!("duplicate shader name '{stem}'");
+            }
+            println!("cargo:rerun-if-changed={}", path.display());
+            sources.push(ShaderSource {
+                name: stem.clone(),
+                source: path,
+                output: format!("{stem}.spv"),
+                c_define: None,
+            });
         }
-        if !names.insert(stem.clone()) {
-            panic!("duplicate shader name '{stem}'");
-        }
-        println!("cargo:rerun-if-changed={}", path.display());
-        sources.push(ShaderSource {
-            name: stem.clone(),
-            source: path,
-            output: format!("{stem}.spv"),
-            c_define: None,
-        });
     }
     sources.sort_by(|left, right| left.name.cmp(&right.name));
     sources
@@ -320,13 +341,12 @@ fn compile_vulkan(shaders: &[ShaderSource]) {
                     definitions.push((define, format!("\"{path}\"")));
                 }
             }
-            Ok(status) if shader.c_define.is_none() => panic!(
-                "{} failed to compile model shader {} (status {status})",
-                glslc.to_string_lossy(),
+            Ok(status) if shader.c_define.is_none() => println!(
+                "cargo:warning=custom op shader {} failed to compile (status {status}); override its SPIR-V path at runtime via the op's CustomShader.env variable",
                 shader.source.display()
             ),
-            Err(error) if shader.c_define.is_none() => panic!(
-                "unable to run {} for model shader {}: {error}",
+            Err(error) if shader.c_define.is_none() => println!(
+                "cargo:warning=unable to run {} for custom op shader {}: {error}; override its SPIR-V path at runtime via the op's CustomShader.env variable",
                 glslc.to_string_lossy(),
                 shader.source.display()
             ),
@@ -342,6 +362,34 @@ fn compile_vulkan(shaders: &[ShaderSource]) {
             ),
         }
     }
+
+    // Expose the compiled custom op shaders (c_define == None) to the Rust
+    // registry so it can resolve each op's default SPIR-V path at runtime and
+    // assert that every registered custom op ships a shader.
+    let mut custom_list = String::from("// Generated by build.rs — do not edit.\n");
+    custom_list.push_str("pub(crate) const CUSTOM_OP_SHADERS: &[(&str, &str)] = &[\n");
+    for shader in shaders {
+        if shader.c_define.is_some() {
+            continue;
+        }
+        if !compiled.contains(&shader.name) {
+            continue;
+        }
+        let path = out_dir
+            .join(&shader.output)
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        custom_list.push_str(&format!("    (\"{}\", \"{path}\"),\n", shader.name));
+    }
+    custom_list.push_str("];\n");
+    custom_list
+        .push_str("pub(crate) fn custom_op_shader_default(name: &str) -> Option<&'static str> {\n");
+    custom_list
+        .push_str("    CUSTOM_OP_SHADERS.iter().find(|(n, _)| *n == name).map(|(_, p)| *p)\n");
+    custom_list.push_str("}\n");
+    fs::write(out_dir.join("custom_op_shaders.rs"), custom_list)
+        .expect("failed to write custom op shader list");
 
     for (name, value) in &definitions {
         build.define(name, Some(value.as_str()));

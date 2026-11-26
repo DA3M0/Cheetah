@@ -1,0 +1,50 @@
+#version 450
+
+// Custom operator shader: Mish activation (act.mish, op code 100).
+// It follows the shared_ops ABI exactly so the generic catalog dispatcher can
+// bind it without a dedicated C entry point:
+//   b0 = input (f32), b2 = output (f32)
+//   params.p1 = element count, params.p2 = sub-op (unused here)
+// local_size_x must stay 64 (the dispatcher rounds thread counts to it).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Buffer0 {
+    uint data[];
+} b0;
+layout(set = 0, binding = 1, std430) readonly buffer Buffer1 {
+    uint data[];
+} b1;
+layout(set = 0, binding = 2, std430) buffer Buffer2 {
+    uint data[];
+} b2;
+layout(set = 0, binding = 3, std430) buffer Buffer3 {
+    uint data[];
+} b3;
+layout(set = 0, binding = 4, std430) readonly buffer Buffer4 {
+    uint data[];
+} b4;
+
+layout(push_constant) uniform Parameters {
+    uint op;
+    uint p1;
+    uint p2;
+    uint p3;
+    uint p4;
+    uint p5;
+    uint p6;
+    uint p7;
+} params;
+
+float softplus(float value) {
+    return value > 20.0 ? value : log(1.0 + exp(value));
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.p1) {
+        return;
+    }
+    float value = uintBitsToFloat(b0.data[index]);
+    b2.data[index] = floatBitsToUint(value * tanh(softplus(value)));
+}

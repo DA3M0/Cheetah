@@ -134,6 +134,15 @@ static VkDescriptorSetLayout g_qwen_descriptor_layout = VK_NULL_HANDLE;
 static VkPipelineLayout g_qwen_pipeline_layout = VK_NULL_HANDLE;
 static VkPipeline g_qwen_pipeline = VK_NULL_HANDLE;
 
+/* Lazily-built per-shader pipelines for custom catalog ops (op codes >= 100).
+ * Each entry caches one compiled SPIR-V path; custom shaders reuse the
+ * shared_ops 5-buffer / 8-push-constant descriptor layout. */
+#define CHEETAH_CUSTOM_PIPELINE_SLOTS 8
+static struct {
+    char path[256];
+    VkPipeline pipeline;
+} g_custom_pipelines[CHEETAH_CUSTOM_PIPELINE_SLOTS];
+
 static void destroy_matmul_pipeline(void);
 static int matrix_byte_size(int rows, int columns, size_t *bytes_out);
 
@@ -931,6 +940,14 @@ static void destroy_matmul_pipeline(void) {
         if (g_qwen_pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(g_vulkan.device, g_qwen_pipeline, NULL);
         }
+        for (int i = 0; i < CHEETAH_CUSTOM_PIPELINE_SLOTS; ++i) {
+            if (g_custom_pipelines[i].pipeline != VK_NULL_HANDLE) {
+                vkDestroyPipeline(g_vulkan.device,
+                                  g_custom_pipelines[i].pipeline, NULL);
+                g_custom_pipelines[i].pipeline = VK_NULL_HANDLE;
+                g_custom_pipelines[i].path[0] = '\0';
+            }
+        }
         if (g_matmul_pipeline_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(g_vulkan.device,
                                     g_matmul_pipeline_layout, NULL);
@@ -1260,6 +1277,243 @@ cleanup:
         if (submitted && !completed) {
             VkResult idle_result = vkDeviceWaitIdle(g_vulkan.device);
             (void)check_vk_result(idle_result, "vkDeviceWaitIdle(qwen cleanup)");
+        }
+        vkFreeCommandBuffers(g_vulkan.device, g_vulkan.command_pool, 1,
+                             &command_buffer);
+    }
+    if (descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(g_vulkan.device, descriptor_pool, NULL);
+    }
+    for (i = 0; i < 5; ++i) {
+        if (device_buffers[i] != NULL) vk_free_vram(device_buffers[i]);
+    }
+    matmul_unlock();
+    return status;
+}
+
+/* Resolve (env override or default) and lazily build a compute pipeline for a
+ * custom catalog shader. Custom shaders reuse g_qwen_pipeline_layout, so they
+ * must conform to the shared_ops layout: 5 storage buffers (b0/b1 read, b2/b3
+ * write, b4 read), 8 uint push constants, local_size_x = 64, entry "main".
+ * Caller must hold matmul_lock and must have ensured g_qwen_pipeline_layout. */
+static int ensure_custom_pipeline(const char *shader_env,
+                                  const char *default_shader,
+                                  VkPipeline *out_pipeline) {
+    const char *env_value = getenv(shader_env);
+    const char *shader_path =
+        env_value != NULL && env_value[0] != '\0' ? env_value : default_shader;
+    if (shader_path == NULL || shader_path[0] == '\0') {
+        report_error("custom op shader has no resolvable path");
+        return -1;
+    }
+    for (int i = 0; i < CHEETAH_CUSTOM_PIPELINE_SLOTS; ++i) {
+        if (g_custom_pipelines[i].pipeline != VK_NULL_HANDLE &&
+            strcmp(g_custom_pipelines[i].path, shader_path) == 0) {
+            *out_pipeline = g_custom_pipelines[i].pipeline;
+            return 0;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < CHEETAH_CUSTOM_PIPELINE_SLOTS; ++i) {
+        if (g_custom_pipelines[i].pipeline == VK_NULL_HANDLE) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        report_error("too many distinct custom op shaders (cache full)");
+        return -1;
+    }
+    VkShaderModule shader = vk_load_spirv_shader(shader_path);
+    if (shader == VK_NULL_HANDLE) {
+        report_error("unable to load custom op shader");
+        return -1;
+    }
+    VkPipeline pipeline =
+        vk_create_compute_pipeline(shader, g_qwen_pipeline_layout, "main");
+    vkDestroyShaderModule(g_vulkan.device, shader, NULL);
+    if (pipeline == VK_NULL_HANDLE) {
+        report_error("unable to create custom op pipeline");
+        return -1;
+    }
+    strncpy(g_custom_pipelines[slot].path, shader_path,
+            sizeof(g_custom_pipelines[slot].path) - 1);
+    g_custom_pipelines[slot].path[sizeof(g_custom_pipelines[slot].path) - 1] =
+        '\0';
+    g_custom_pipelines[slot].pipeline = pipeline;
+    *out_pipeline = pipeline;
+    return 0;
+}
+
+/* Generic operator dispatch (xxx_ops catalog, op codes >= 10). Identical to
+ * run_qwen_compute except buffer initialization: when a slot is both a source
+ * and a destination (recurrent state, read-modify-write), the host data is
+ * copied in and preserved instead of being zeroed, so the shader can read the
+ * previous state before overwriting it. Destination-only slots are still
+ * zeroed; source-only slots are never copied back. When custom_shader_env is
+ * non-NULL a custom-shader pipeline is bound instead of g_qwen_pipeline. */
+static int run_op_compute(const char *custom_shader_env,
+                          const char *custom_default_spv,
+                          const void *const sources[5],
+                          void *const destinations[5],
+                          const size_t byte_sizes[5],
+                          const uint32_t parameters[8],
+                          uint32_t group_count_x) {
+    void *device_buffers[5] = {NULL, NULL, NULL, NULL, NULL};
+    VkBuffer buffers[5];
+    VkDeviceSize offsets[5];
+    VkDeviceSize ranges[5];
+    VkDescriptorBufferInfo buffer_infos[5];
+    VkWriteDescriptorSet writes[5];
+    VkDescriptorPoolSize pool_size;
+    VkDescriptorPoolCreateInfo pool_info;
+    VkDescriptorSetAllocateInfo set_info;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo command_info;
+    VkCommandBufferBeginInfo begin_info;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkFenceCreateInfo fence_info;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSubmitInfo submit_info;
+    VkResult result;
+    int command_allocated = 0;
+    int submitted = 0;
+    int completed = 0;
+    int status = -1;
+    uint32_t i;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    if (!g_vulkan.initialized || parameters == NULL || group_count_x == 0) {
+        report_error("invalid operator dispatch");
+        return -1;
+    }
+    if (group_count_x > g_vulkan.properties.limits.maxComputeWorkGroupCount[0]) {
+        report_error("operator dispatch exceeds maxComputeWorkGroupCount");
+        return -1;
+    }
+    matmul_lock();
+    if (ensure_qwen_pipeline() != 0) goto cleanup;
+    pipeline = g_qwen_pipeline;
+    if (custom_shader_env != NULL) {
+        if (ensure_custom_pipeline(custom_shader_env, custom_default_spv,
+                                   &pipeline) != 0) goto cleanup;
+    }
+    for (i = 0; i < 5; ++i) {
+        size_t allocation_size;
+        if (byte_sizes[i] > SIZE_MAX - 3) {
+            report_error("operator buffer size overflows size_t");
+            goto cleanup;
+        }
+        allocation_size = (byte_sizes[i] + 3U) & ~(size_t)3U;
+        if (allocation_size == 0) allocation_size = 4;
+        if ((VkDeviceSize)allocation_size >
+            g_vulkan.properties.limits.maxStorageBufferRange) {
+            report_error("operator tensor exceeds maxStorageBufferRange");
+            goto cleanup;
+        }
+        device_buffers[i] = vk_alloc_vram(allocation_size);
+        if (device_buffers[i] == NULL) goto cleanup;
+        if (sources[i] != NULL && byte_sizes[i] > 0) {
+            memcpy(device_buffers[i], sources[i], byte_sizes[i]);
+        } else {
+            memset(device_buffers[i], 0, allocation_size);
+        }
+        if (vk_get_vram_allocation(device_buffers[i], &buffers[i],
+                                   &offsets[i], &ranges[i]) != 0) {
+            goto cleanup;
+        }
+        buffer_infos[i].buffer = buffers[i];
+        buffer_infos[i].offset = offsets[i];
+        buffer_infos[i].range = ranges[i];
+    }
+    memset(&pool_size, 0, sizeof(pool_size));
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_size.descriptorCount = 5;
+    memset(&pool_info, 0, sizeof(pool_info));
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    result = vkCreateDescriptorPool(g_vulkan.device, &pool_info, NULL,
+                                    &descriptor_pool);
+    if (check_vk_result(result, "vkCreateDescriptorPool(op)") != 0)
+        goto cleanup;
+    memset(&set_info, 0, sizeof(set_info));
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = descriptor_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &g_qwen_descriptor_layout;
+    result = vkAllocateDescriptorSets(g_vulkan.device, &set_info,
+                                      &descriptor_set);
+    if (check_vk_result(result, "vkAllocateDescriptorSets(op)") != 0)
+        goto cleanup;
+    memset(writes, 0, sizeof(writes));
+    for (i = 0; i < 5; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptor_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(g_vulkan.device, 5, writes, 0, NULL);
+
+    memset(&command_info, 0, sizeof(command_info));
+    command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    command_info.commandPool = g_vulkan.command_pool;
+    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    result = vkAllocateCommandBuffers(g_vulkan.device, &command_info,
+                                      &command_buffer);
+    if (check_vk_result(result, "vkAllocateCommandBuffers(op)") != 0)
+        goto cleanup;
+    command_allocated = 1;
+    memset(&begin_info, 0, sizeof(begin_info));
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(command_buffer, &begin_info);
+    if (check_vk_result(result, "vkBeginCommandBuffer(op)") != 0)
+        goto cleanup;
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      pipeline);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            g_qwen_pipeline_layout, 0, 1, &descriptor_set,
+                            0, NULL);
+    vkCmdPushConstants(command_buffer, g_qwen_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       8 * sizeof(uint32_t), parameters);
+    vkCmdDispatch(command_buffer, group_count_x, 1, 1);
+    result = vkEndCommandBuffer(command_buffer);
+    if (check_vk_result(result, "vkEndCommandBuffer(op)") != 0)
+        goto cleanup;
+    memset(&fence_info, 0, sizeof(fence_info));
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(g_vulkan.device, &fence_info, NULL, &fence);
+    if (check_vk_result(result, "vkCreateFence(op)") != 0) goto cleanup;
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+    result = vkQueueSubmit(g_vulkan.compute_queue, 1, &submit_info, fence);
+    if (check_vk_result(result, "vkQueueSubmit(op)") != 0) goto cleanup;
+    submitted = 1;
+    result = vkWaitForFences(g_vulkan.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (check_vk_result(result, "vkWaitForFences(op)") != 0) goto cleanup;
+    completed = 1;
+    for (i = 0; i < 5; ++i) {
+        if (destinations[i] != NULL && byte_sizes[i] > 0) {
+            memcpy(destinations[i], device_buffers[i], byte_sizes[i]);
+        }
+    }
+    status = 0;
+
+cleanup:
+    if (fence != VK_NULL_HANDLE) vkDestroyFence(g_vulkan.device, fence, NULL);
+    if (command_allocated) {
+        if (submitted && !completed) {
+            VkResult idle_result = vkDeviceWaitIdle(g_vulkan.device);
+            (void)check_vk_result(idle_result, "vkDeviceWaitIdle(op cleanup)");
         }
         vkFreeCommandBuffers(g_vulkan.device, g_vulkan.command_pool, 1,
                              &command_buffer);
@@ -2373,6 +2627,48 @@ int vk_qwen_bias_add(const float *values, const void *bias,
     parameters[3] = bias_format;
     return run_qwen_compute(sources, destinations, sizes, parameters,
                             ceil_div_u32((uint32_t)total_count, 64));
+}
+
+/* Generic catalog dispatch (xxx_ops, op codes >= 10) on the shared_ops
+ * pipeline. parameters[0] is the op code, parameters[1..7] the op-specific
+ * push constants. sources[i] / destinations[i] may both be non-null for
+ * read-modify-write state buffers; the host contents are preserved across the
+ * round trip. invocation_count is the number of shader invocations (threads);
+ * it is rounded up to the 64-wide local workgroup. Returns 0 on success. */
+int vk_run_op(const uint32_t parameters[8],
+              const void *const sources[5],
+              void *const destinations[5],
+              const size_t byte_sizes[5],
+              uint32_t invocation_count) {
+    if (parameters == NULL || sources == NULL || destinations == NULL ||
+        byte_sizes == NULL || invocation_count == 0) {
+        report_error("invalid arguments to vk_run_op");
+        return -1;
+    }
+    return run_op_compute(NULL, NULL, sources, destinations, byte_sizes,
+                          parameters, ceil_div_u32(invocation_count, 64));
+}
+
+/* Generic catalog dispatch for a custom-shader op (op code >= 100). The
+ * pipeline is built from the SPIR-V at the shader_env override or default_spv;
+ * it must conform to the shared_ops buffer/push-constant layout. Buffer
+ * semantics are identical to vk_run_op (in-out slots preserve host contents). */
+int vk_run_custom_op(const char *shader_env,
+                     const char *default_spv,
+                     const uint32_t parameters[8],
+                     const void *const sources[5],
+                     void *const destinations[5],
+                     const size_t byte_sizes[5],
+                     uint32_t invocation_count) {
+    if (shader_env == NULL || default_spv == NULL || parameters == NULL ||
+        sources == NULL || destinations == NULL || byte_sizes == NULL ||
+        invocation_count == 0) {
+        report_error("invalid arguments to vk_run_custom_op");
+        return -1;
+    }
+    return run_op_compute(shader_env, default_spv, sources, destinations,
+                          byte_sizes, parameters,
+                          ceil_div_u32(invocation_count, 64));
 }
 
 /* ---- Ant quantized matmul operators (format-generic) ----

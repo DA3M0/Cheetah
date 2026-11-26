@@ -19,6 +19,11 @@ anywhere.
 For the memory manager and the native backend that implement the Ant tiers,
 read [ANT_MEMORY.md](ANT_MEMORY.md) alongside this document.
 
+The same declarative pattern backs two companion registries:
+`src/chat/precision/` (weight formats) and `src/chat/ops/` (the generic
+operator catalog, §4.5). Both are discovered by `build.rs` and expose generated
+`REGISTRY` tables; adding a format or an operator is adding a file.
+
 ---
 
 ## 1. Overview — resolution layers
@@ -191,6 +196,39 @@ file (phi's executor lives in `registrations/phi.rs`), keeping
 one-family-one-file true on both backends. Keep the executors Candle-free (the shared shader library lives in
 `*.comp` at the repo root; shaders are discovered from `src/chat/registrations/` at
 build time).
+
+### 4.5 A new operator (the `xxx_ops` catalog)
+
+The generic operator catalog lives in `src/chat/ops/`; it carries non-matmul
+transformer operators (activations, elementwise, norms, position/embedding,
+stateful recurrent steps) on **f32 buffers**. Large linear projections stay in
+the precision registry — callers dequantize small norm weights/biases to f32
+before dispatching a catalog op.
+
+1. **Add `src/chat/ops/<family>.rs`** declaring `REGISTRATION: OpRegistration`
+   with one `OpEntry` per operator id. Each entry lists both backends:
+   - `OpBackend::Native(NativeOp::…)` — a plain fn pointer in one of the
+     signature families (`Unary`, `InPlaceBinop`, `Binary`, `Norm`, `NormL2`,
+     `Softmax`, `Rope`, `Embedding`, `Conv1dStep`, `GatedDeltaStep`).
+   - `OpBackend::Vulkan(VulkanOp { … })` — either a shared `shared_ops` op code
+     (`0..17`, with `kind` + `sub_op`) or a custom shader.
+2. **Custom shader ops** (op code `>= CUSTOM_OP_BASE`, i.e. `100`) set
+   `custom_shader: Some(CustomShader { name, env })` and add
+   `src/chat/ops/shaders/<name>.comp`. The shader uses the `shared_ops` ABI
+   unchanged (5 storage buffers, 8 uint push constants, `local_size_x = 64`,
+   entry `main`); `env` names its runtime SPIR-V override variable (e.g.
+   `CHEETAH_MISH_OPS_SPV`). A shader compile failure is a build warning, not an
+   error — set the override variable to recover without rebuilding.
+3. **Rebuild.** `build.rs` discovers every `.rs` file in `src/chat/ops/` (the
+   directory is the contract), generates `OUT_DIR/ops_registry.rs`, compiles
+   custom shaders into `OUT_DIR/custom_op_shaders.rs`, and the runtime derives
+   `native_op_for` / `vulkan_op_for` from the generated table. No core
+   dispatch edits.
+4. **Tests.** `cargo test ops::` runs the native unit tests plus registry
+   invariants (unique ids, both backends, op-kind agreement, custom-shader
+   metadata). `cargo test --features vulkan ops::` adds the native↔Vulkan
+   parity suite for every operator; it skips cleanly when no Vulkan device is
+   present.
 
 ## 5. Design decisions worth remembering
 

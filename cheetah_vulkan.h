@@ -78,6 +78,29 @@ int vk_qwen_attention(const float *query, const float *keys,
                       uint32_t kv_heads, uint32_t head_dim,
                       uint32_t sliding_window);
 
+/* Generic catalog dispatch (xxx_ops). parameters[0] = op code, parameters[1..7]
+ * = push constants. Each of the 5 slots may be a source, a destination, or
+ * both (read-modify-write state); null entries become zero-sized/zero-filled
+ * bindings. invocation_count = number of shader threads (rounded up to the
+ * 64-wide workgroup). Returns 0 on success, -1 on failure. */
+int vk_run_op(const uint32_t parameters[8],
+              const void *const sources[5],
+              void *const destinations[5],
+              const size_t byte_sizes[5],
+              uint32_t invocation_count);
+
+/* Like vk_run_op but dispatches a custom-shader catalog op (op code >= 100).
+ * The SPIR-V is taken from the shader_env environment variable when set, else
+ * default_spv. The shader must use the shared_ops layout: 5 storage buffers,
+ * 8 uint push constants, local_size_x = 64, entry point "main". */
+int vk_run_custom_op(const char *shader_env,
+                     const char *default_spv,
+                     const uint32_t parameters[8],
+                     const void *const sources[5],
+                     void *const destinations[5],
+                     const size_t byte_sizes[5],
+                     uint32_t invocation_count);
+
 /* Handles returned here are borrowed and remain valid until shutdown. */
 VkDevice vk_get_device(void);
 VkPhysicalDevice vk_get_physical_device(void);

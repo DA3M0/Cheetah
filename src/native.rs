@@ -1114,6 +1114,28 @@ pub mod vulkan {
             head_dim: u32,
             sliding_window: u32,
         ) -> c_int;
+        // Generic catalog dispatch (xxx_ops, op codes >= 10) on the shared_ops
+        // pipeline. parameters[0] = op code; sources/destinations/byte_sizes
+        // are the 5 storage-buffer slots (a slot may be both, for state).
+        fn vk_run_op(
+            parameters: *const u32,
+            sources: *const *const std::os::raw::c_void,
+            destinations: *const *mut std::os::raw::c_void,
+            byte_sizes: *const usize,
+            invocation_count: u32,
+        ) -> c_int;
+        // Custom-shader catalog dispatch (op codes >= 100). The SPIR-V is taken
+        // from shader_env when set, else default_spv; the shader must conform to
+        // the shared_ops buffer/push-constant layout.
+        fn vk_run_custom_op(
+            shader_env: *const std::os::raw::c_char,
+            default_spv: *const std::os::raw::c_char,
+            parameters: *const u32,
+            sources: *const *const std::os::raw::c_void,
+            destinations: *const *mut std::os::raw::c_void,
+            byte_sizes: *const usize,
+            invocation_count: u32,
+        ) -> c_int;
     }
 
     /// Initialize the C Vulkan backend and its mapped memory pool.
@@ -1144,6 +1166,68 @@ pub mod vulkan {
             .lock()
             .map_err(|_| "Vulkan backend lock is poisoned.".to_string())?;
         check_native_result(unsafe { vk_qwen_prepare() }, "Vulkan Qwen2 pipeline setup")
+    }
+
+    /// Raw generic catalog dispatch (`xxx_ops`): binds `sources` /
+    /// `destinations` to the 5 `shared_ops` storage slots, pushes `parameters`
+    /// (`parameters[0]` = op code) and launches `invocation_count` threads on
+    /// the shared compute pipeline. A slot may appear in both `sources` and
+    /// `destinations` (recurrent state read-modify-write); its host contents
+    /// are preserved across the round trip.
+    pub fn run_op_raw(
+        parameters: [u32; 8],
+        sources: [*const c_void; 5],
+        destinations: [*mut c_void; 5],
+        byte_sizes: [usize; 5],
+        invocation_count: usize,
+    ) -> Result<(), String> {
+        let _guard = VULKAN_LOCK
+            .lock()
+            .map_err(|_| "Vulkan backend lock is poisoned.".to_string())?;
+        let result = unsafe {
+            vk_run_op(
+                parameters.as_ptr(),
+                sources.as_ptr(),
+                destinations.as_ptr(),
+                byte_sizes.as_ptr(),
+                to_u32(invocation_count)?,
+            )
+        };
+        check_native_result(result, "Vulkan catalog operator dispatch")
+    }
+
+    /// Raw custom-shader catalog dispatch (`xxx_ops`, op code >= 100): like
+    /// [`run_op_raw`] but binds a custom SPIR-V pipeline. The shader path is
+    /// taken from the `shader_env` environment variable when set, otherwise
+    /// `default_spv` (the build-time-compiled artifact under `OUT_DIR`).
+    pub fn run_custom_op_raw(
+        shader_env: &str,
+        default_spv: &str,
+        parameters: [u32; 8],
+        sources: [*const c_void; 5],
+        destinations: [*mut c_void; 5],
+        byte_sizes: [usize; 5],
+        invocation_count: usize,
+    ) -> Result<(), String> {
+        let _guard = VULKAN_LOCK
+            .lock()
+            .map_err(|_| "Vulkan backend lock is poisoned.".to_string())?;
+        let shader_env_c = std::ffi::CString::new(shader_env)
+            .map_err(|_| format!("shader_env name contains a NUL byte: {shader_env}"))?;
+        let default_c = std::ffi::CString::new(default_spv)
+            .map_err(|_| format!("default_spv path contains a NUL byte: {default_spv}"))?;
+        let result = unsafe {
+            vk_run_custom_op(
+                shader_env_c.as_ptr(),
+                default_c.as_ptr(),
+                parameters.as_ptr(),
+                sources.as_ptr(),
+                destinations.as_ptr(),
+                byte_sizes.as_ptr(),
+                to_u32(invocation_count)?,
+            )
+        };
+        check_native_result(result, "Vulkan custom catalog operator dispatch")
     }
 
     /// Compute row-major `C[M,N] = A[M,K] * B[K,N]` using the Vulkan backend.

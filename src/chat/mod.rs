@@ -3,6 +3,7 @@
 mod engine;
 pub(crate) mod moe;
 pub(crate) mod native;
+pub(crate) mod ops;
 pub(crate) mod precision;
 pub(crate) mod registry;
 pub(crate) mod templates;
