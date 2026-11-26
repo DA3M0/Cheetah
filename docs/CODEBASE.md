@@ -394,3 +394,10 @@ Sparse (sliding-window) attention and MoE routing are backend-agnostic: both
 runners resolve `use_sliding_window` / `sliding_window` the same way (`false`
 or `0` → attend to the whole cache) and route experts with
 `chat::moe::select_experts` (softmax → top-k → renormalize).
+
+**Cheetah is decoder-only and text-only by design.** Every registered family
+is a causal, autoregressive decoder stack over plain text; the
+`ModelForward` contract and the KV-cache design assume it. Encoder or
+encoder–decoder architectures (bidirectional attention, cross-attention) and
+multimodal inputs (vision, audio, image tokens) are out of scope — do not
+add them as families.

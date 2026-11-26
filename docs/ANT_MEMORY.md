@@ -673,6 +673,11 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
 
 ## 11. Adding a new family — checklist
 
+> **Scope:** decoder-only, text-only families. The forward contract (one
+> causal autoregressive stack over `&[u32]` text tokens) and the KV-cache
+> design assume it; encoder or encoder–decoder architectures and multimodal
+> inputs are out of scope by design.
+
 1. **Add the registration file** `src/chat/registrations/<family>.rs`
    (build.rs picks it up and regenerates the registry; see
    [REGISTRY.md](REGISTRY.md) §2). It carries the declarative capability

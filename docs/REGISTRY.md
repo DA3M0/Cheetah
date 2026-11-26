@@ -150,6 +150,12 @@ The only static table left in `registry.rs` is the **device selection** table
 
 ### 4.1 A new architecture (the common case)
 
+> **Scope:** Cheetah is decoder-only and text-only by design — every
+> registration must be a causal, autoregressive decoder stack over plain
+> text. Encoder or encoder–decoder architectures (BERT/T5-style
+> bidirectional attention, cross-attention) and multimodal inputs (vision,
+> audio, image) are out of scope and are not accepted as families.
+
 1. **Add `src/chat/registrations/<name>.rs`** with the architecture
    names, chat template, stop markers, backend loaders, family constants,
    and the family's `ModelForward` implementation — copy the closest

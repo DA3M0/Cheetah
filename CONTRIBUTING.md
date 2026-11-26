@@ -57,6 +57,11 @@ Candle; `vulkan` → the independent executor). See
 Full checklist: [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) §11 and
 [docs/REGISTRY.md](docs/REGISTRY.md) §4.2. Short form:
 
+> Cheetah is decoder-only and text-only by design: new families must be
+> causal, autoregressive decoder stacks over plain text.
+> Encoder/encoder–decoder architectures and multimodal inputs are out of
+> scope.
+
 1. Implement the forward deltas in the shared native runner
    (`src/chat/models/native/decoder.rs`) — usually nothing: the
    `DenseFeatures` flags cover all published dense deltas, and optional units

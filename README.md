@@ -434,9 +434,13 @@ The server loads one model at a time. Generation requests are queued in arrival 
 
 ## Supported models and limitations
 
-- **Inference:** Safetensors decoder models resolved for Qwen2, Llama, Qwen3, Mixtral (native CPU backend, Ant-tiered; Mixtral is the mixture-of-experts with per-token expert routing via `num_experts_per_tok`), plus the dense delta families Mistral (decoding-time sliding window), Gemma (offset norms, sqrt(hidden) embedding scale, GeGLU), and Phi (biased LayerNorms, parallel residual, fused projections, partial rotary). Every family also runs on the independent Vulkan executor with F32, F16, BF16, Q8 (row-wise int8) or Q4 (row-wise int4) weights, subject to model configuration compatibility.
+- **Inference:** Safetensors **decoder-only, text-only** models — Cheetah
+  runs causal, autoregressive decoder architectures over plain text only;
+  encoder or encoder–decoder models (BERT/T5-style bidirectional attention,
+  cross-attention) and multimodal inputs (vision, audio, image) are out of
+  scope by design. Supported families: Qwen2, Llama, Qwen3, Mixtral (native CPU backend, Ant-tiered; Mixtral is the mixture-of-experts with per-token expert routing via `num_experts_per_tok`), plus the dense delta families Mistral (decoding-time sliding window), Gemma (offset norms, sqrt(hidden) embedding scale, GeGLU), and Phi (biased LayerNorms, parallel residual, fused projections, partial rotary). Every family also runs on the independent Vulkan executor with F32, F16, BF16, Q8 (row-wise int8) or Q4 (row-wise int4) weights, subject to model configuration compatibility.
 - **Inspection and preparation:** Safetensors model directories and weight files.
-- **Not supported:** GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
+- **Not supported:** encoder or encoder–decoder architectures (BERT/T5-style), multimodal model inputs (vision/audio/image tokens), GGUF inference, ONNX, and PyTorch `.bin`/pickle inference. Cheetah's `formats` command lists its supported inputs.
 
 Model inference requires enough system or GPU memory for the weights, context, and generated output. Actual performance depends on model size, backend, and hardware.
 
