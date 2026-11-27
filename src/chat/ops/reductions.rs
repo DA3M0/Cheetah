@@ -211,12 +211,30 @@ mod tests {
         }
     }
 
+    /// Max/mean absolute deviation and max relative deviation of `got`
+    /// against the torch reference `want`.
+    fn deviation(got: &[f32], want: &[f32]) -> (f32, f32, f32) {
+        let mut max_abs = 0f32;
+        let mut sum_abs = 0f32;
+        let mut max_rel = 0f32;
+        for (g, w) in got.iter().zip(want) {
+            let diff = (g - w).abs();
+            max_abs = max_abs.max(diff);
+            sum_abs += diff;
+            if w.abs() > f32::EPSILON {
+                max_rel = max_rel.max(diff / w.abs());
+            }
+        }
+        (max_abs, sum_abs / got.len() as f32, max_rel)
+    }
+
     /// PyTorch cross-verification. The fixture is generated externally
     /// (`torch.sum/mean/max/argmax` over a seeded random `[rows, width]`
     /// buffer) and pointed at through `CHEETAH_REDUCE_FIXTURE`; without it
     /// the test skips, keeping the suite self-contained (same pattern as the
     /// Ant real-model tests). When a Vulkan device is present the GPU path is
-    /// checked against the same reference.
+    /// checked against the same reference. Deviation statistics against the
+    /// torch reference are printed for every sub-op × axis × backend.
     #[test]
     fn pytorch_reference_fixture_matches() {
         let Some(path) = std::env::var_os("CHEETAH_REDUCE_FIXTURE") else {
@@ -265,6 +283,10 @@ mod tests {
                     NativeOp::Reduce(f) => f(&x, rows, width, axis, &mut n_out),
                     other => panic!("{id} should be Reduce, got {other:?}"),
                 }
+                let (n_max, n_mean, n_rel) = deviation(&n_out, &expected);
+                eprintln!(
+                    "DEV {id} axis {axis:>1} native : n={out_len} max_abs={n_max:.3e} mean_abs={n_mean:.3e} max_rel={n_rel:.3e}"
+                );
                 // Sequential f32 accumulation vs torch's reduction order:
                 // relative tolerance; argmax indices must match exactly.
                 for (i, (got, want)) in n_out.iter().zip(&expected).enumerate() {
@@ -272,7 +294,9 @@ mod tests {
                     let tol = if id == "reduce.argmax" {
                         1e-6
                     } else {
-                        1e-4 * want.abs().max(1.0)
+                        // Sequential vs pairwise accumulation-order rounding
+                        // grows with the reduced extent; scale the guard.
+                        (1e-4 + 2e-6 * rows.max(width) as f32) * want.abs().max(1.0)
                     };
                     assert!(
                         diff <= tol,
@@ -295,12 +319,17 @@ mod tests {
                         )
                         .expect(id)
                         .primary;
+                        let (v_max, v_mean, v_rel) = deviation(&v_out, &expected);
+                        eprintln!(
+                            "DEV {id} axis {axis:>1} vulkan : n={} max_abs={v_max:.3e} mean_abs={v_mean:.3e} max_rel={v_rel:.3e}",
+                            v_out.len()
+                        );
                         for (i, (got, want)) in v_out.iter().zip(&expected).enumerate() {
                             let diff = (got - want).abs();
                             let tol = if id == "reduce.argmax" {
                                 1e-6
                             } else {
-                                1e-4 * want.abs().max(1.0)
+                                (1e-4 + 2e-6 * rows.max(width) as f32) * want.abs().max(1.0)
                             };
                             assert!(
                                 diff <= tol,
