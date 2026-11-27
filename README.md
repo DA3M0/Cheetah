@@ -220,7 +220,7 @@ The optional Vulkan feature uses native C compute operators for all registered a
 
 **Ant bucketed residency:** VRAM-tier weights are uploaded once into DEVICE_LOCAL memory (real VRAM); disk-tier weights stream through a HOST_COHERENT pool each step. Ant page-in/evict moves weights between the two buckets. On GPUs with small VRAM, oversized uploads automatically fall back to the streaming path per weight.
 
-**Operator library** (`shared_ops.comp`, 10 ops): rms_norm (op 0), elementwise add/sub (ops 1–2), rotary (op 3), attention (op 4), silu_mul (op 5), gelu_mul — exact + tanh (op 6), layer_norm (op 7), embedding_gather (op 8), bias_add (op 9). Dedicated matmul pipelines for f32, bf16, f16, and q8.
+**Operator library** (`shared_ops.comp`, ops 0–9 plus catalog ops 10–18): rms_norm (op 0), elementwise add/sub (ops 1–2), rotary (op 3), attention (op 4), silu_mul (op 5), gelu_mul — exact + tanh (op 6), layer_norm (op 7), embedding_gather (op 8), bias_add (op 9); catalog codes 10–18 cover activations, elementwise binops, extra norms, stateful recurrent steps, and reduction — sum/mean/max/argmax over one axis of a row-major buffer (op 18). Dedicated matmul pipelines for f32, bf16, f16, and q8.
 
 Compiled shader paths can be overridden per operator:
 

@@ -64,6 +64,9 @@ pub(crate) const OP_L2_NORM: u32 = 14;
 pub(crate) const OP_SOFTMAX: u32 = 15;
 pub(crate) const OP_CONV1D_STEP: u32 = 16;
 pub(crate) const OP_GATED_DELTA_STEP: u32 = 17;
+/// Reduction over one axis of a row-major f32 buffer (sub-op picks
+/// sum/mean/max/argmax; axis rides a push constant).
+pub(crate) const OP_REDUCE: u32 = 18;
 
 /// Op codes >= this base route to a registration-supplied custom SPIR-V shader
 /// (see [`CustomShader`]) instead of the shared `shared_ops` pipeline. This is
@@ -89,6 +92,12 @@ pub(crate) const BIN_DIV: u32 = 3;
 pub(crate) const BIN_MAX: u32 = 4;
 pub(crate) const BIN_MIN: u32 = 5;
 
+// Sub-op selectors for OP_REDUCE.
+pub(crate) const RED_SUM: u32 = 0;
+pub(crate) const RED_MEAN: u32 = 1;
+pub(crate) const RED_MAX: u32 = 2;
+pub(crate) const RED_ARGMAX: u32 = 3;
+
 /// Operator shape: tells the generic Vulkan dispatcher how to bind buffers
 /// and push constants for a registered op. Mirrors the `NativeOp` variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +122,8 @@ pub(crate) enum OpKind {
     Conv1dStep,
     /// Stateful gated delta-rule step.
     GatedDeltaStep,
+    /// Reduction over one axis (sum / mean / max / argmax).
+    Reduce,
 }
 
 /// One native CPU operator, tagged by its calling signature. The variants are
@@ -144,6 +155,9 @@ pub(crate) enum NativeOp {
     GatedDeltaStep(
         fn(&[f32], &[f32], &[f32], &[f32], &[f32], &mut [f32], &mut [f32], u32, u32, u32, u32),
     ),
+    /// Reduction over one axis of a row-major `[rows, width]` buffer:
+    /// `(x, rows, width, axis, out)`; the sub-op picks the reduction.
+    Reduce(fn(&[f32], u32, u32, u32, &mut [f32])),
 }
 
 /// A registration-supplied compute shader (op codes >= `CUSTOM_OP_BASE`).
@@ -412,6 +426,7 @@ mod invariants {
                 NativeOp::Embedding(_) => OpKind::Embedding,
                 NativeOp::Conv1dStep(_) => OpKind::Conv1dStep,
                 NativeOp::GatedDeltaStep(_) => OpKind::GatedDeltaStep,
+                NativeOp::Reduce(_) => OpKind::Reduce,
             };
             assert_eq!(v.kind, expected, "op {id} kind mismatch");
         }
@@ -858,6 +873,52 @@ mod parity {
             .primary;
             cmp(&format!("{id} out step {step}"), &out_n, &out_v, 1e-5);
             cmp(&format!("{id} state step {step}"), &state_n, &state_v, 1e-5);
+        }
+    }
+
+    #[test]
+    fn parity_reduce() {
+        if !device_available() {
+            return;
+        }
+        // 5 rows × 130 columns: a width that is not a multiple of the
+        // workgroup size (64) exercises the shader's tail on both axes.
+        let (rows, width) = (5usize, 130usize);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
+        };
+        let x: Vec<f32> = (0..rows * width).map(|_| next()).collect();
+        let ids = ["reduce.sum", "reduce.mean", "reduce.max", "reduce.argmax"];
+        for id in ids {
+            for axis in [0u32, 1] {
+                let out_len = if axis == 0 { rows } else { width };
+                let native = native_op_for(id).expect(id);
+                let vulkan = vulkan_op_for(id).expect(id);
+                let mut n_out = vec![f32::NAN; out_len];
+                match native {
+                    NativeOp::Reduce(f) => f(&x, rows as u32, width as u32, axis, &mut n_out),
+                    other => panic!("{id} should be Reduce, got {other:?}"),
+                }
+                let v_out = run_vulkan_op(
+                    &vulkan,
+                    OpCall::Reduce {
+                        x: &x,
+                        rows,
+                        width,
+                        axis,
+                    },
+                )
+                .expect(id)
+                .primary;
+                // argmax outputs are exact indices; sums over 130 addends of
+                // magnitude < 1 stay far inside 1e-4.
+                let label = format!("{id} axis {axis}");
+                cmp(&label, &n_out, &v_out, 1e-4);
+            }
         }
     }
 

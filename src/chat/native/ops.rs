@@ -1066,6 +1066,11 @@ pub fn l2norm_heads(values: &mut [f32], heads: usize, head_dim: usize) {
 /// Gated RMSNorm used by Qwen3.5's linear-attention output:
 /// per-head `x / rms(x) · weight · silu(gate)`. `weight` is one head wide
 /// and shared by every head; `gate` is `heads * head_dim` long.
+///
+/// Intentionally unused until the Qwen3.5 family registers: its siblings
+/// (`causal_conv1d_step`, `gated_delta_step`) are already wired through the
+/// operator catalog; this kernel joins when that family lands.
+#[allow(dead_code)]
 pub fn rmsnorm_gated(
     values: &mut [f32],
     gate: &[f32],
@@ -1195,6 +1200,123 @@ pub fn softmax(scores: &mut [f32]) {
     let inv = 1.0 / sum;
     for score in scores.iter_mut() {
         *score *= inv;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reductions over one axis of a row-major `[rows, width]` buffer.
+// `axis == 0` reduces each row over `width` (one output per row — the
+// logits / per-row shape); `axis == 1` reduces each column over `rows` (one
+// output per column — the mean-pooling shape). `out.len()` must match the
+// reduced shape.
+// ---------------------------------------------------------------------------
+
+/// Sum over one axis; NaN inputs propagate.
+pub fn reduce_sum(x: &[f32], rows: usize, width: usize, axis: u32, out: &mut [f32]) {
+    match axis {
+        0 => {
+            assert_eq!(out.len(), rows, "reduce_sum axis 0 needs one output per row");
+            for (row, value) in out.iter_mut().enumerate() {
+                *value = x[row * width..(row + 1) * width].iter().sum();
+            }
+        }
+        1 => {
+            assert_eq!(out.len(), width, "reduce_sum axis 1 needs one output per column");
+            for value in out.iter_mut() {
+                *value = 0.0;
+            }
+            for row in 0..rows {
+                for (column, value) in out.iter_mut().enumerate() {
+                    *value += x[row * width + column];
+                }
+            }
+        }
+        other => panic!("reduce_sum: unsupported axis {other} (0 = over width, 1 = over rows)"),
+    }
+}
+
+/// Mean over one axis (`reduce_sum` scaled by the reduced extent; an empty
+/// extent yields NaN, matching torch.mean over a zero-length dim).
+pub fn reduce_mean(x: &[f32], rows: usize, width: usize, axis: u32, out: &mut [f32]) {
+    let extent = match axis {
+        0 => width,
+        1 => rows,
+        other => panic!("reduce_mean: unsupported axis {other} (0 = over width, 1 = over rows)"),
+    };
+    reduce_sum(x, rows, width, axis, out);
+    for value in out.iter_mut() {
+        *value /= extent as f32;
+    }
+}
+
+/// Maximum over one axis; NaN inputs propagate (NaN dominates, matching
+/// torch.max).
+pub fn reduce_max(x: &[f32], rows: usize, width: usize, axis: u32, out: &mut [f32]) {
+    match axis {
+        0 => {
+            assert_eq!(out.len(), rows, "reduce_max axis 0 needs one output per row");
+            for (row, value) in out.iter_mut().enumerate() {
+                let mut best = f32::NEG_INFINITY;
+                let mut saw_nan = false;
+                for &entry in &x[row * width..(row + 1) * width] {
+                    if entry.is_nan() {
+                        saw_nan = true;
+                        break;
+                    }
+                    if entry > best {
+                        best = entry;
+                    }
+                }
+                *value = if saw_nan { f32::NAN } else { best };
+            }
+        }
+        1 => {
+            assert_eq!(out.len(), width, "reduce_max axis 1 needs one output per column");
+            for value in out.iter_mut() {
+                *value = f32::NEG_INFINITY;
+            }
+            for row in 0..rows {
+                for (column, value) in out.iter_mut().enumerate() {
+                    let entry = x[row * width + column];
+                    if entry.is_nan() {
+                        *value = f32::NAN;
+                    } else if !value.is_nan() && entry > *value {
+                        *value = entry;
+                    }
+                }
+            }
+        }
+        other => panic!("reduce_max: unsupported axis {other} (0 = over width, 1 = over rows)"),
+    }
+}
+
+/// Argmax over one axis, written as the f32 index value. Replicates the
+/// host-side greedy scan (`sample_token`'s `max_by(f32::total_cmp)`)
+/// element-for-element: `total_cmp` ordering, equal maxima keep the later
+/// index, and NaN ranks above every number.
+pub fn reduce_argmax(x: &[f32], rows: usize, width: usize, axis: u32, out: &mut [f32]) {
+    let (count, inner, stride, base_step) = match axis {
+        0 => (rows, width, 1usize, width),
+        1 => (width, rows, width, 1usize),
+        other => panic!("reduce_argmax: unsupported axis {other} (0 = over width, 1 = over rows)"),
+    };
+    assert_eq!(
+        out.len(),
+        count,
+        "reduce_argmax needs one output per reduced row/column"
+    );
+    for index in 0..count {
+        let base = index * base_step;
+        let mut best = f32::NEG_INFINITY;
+        let mut best_index = 0usize;
+        for step in 0..inner {
+            let value = x[base + step * stride];
+            if value.total_cmp(&best) != std::cmp::Ordering::Less {
+                best = value;
+                best_index = step;
+            }
+        }
+        out[index] = best_index as f32;
     }
 }
 
@@ -1777,18 +1899,13 @@ impl OpsToolbox {
         Ok(())
     }
 
-    /// Whether the weight store carries a unit by this exact id.
-    pub(crate) fn contains_unit(&self, unit: &str) -> bool {
-        self.store.contains(unit)
-    }
-
-    /// Shape of a unit as stored in the units manifest.
-    pub(crate) fn unit_shape(&self, unit: &str) -> Option<Vec<usize>> {
-        self.store.unit_shape(unit)
-    }
-
     /// Dequantize one unit to f32 values (small parameter tensors such as a
     /// gated-delta `A_log`, convolution taps, or a head norm).
+    ///
+    /// Intentionally unused until the Qwen3.5 family registers: its forward
+    /// will read the gated-delta parameters through this accessor, the same
+    /// way dense families read norm weights through `rmsnorm`.
+    #[allow(dead_code)]
     pub(crate) fn unit_values(&self, unit: &str) -> Result<Vec<f32>, String> {
         let (bytes, dtype, shape) = self
             .store

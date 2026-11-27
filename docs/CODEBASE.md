@@ -251,7 +251,7 @@ run_init_command      src/main.rs:90
 | `NativeOp` | ops.rs | native operator signature families: `Unary` / `InPlaceBinop` / `Binary` / `Norm` / `NormL2` / `Softmax` / `Rope` / `Embedding` / `Conv1dStep` / `GatedDeltaStep`; stored as plain fn pointers |
 | `VulkanOp` / `CustomShader` | ops.rs | Vulkan binding: stable op code + `OpKind` + sub-op selector; op codes ≥ `CUSTOM_OP_BASE` (100) carry a `CustomShader { name, env }` instead of the shared pipeline |
 | `native_op_for` / `vulkan_op_for` / `registered_op_ids` | ops.rs | lookups derived from the generated `REGISTRY`; misses list the valid ids |
-| operator families | ops/{activations,elementwise,norms,positional,stateful}.rs | first batch: 10 activations, 6 elementwise, 6 norms, 3 position/embedding/bias, 2 stateful recurrent steps — native + Vulkan on every entry |
+| operator families | ops/{activations,elementwise,norms,positional,reductions,stateful}.rs | first batch: 10 activations, 6 elementwise, 6 norms, 3 position/embedding/bias, 4 reductions (sum/mean/max/argmax over one axis, op 18), 2 stateful recurrent steps — native + Vulkan on every entry |
 | custom-shader family | ops/custom.rs + ops/shaders/*.comp | registration-supplied SPIR-V for ops that don't fit `shared_ops` (demo: `act.mish`); build.rs compiles the shader and publishes its default path, runtime env overrides it |
 | `run_vulkan_op` | vulkan/ops.rs | translates an `OpCall` into the `shared_ops` 5-buffer / 8-push-constant layout; routes custom op codes to `vk_run_custom_op` |
 | `vk_run_op` / `vk_run_custom_op` | cheetah_vulkan.c | generic dispatch on the shared layout; in-out slots (recurrent state) preserve host contents across the round trip |
@@ -292,7 +292,7 @@ run_init_command      src/main.rs:90
 | `CHEETAH_MATMUL_BF16_SPV` | cheetah_vulkan.c | .spv path | overrides the bf16 matmul shader |
 | `CHEETAH_MATMUL_Q8_SPV` | cheetah_vulkan.c | .spv path | overrides the q8 matmul shader |
 | `CHEETAH_MATMUL_Q4_SPV` | cheetah_vulkan.c | .spv path | overrides the q4 matmul shader |
-| `CHEETAH_QWEN_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the shared_ops shader (rmsnorm/rope/attention/silu/gelu/elementwise + catalog op codes 10..17) |
+| `CHEETAH_QWEN_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the shared_ops shader (rmsnorm/rope/attention/silu/gelu/elementwise + catalog op codes 10..18) |
 | `CHEETAH_MISH_OPS_SPV` | cheetah_vulkan.c | .spv path | overrides the custom `act.mish` shader (`src/chat/ops/shaders/mish.comp`); every `CustomShader` registration names its own override variable |
 
 ### 4.3 Build-time
@@ -363,7 +363,7 @@ self-contained and runs anywhere.
    a family gains/loses a backend.
 9. **The operator catalog is additive and dual-backend**: every entry in
    `src/chat/ops/` declares both a native fn pointer and a Vulkan binding
-   (`every_registered_op_has_*_backend`); op codes are stable (`0..17` =
+   (`every_registered_op_has_*_backend`); op codes are stable (`0..18` =
    shared_ops branches, `>=100` = custom shaders), and a custom op must name a
    `.comp` under `src/chat/ops/shaders/` (`custom_op_codes_and_shaders_are_consistent`).
 

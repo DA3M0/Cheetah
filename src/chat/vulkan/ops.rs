@@ -93,6 +93,14 @@ pub(crate) enum OpCall<'a> {
         head_k_dim: usize,
         head_v_dim: usize,
     },
+    /// Reduction over one axis of a row-major `[rows, width]` buffer; the
+    /// `VulkanOp`'s sub-op picks the reduction.
+    Reduce {
+        x: &'a [f32],
+        rows: usize,
+        width: usize,
+        axis: u32,
+    },
 }
 
 /// Output of one dispatch: the primary buffer (b2). Stateful ops mutate their
@@ -337,6 +345,24 @@ pub(crate) fn run_vulkan_op(op: &VulkanOp, call: OpCall<'_>) -> Result<OpOutput,
             destinations[3] = state.as_mut_ptr() as *mut c_void;
             sizes[2] = bytes(out_len);
             invocation_count = num_v_heads;
+        }
+        OpCall::Reduce {
+            x,
+            rows,
+            width,
+            axis,
+        } => {
+            let out_len = if axis == 0 { rows } else { width };
+            params[1] = rows as u32;
+            params[2] = width as u32;
+            params[3] = op.sub_op;
+            params[4] = axis;
+            sources[0] = x.as_ptr() as *const c_void;
+            sizes[0] = bytes(x.len());
+            primary = vec![0.0; out_len];
+            destinations[2] = primary.as_mut_ptr() as *mut c_void;
+            sizes[2] = bytes(out_len);
+            invocation_count = out_len;
         }
     }
 

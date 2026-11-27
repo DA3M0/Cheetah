@@ -524,6 +524,56 @@ void run_gated_delta_step(uint v_head) {
     }
 }
 
+// op 18: reduction over one axis of a row-major [rows, width] f32 buffer.
+// p1 = rows, p2 = width, p3 = sub-op (0 sum, 1 mean, 2 max, 3 argmax),
+// p4 = axis (0 = over width, one output per row; 1 = over rows, one output
+// per column). b0 = x, b2 = out. One thread per output element.
+void run_reduce(uint index) {
+    uint rows = params.p1;
+    uint width = params.p2;
+    uint sub = params.p3;
+    uint axis = params.p4;
+    uint count = (axis == 0u) ? rows : width;
+    if (index >= count) {
+        return;
+    }
+    uint inner = (axis == 0u) ? width : rows;
+    uint stride = (axis == 0u) ? 1u : width;
+    uint base = (axis == 0u) ? index * width : index;
+    float acc = 0.0;
+    float best = uintBitsToFloat(0xFF800000u); // -inf
+    uint best_index = 0u;
+    bool saw_nan = false;
+    for (uint i = 0u; i < inner; ++i) {
+        float value = uintBitsToFloat(b0.data[base + i * stride]);
+        if (isnan(value)) {
+            // NaN dominates max/argmax and propagates through sum/mean.
+            saw_nan = true;
+            best_index = i;
+            break;
+        }
+        acc += value;
+        if (value > best) {
+            best = value;
+            best_index = i;
+        } else if (sub == 3u && value == best) {
+            // argmax keeps the later index on ties, matching the native scan.
+            best_index = i;
+        }
+    }
+    float result;
+    if (sub == 0u) {
+        result = acc;
+    } else if (sub == 1u) {
+        result = acc / float(inner);
+    } else if (sub == 2u) {
+        result = saw_nan ? uintBitsToFloat(0x7FC00000u) : best;
+    } else {
+        result = float(best_index);
+    }
+    b2.data[index] = floatBitsToUint(result);
+}
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (params.op == 0u) {
@@ -562,5 +612,7 @@ void main() {
         run_conv1d_step(index);
     } else if (params.op == 17u) {
         run_gated_delta_step(index);
+    } else if (params.op == 18u) {
+        run_reduce(index);
     }
 }
