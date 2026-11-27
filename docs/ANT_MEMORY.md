@@ -717,9 +717,14 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   B-length derivation bug on that model's tied-embedding config, present
   since before RC4 and unrelated to the registration layer. Synthetic-model
   Vulkan runs and the native backend are unaffected.
-- Batched prefill (one weight pass over all prompt tokens) is pending —
-  prefill currently walks positions sequentially, re-reading resident pages
-  per position.
+- Chunked prefill (batched-GEMM passes over prompt-token chunks,
+  `CHEETAH_PREFILL_CHUNK`) is implemented for the dense families — each dense
+  registration file carries its own `forward_chunked` path. Mixtral still
+  walks positions sequentially (the sparse MoE block has no batched
+  feed-forward yet on native), so MoE prefill does not benefit from chunking.
+- Sliding-window attention is a single global window resolved per config;
+  per-layer alternating windows (gemma-2-style hybrid attention) are not
+  supported.
 - MoE routing-aware offload (per-expert residency) is implemented as of RC2-B:
   both backends now track per-(layer, expert) residency from the router's
   expert selections. The native runner pages in freshly selected experts and
