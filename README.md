@@ -340,6 +340,7 @@ The startup banner prints the backend capability list per architecture (`backend
 - [docs/ANT_MEMORY.md](docs/ANT_MEMORY.md) — Ant memory manager and the native backend: file formats, the parameter-resolution chain, the residency planner, page-level tier control, SIMD kernels, the comparison-test infrastructure, and the add-a-family checklist.
 - [docs/REGISTRY.md](docs/REGISTRY.md) — the model resolution layer: architecture → chat template / backend capability / family constants, backend selection, and how to add an architecture, family, or backend.
 - [docs/MCP.md](docs/MCP.md) — MCP, both directions: the built-in `POST /mcp` server endpoint, client configuration, the agentic loop, streaming hold-back, and testing.
+- [docs/REDUCTIONS_VALIDATION.md](docs/REDUCTIONS_VALIDATION.md) — reduction operators vs the PyTorch reference: fixture method, deviation tables (max/argmax bit-exact; sum/mean at f32 rounding noise), and reproduction steps.
 - [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md) — coding conventions and the complete per-function reference (every function in the codebase, analyzed).
 
 ## Model inspection

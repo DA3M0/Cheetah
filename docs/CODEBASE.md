@@ -331,8 +331,7 @@ cargo test -- --test-threads=4       # parallel (some tests are timing-sensitive
 Tests that need local artifacts (auto-skip when absent):
 - `ant_lifecycle_against_real_prepared_model` — `/home/benny/models/qwen-0.5b-prepared`
 - `pytorch_reference_fixture_matches` — reduction operators vs the PyTorch
-  reference, fixture path via `CHEETAH_REDUCE_FIXTURE` (method, deviation
-  tables, conclusions: [REDUCTIONS_VALIDATION.md](REDUCTIONS_VALIDATION.md))
+  reference (fixture path via `CHEETAH_REDUCE_FIXTURE`)
 
 Everything else — including the native kernel / forward tests — is
 self-contained and runs anywhere.
