@@ -1,18 +1,19 @@
 //! The generic transformer executor (llama / qwen2 / qwen3 / mistral /
 //! gemma / mixtral): the decoder graph (attention + dense/MoE feed-forward),
-//! the executor's Ant GPU-bucket residency, and the config surface the
-//! loader (`super`) builds per model_type. Weight loading and the operator
-//! dispatch live in `super::weights` (the precision registry).
+//! and the config surface the loader (`super`) builds per model_type. The
+//! family-free machinery (expert residency, GPU slot paging, KV cache) lives
+//! in `super::context`; weight loading and the operator dispatch in
+//! `super::weights` (the precision registry).
 
 use crate::chat::moe::select_experts;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+use super::context::{Expert, GpuKvCache, VulkanForwardContext, page_linear};
 use super::required_usize;
 use super::weights::{
-    Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight, upload_slot,
-    validate_shape,
+    Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight, validate_shape,
 };
 
 #[derive(Clone, Debug)]
@@ -273,13 +274,6 @@ impl VulkanTransformerConfig {
 }
 
 #[derive(Clone)]
-struct Expert {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
-}
-
-#[derive(Clone)]
 enum FeedForward {
     Dense {
         gate: Linear,
@@ -307,7 +301,7 @@ impl FeedForward {
         input: &[f32],
         rows: usize,
         hidden_size: usize,
-        expert_residency: &mut HashMap<(usize, usize), bool>,
+        context: &mut VulkanForwardContext,
         layer_index: usize,
     ) -> Result<Vec<f32>, String> {
         match self {
@@ -340,55 +334,17 @@ impl FeedForward {
                         selected_by_expert[expert_index].push((row, route_weight));
                     }
                 }
-                // RC2-B: routing-aware per-expert residency. Experts the current
-                // router selection no longer picks are evicted (release the
-                // resident GPU bucket); freshly picked experts are paged in
-                // (upload into the resident bucket). State is keyed per
-                // (layer, expert) so it holds across positions and generation steps.
-                for expert_index in 0..experts.len() {
-                    let selected_rows = &selected_by_expert[expert_index];
-                    let resident = !selected_rows.is_empty();
-                    let key = (layer_index, expert_index);
-                    let was_resident = expert_residency.get(&key).copied().unwrap_or(false);
-                    if was_resident != resident {
-                        if resident {
-                            let expert = &mut experts[expert_index];
-                            if expert.gate.slot.is_none() {
-                                expert.gate.slot = upload_slot(
-                                    &expert.gate.name,
-                                    &expert.gate.weight,
-                                    (expert.gate.input_size + 3) / 4 * 4,
-                                );
-                            }
-                            if expert.up.slot.is_none() {
-                                expert.up.slot = upload_slot(
-                                    &expert.up.name,
-                                    &expert.up.weight,
-                                    (expert.up.input_size + 3) / 4 * 4,
-                                );
-                            }
-                            if expert.down.slot.is_none() {
-                                expert.down.slot = upload_slot(
-                                    &expert.down.name,
-                                    &expert.down.weight,
-                                    (expert.down.input_size + 3) / 4 * 4,
-                                );
-                            }
-                        } else {
-                            let expert = &mut experts[expert_index];
-                            if let Some(slot) = expert.gate.slot.take() {
-                                cheetah::native::vulkan::weight_release(slot.handle);
-                            }
-                            if let Some(slot) = expert.up.slot.take() {
-                                cheetah::native::vulkan::weight_release(slot.handle);
-                            }
-                            if let Some(slot) = expert.down.slot.take() {
-                                cheetah::native::vulkan::weight_release(slot.handle);
-                            }
-                        }
-                        expert_residency.insert(key, resident);
-                    }
-                }
+                // RC2-B: routing-aware per-expert residency, driven through the
+                // shared context: experts the current router selection no
+                // longer picks are evicted (release the resident GPU bucket);
+                // freshly picked experts are paged in (upload into the
+                // resident bucket). State is keyed per (layer, expert) so it
+                // holds across positions and generation steps.
+                let resident: Vec<bool> = selected_by_expert
+                    .iter()
+                    .map(|selected_rows| !selected_rows.is_empty())
+                    .collect();
+                context.sync_expert_residency(layer_index, experts, &resident);
                 for (expert, selected_rows) in experts.iter().zip(selected_by_expert) {
                     if selected_rows.is_empty() {
                         continue;
@@ -442,8 +398,7 @@ struct Layer {
     v_proj: Linear,
     o_proj: Linear,
     feed_forward: FeedForward,
-    keys: Vec<f32>,
-    values: Vec<f32>,
+    kv: GpuKvCache,
 }
 
 #[derive(Clone)]
@@ -453,10 +408,9 @@ pub(crate) struct VulkanTransformerExecutor {
     layers: Vec<Layer>,
     final_norm: WeightData,
     lm_head: WeightData,
-    /// RC2-B: routing-aware per-expert residency, keyed by
-    /// (layer_index, expert_index) -> resident. Kept in sync with the MoE
-    /// router's expert selections while a generation walks the layers.
-    expert_residency: HashMap<(usize, usize), bool>,
+    /// Family-free forward machinery: the routing-aware per-expert residency
+    /// and the substrate paging primitives it drives.
+    context: VulkanForwardContext,
 }
 
 impl crate::chat::registry::ModelForward for VulkanTransformerExecutor {
@@ -483,9 +437,10 @@ impl crate::chat::registry::ModelForward for VulkanTransformerExecutor {
 
 impl VulkanTransformerExecutor {
     /// Ant bucketing: page one weight tensor between the GPU bucket
-    /// (persistent upload) and the host-streaming bucket. The host copy in
-    /// `WeightData` is always authoritative, so eviction only releases the
-    /// device allocation and a page-in re-uploads from it.
+    /// (persistent upload) and the host-streaming bucket, through the shared
+    /// context's paging primitive. The host copy in `WeightData` is always
+    /// authoritative, so eviction only releases the device allocation and a
+    /// page-in re-uploads from it.
     fn page_weight(&mut self, unit_id: &str, resident: bool) -> bool {
         let mut handled = false;
         for layer in &mut self.layers {
@@ -499,18 +454,7 @@ impl VulkanTransformerExecutor {
                     continue;
                 }
                 handled = true;
-                match (resident, &mut linear.slot) {
-                    (true, slot @ None) => {
-                        let row_bytes = (linear.input_size + 3) / 4 * 4;
-                        *slot = upload_slot(&linear.name, &linear.weight, row_bytes);
-                    }
-                    (false, slot @ Some(_)) => {
-                        if let Some(slot) = slot.take() {
-                            cheetah::native::vulkan::weight_release(slot.handle);
-                        }
-                    }
-                    _ => {}
-                }
+                page_linear(linear, resident);
             }
             match &mut layer.feed_forward {
                 FeedForward::Dense { gate, up, down, .. } => {
@@ -519,18 +463,7 @@ impl VulkanTransformerExecutor {
                             continue;
                         }
                         handled = true;
-                        match (resident, &mut linear.slot) {
-                            (true, slot @ None) => {
-                                let row_bytes = (linear.input_size + 3) / 4 * 4;
-                                *slot = upload_slot(&linear.name, &linear.weight, row_bytes);
-                            }
-                            (false, slot @ Some(_)) => {
-                                if let Some(slot) = slot.take() {
-                                    cheetah::native::vulkan::weight_release(slot.handle);
-                                }
-                            }
-                            _ => {}
-                        }
+                        page_linear(linear, resident);
                     }
                 }
                 FeedForward::MixtureOfExperts {
@@ -545,18 +478,7 @@ impl VulkanTransformerExecutor {
                             continue;
                         }
                         handled = true;
-                        match (resident, &mut linear.slot) {
-                            (true, slot @ None) => {
-                                let row_bytes = (linear.input_size + 3) / 4 * 4;
-                                *slot = upload_slot(&linear.name, &linear.weight, row_bytes);
-                            }
-                            (false, slot @ Some(_)) => {
-                                if let Some(slot) = slot.take() {
-                                    cheetah::native::vulkan::weight_release(slot.handle);
-                                }
-                            }
-                            _ => {}
-                        }
+                        page_linear(linear, resident);
                     }
                 }
             }
@@ -755,8 +677,7 @@ impl VulkanTransformerExecutor {
                     config.features.attention_output_bias,
                 )?,
                 feed_forward,
-                keys: Vec::new(),
-                values: Vec::new(),
+                kv: GpuKvCache::default(),
             });
         }
         Ok(Self {
@@ -765,15 +686,14 @@ impl VulkanTransformerExecutor {
             layers,
             final_norm,
             lm_head,
-            expert_residency: HashMap::new(),
+            context: VulkanForwardContext::new(),
         })
     }
 
     /// Per-layer KV reset backing the trait impl.
     fn clear_cache(&mut self) {
         for layer in &mut self.layers {
-            layer.keys.clear();
-            layer.values.clear();
+            layer.kv.clear();
         }
     }
 
@@ -803,7 +723,7 @@ impl VulkanTransformerExecutor {
         if self
             .layers
             .first()
-            .is_some_and(|layer| layer.keys.len() != expected_cache)
+            .is_some_and(|layer| layer.kv.keys.len() != expected_cache)
         {
             return Err(
                 "Vulkan transformer KV cache position does not match the input offset.".into(),
@@ -866,12 +786,11 @@ impl VulkanTransformerExecutor {
                 self.config.head_dim,
                 self.config.rope_theta,
             )?;
-            layer.keys.extend_from_slice(&keys);
-            layer.values.extend_from_slice(&values);
+            layer.kv.append(&keys, &values);
             let attention = cheetah::native::vulkan::attention(
                 &query,
-                &layer.keys,
-                &layer.values,
+                &layer.kv.keys,
+                &layer.kv.values,
                 sequence,
                 offset,
                 offset + sequence,
@@ -894,7 +813,7 @@ impl VulkanTransformerExecutor {
                 &normalized,
                 sequence,
                 hidden,
-                &mut self.expert_residency,
+                &mut self.context,
                 layer_index,
             )?;
             activations = cheetah::native::vulkan::add(&residual, &feed_forward)?;
@@ -1056,12 +975,11 @@ mod tests {
                 v_proj: identity_linear("v_proj", 2),
                 o_proj: identity_linear("o_proj", 2),
                 feed_forward,
-                keys: Vec::new(),
-                values: Vec::new(),
+                kv: GpuKvCache::default(),
             }],
             final_norm: WeightData::F32(vec![1.0, 1.0].into()),
             lm_head: WeightData::F32(vec![1.0, 0.0, 0.0, 1.0].into()),
-            expert_residency: HashMap::new(),
+            context: VulkanForwardContext::new(),
         }
     }
 

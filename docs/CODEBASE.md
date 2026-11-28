@@ -53,6 +53,7 @@ cheetah/
 │   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
 │   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
 │   │       ├── ops.rs          generic catalog dispatch (VulkanOp → 5 buffers + 8 push constants)
+│   │       ├── context.rs      family-free forward machinery (VulkanForwardContext: expert residency, GPU slot paging, KV cache)
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
 │   ├── mcp.rs                  ★ MCP client: server configs, tool registry, stdio transport (src/mcp/client.rs; docs/MCP.md)
 │   ├── native.rs               FFI: init/manifest update + Rust wrappers over cheetah_*.c

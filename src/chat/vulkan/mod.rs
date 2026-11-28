@@ -15,6 +15,9 @@
 //! family branching in core code that the registration mode removed, so phi
 //! keeps its own compute graph in its registration file.
 //!
+//! - `context` — the family-free forward machinery (expert residency, GPU
+//!   slot paging, KV cache container): the `OpsToolbox` analogue every
+//!   executor composes
 //! - `transformer` — the generic transformer executor (llama-shaped families)
 //! - `weights` — the shared weight layer + precision-registry dispatch
 //!
@@ -22,6 +25,8 @@
 //! (`src/chat/registrations/phi.rs`), the same one-family-one-file rule the
 //! native side follows.
 
+#[cfg(feature = "vulkan")]
+pub(crate) mod context;
 #[cfg(feature = "vulkan")]
 #[allow(dead_code)] // additive catalog: callers arrive with model-forward adoption
 pub(crate) mod ops;
