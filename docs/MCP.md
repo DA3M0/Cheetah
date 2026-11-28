@@ -133,11 +133,12 @@ MCP tools/call ──► chat_generate: messages + the configured MCP tools
               └─ plain answer ──► final response
 ```
 
-- **MCP-owned calls execute server-side.** A streaming OpenAI request never
-  sees the tool-call JSON: the engine's `ToolStreamSink` holds back
-  everything from the first `{` / code fence and the tool-loop round
-  decision drops it. The client only sees the final text deltas (or
-  `tool_calls` frames for client-owned calls).
+- **Tool responses are never streamed.** A streaming OpenAI request that
+  carries tools buffers the whole generation (SSE heartbeats keep the
+  connection alive) and delivers one complete wrapped frame at the end —
+  the full content message or the fully-assembled `tool_calls` array —
+  never fragments of an agentic round. The chat REPL keeps live deltas
+  (`ToolStreamSink` holds back tool-call JSON there).
 - **Client-declared calls keep the OpenAI contract.** If a round returns any
   call that is not an MCP tool, the calls return to the HTTP client as
   `tool_calls` — the client executes them and sends results back as
@@ -155,7 +156,7 @@ MCP tools/call ──► chat_generate: messages + the configured MCP tools
 | Registry | `src/mcp.rs` | Server configs → connected clients + flattened tool list; `tool_definitions()` renders OpenAI-style definitions; `call()` routes to the owning server (per-client mutex, `Arc`-shared across request workers); `Drop` kills children |
 | Agentic loop | `Engine::generate_tool_chat` | The round driver (MCP-agnostic — it routes calls to `Option<&McpRegistry>`) |
 | MCP **endpoint** | `src/serve/mcp.rs` | Serve's MCP surface: `POST /mcp` dispatch (`handle_request` is HTTP-free and generic over the invoker), the `chat_generate` / `model_info` catalog, per-request state borrowing the shared engine + generation ticket |
-| Streaming hold-back | `ToolStreamSink` (engine.rs) | Live text deltas with tool-call JSON held back until the round decision |
+| Streaming hold-back | `ToolStreamSink` (engine.rs) | Chat-REPL deltas with tool-call JSON held back until the round decision; API tool responses buffer entirely (one wrapped frame) |
 
 The full function-level reference lives in
 [CODING_STANDARDS.md](CODING_STANDARDS.md) §10.19–10.20b.
@@ -173,10 +174,11 @@ The full function-level reference lives in
 - `cargo test tool_stream` — the hold-back wrapper: braces/fences hold,
   plain text streams through, flush/drop at the round decision.
 - Live verification: `cheetah serve ... --mcp-server "demo=python3
-  /tmp/echo_mcp_server.py"` + a streaming request — heartbeats and content
-  deltas arrive incrementally, and `[mcp] calling tool '...'` lines appear on
-  stderr per execution. Server side: `POST /mcp` with an initialize /
-  tools/call line — see the patterns in §1.
+  /tmp/echo_mcp_server.py"` + a streaming request — heartbeats flow while
+  the generation runs, then one complete frame arrives with the packaged
+  response, and `[mcp] calling tool '...'` lines appear on stderr per
+  execution. Server side: `POST /mcp` with an initialize / tools/call
+  line — see the patterns in §1.
 
 ## 6. Limitations
 

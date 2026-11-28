@@ -417,18 +417,25 @@ async fn handle_chat_completions(
                 };
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
             let response = sse_response(rx, heartbeat_frame, None);
-            // The SSE sink goes INTO the loop: text deltas stream live (with
-            // tool-call hold-back), so streaming tool requests get
-            // incremental frames per round instead of one post-hoc blob.
+            // Tool-call responses are never streamed: the generation runs into
+            // a buffering sink (SSE heartbeats keep the connection alive), and
+            // the caller receives one complete wrapped frame — the full content
+            // message or the fully-assembled `tool_calls` array — never
+            // fragments of an agentic round.
             tokio::task::spawn_blocking(move || {
                 let guard = generation_ticket.acquire();
+                let mut buffer = NullSink;
+                let result = generate_tool_chat(&gen_state, guard, generation_input, &mut buffer);
                 let mut sink = SseSink::new(tx, completion_id, created, model);
-                let result = generate_tool_chat(&gen_state, guard, generation_input, &mut sink);
                 match result {
-                    Ok((generation, ToolResponse::Text(_))) => {
-                        // Content deltas already streamed round by round.
+                    Ok((generation, ToolResponse::Text(content))) => {
                         if let Err(error) = sink
-                            .send_chunk(None, None, None, Some(generation.finish_reason.as_str()))
+                            .send_chunk(
+                                Some("assistant"),
+                                Some(&content),
+                                None,
+                                Some(generation.finish_reason.as_str()),
+                            )
                             .and_then(|()| sink.send_done())
                         {
                             eprintln!(
