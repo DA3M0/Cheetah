@@ -51,7 +51,7 @@ cheetah/
 │   │   │   ├── shaders/        custom-shader ops (.comp, shared_ops ABI; build.rs → custom_op_shaders.rs)
 │   │   │   └── ...             activations / elementwise / norms / positional / stateful / custom
 │   │   └── vulkan/             ★ the Vulkan backend (shared executor machinery)
-│   │       ├── transformer.rs  generic transformer executor (llama-shaped families) + Ant GPU-bucket residency
+│   │       ├── transformer.rs  transformer config surface (VulkanTransformerConfig + per-family features); the decode graphs live in the registration files
 │   │       ├── ops.rs          generic catalog dispatch (VulkanOp → 5 buffers + 8 push constants)
 │   │       ├── context.rs      family-free forward machinery (VulkanForwardContext: expert residency, GPU slot paging, KV cache)
 │   │       └── weights.rs      shared weight layer + precision-registry dispatch
@@ -229,7 +229,7 @@ run_init_command      src/main.rs:90
 | generated `REGISTRY` include | mod.rs | build.rs → `OUT_DIR/model_registry.rs`; the `<family>_registration` modules are children of `chat`, so registration files reach the boundary types via `super::` |
 | `backend_loader_for_architecture` / `vulkan_loader_for_architecture` / `registered_backends` / `family_for_architecture` / `chat_template_for_architecture` / `stop_markers_for_architecture` | registry.rs | lookups derived from the generated `REGISTRY` |
 | `load_model` / `load_model_for_device` | registry.rs | device/backend dispatch + Candle CPU retirement policy |
-| `VulkanTransformerExecutor` / `VulkanPhiExecutor` | vulkan/transformer.rs; registrations/phi.rs | Candle-free Vulkan executors (Ant GPU-bucket residency); the phi executor lives in the phi registration file — one family, one file on both backends |
+| `<Family>VulkanExecutor` (llama/qwen2/qwen3/mistral/gemma/mixtral/phi) | registrations/<family>.rs | each family's own Candle-free Vulkan executor (Ant GPU-bucket residency) — one family, one file on both backends; `vulkan/transformer.rs` carries only the config surface |
 | `WeightData` / `Linear` / `take_linear` / resident upload | vulkan/weights.rs | shared weight layer; streaming/resident matmuls dispatch through the precision registry |
 
 ### `src/chat/precision.rs` + `src/chat/precision/` — weight-precision operator registry
