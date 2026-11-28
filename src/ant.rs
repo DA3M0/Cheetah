@@ -31,7 +31,6 @@ use cheetah::native::{self, AntFfiSettings};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 
 /// Name of the atomic-units manifest written by `cheetah init`
@@ -207,29 +206,6 @@ pub fn ant_swap_fit(
     }
 }
 
-/// Keep only the requested unit ids that exist in the units manifest, warning
-/// on (and dropping) unknown ids and duplicates. Used by the `--setup`
-/// wizard to validate user-typed pinned unit ids.
-pub fn ant_filter_known_units(requested: &[String], units: &[AntUnit]) -> Vec<String> {
-    let known: HashSet<&str> = units.iter().map(|unit| unit.unit_id.as_str()).collect();
-    let mut kept: Vec<String> = Vec::new();
-    for requested_id in requested {
-        let id = requested_id.trim();
-        if id.is_empty() {
-            continue;
-        }
-        if known.contains(id) {
-            if !kept.iter().any(|existing| existing == id) {
-                kept.push(id.to_string());
-            }
-        } else {
-            eprintln!(
-                "cheetah-ant: warning: unknown unit id '{id}' ignored (not in the units manifest)"
-            );
-        }
-    }
-    kept
-}
 
 /// Rust handle over the C Ant manager (`cheetah_memory.c`).
 ///
@@ -424,122 +400,6 @@ impl Ant {
         Ok(settings)
     }
 
-    /// Runs the interactive preset configuration for a model directory
-    /// (`--setup`) and persists it via `write_settings_for_model`.
-    ///
-    /// Each prompt shows the default and accepts an empty answer to keep
-    /// it; pinned unit ids are validated against the units manifest when
-    /// one exists (unknown ids warn and are dropped).
-    pub fn run_interactive_setup(&self, model_dir: &Path) -> Result<AntSettings, String> {
-        println!("Ant interactive setup for '{}':", model_dir.display());
-        let units = self.units_for_model(model_dir).ok();
-        if let Some(units) = &units {
-            let total: u64 = units.iter().map(AntUnit::byte_size).sum();
-            let layers = units
-                .iter()
-                .map(|unit| unit.layer_id)
-                .collect::<HashSet<_>>()
-                .len();
-            println!(
-                "  model units: {} across {} layer(s), total {}",
-                units.len(),
-                layers,
-                crate::format_size(total)
-            );
-            println!(
-                "  the VRAM pool fills units layer by layer; units that do not fit spill to RAM, then disk"
-            );
-        } else {
-            println!(
-                "  (units manifest not found in this directory; run `cheetah init` first for unit-level planning)"
-            );
-        }
-        let mut settings = AntSettings::default();
-        // The wizard always produces an enabled preset; disabling Ant is
-        // done via `--ant false`, not through the wizard.
-        settings.enabled = true;
-        settings.vram_pool_bytes = interactive_prompt_u64(
-            &format!(
-                "Ant interactive setup: VRAM pool size in bytes [default: {}]:",
-                settings.vram_pool_bytes
-            ),
-            settings.vram_pool_bytes,
-        )?;
-        settings.ram_budget_bytes = interactive_prompt_u64(
-            &format!(
-                "Ant interactive setup: RAM budget in bytes [default: {}]:",
-                settings.ram_budget_bytes
-            ),
-            settings.ram_budget_bytes,
-        )?;
-        let disk_dir = interactive_prompt_str(
-            "Ant interactive setup: disk residency directory (empty for default):",
-            "",
-        )?;
-        if !disk_dir.trim().is_empty() {
-            settings.disk_dir = Some(disk_dir.trim().to_string());
-        }
-        let eviction_policy = interactive_prompt_str(
-            &format!(
-                "Ant interactive setup: eviction policy (lru/clock/clock2; default: {}):",
-                settings.eviction_policy
-            ),
-            &settings.eviction_policy,
-        )?;
-        if !eviction_policy.trim().is_empty() {
-            settings.eviction_policy = eviction_policy.trim().to_string();
-        }
-        let prefetch_stages = interactive_prompt_usize(
-            &format!(
-                "Ant interactive setup: prefetch stages (default: {}):",
-                settings.prefetch_stages
-            ),
-            settings.prefetch_stages.max(0) as usize,
-        )?;
-        settings.prefetch_stages = prefetch_stages as i32;
-        settings.allow_vram_swap = interactive_prompt_bool(
-            &format!(
-                "Ant interactive setup: allow VRAM swap (true/false; default: {}):",
-                settings.allow_vram_swap
-            ),
-            settings.allow_vram_swap,
-        )?;
-        let pinned_input = interactive_prompt_str(
-            "Ant interactive setup: pinned resident units (comma-separated unit ids; empty for none):",
-            "",
-        )?;
-        let requested: Vec<String> = pinned_input
-            .split(',')
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty())
-            .collect();
-        settings.resident_units = match units.as_deref() {
-            Some(units) => ant_filter_known_units(&requested, units),
-            None => requested,
-        };
-        // Round-trip through a fresh manager so the preset printed below is
-        // exactly what the C side would receive.
-        let ant = Ant::with_settings(&settings)?;
-        ant.write_settings_for_model(model_dir, &settings)?;
-        println!(
-            "Ant preset written to '{}'; Ant will run with these settings:",
-            model_dir.join(CHEETAH_ANT_SETTINGS_FILENAME).display()
-        );
-        println!("  vram_pool_bytes:  {}", settings.vram_pool_bytes);
-        println!("  ram_budget_bytes: {}", settings.ram_budget_bytes);
-        println!(
-            "  disk_dir:         {}",
-            settings.disk_dir.as_deref().unwrap_or("<model directory>")
-        );
-        println!("  eviction_policy:  {}", settings.eviction_policy);
-        println!("  prefetch_stages:  {}", settings.prefetch_stages);
-        println!("  allow_vram_swap:  {}", settings.allow_vram_swap);
-        println!(
-            "  resident_units:   {} pinned",
-            settings.resident_units.len()
-        );
-        Ok(settings)
-    }
 
     /// Loads and parses `cheetah_units.json` from the model directory.
     ///
@@ -710,63 +570,6 @@ impl Ant {
     }
 }
 
-/// Prints a prompt, flushes stdout, and reads one trimmed stdin line for the `--setup` wizard.
-fn interactive_prompt(prompt: &str) -> Result<String, String> {
-    print!("{prompt}");
-    let mut stdout = std::io::stdout();
-    let _ = stdout.flush();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .map_err(|error| format!("Failed to read interactive setting: {error}"))?;
-    Ok(line.trim().to_string())
-}
-
-/// Prompt variant returning a u64; an empty answer takes the `default`, anything unparsable is a wizard error.
-fn interactive_prompt_u64(prompt: &str, default: u64) -> Result<u64, String> {
-    let answer = interactive_prompt(prompt)?;
-    if answer.is_empty() {
-        return Ok(default);
-    }
-    answer
-        .parse::<u64>()
-        .map_err(|_| format!("{prompt} expects a non-negative integer; received '{answer}'."))
-}
-
-/// Prompt variant returning a usize; an empty answer takes the `default`, anything unparsable is a wizard error.
-fn interactive_prompt_usize(prompt: &str, default: usize) -> Result<usize, String> {
-    let answer = interactive_prompt(prompt)?;
-    if answer.is_empty() {
-        return Ok(default);
-    }
-    answer
-        .parse::<usize>()
-        .map_err(|_| format!("{prompt} expects a non-negative integer; received '{answer}'."))
-}
-
-/// Prompt variant accepting true/1/yes/on vs false/0/no/off (case-insensitive); an empty answer takes the `default`.
-fn interactive_prompt_bool(prompt: &str, default: bool) -> Result<bool, String> {
-    let answer = interactive_prompt(prompt)?;
-    if answer.is_empty() {
-        return Ok(default);
-    }
-    match answer.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err(format!(
-            "{prompt} expects a boolean value (true/false); received '{answer}'."
-        )),
-    }
-}
-
-/// Prompt variant returning the raw trimmed string; an empty answer takes the `default`.
-fn interactive_prompt_str(prompt: &str, default: &str) -> Result<String, String> {
-    let answer = interactive_prompt(prompt)?;
-    if answer.is_empty() {
-        return Ok(default.to_string());
-    }
-    Ok(answer)
-}
 
 impl Drop for Ant {
     /// Releases the C manager handle exactly once — the FFI ownership contract between [`Ant`] and `cheetah_ant_delete`.
@@ -864,32 +667,6 @@ mod tests {
         assert_eq!(layer_2.vram_bytes, 600);
         assert_eq!(layer_2.ram_units, 1);
         assert_eq!(layer_2.ram_bytes, 600);
-    }
-
-    #[test]
-    fn ant_filter_known_units_drops_unknown_and_duplicates() {
-        let units = vec![
-            unit("model.embed_tokens.weight", 272),
-            layered_unit("model.layers.0.mlp.gate_proj", 600, 0),
-            layered_unit("model.layers.1.mlp.gate_proj", 600, 1),
-        ];
-        let kept = ant_filter_known_units(
-            &[
-                "model.layers.0.mlp.gate_proj".to_string(),
-                "model.layers.0.mlp.gate_proj".to_string(),
-                " model.embed_tokens.weight ".to_string(),
-                "model.missing.weight".to_string(),
-                "".to_string(),
-            ],
-            &units,
-        );
-        assert_eq!(
-            kept,
-            vec![
-                "model.layers.0.mlp.gate_proj".to_string(),
-                "model.embed_tokens.weight".to_string(),
-            ]
-        );
     }
 
     #[test]

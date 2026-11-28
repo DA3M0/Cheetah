@@ -215,8 +215,8 @@ enforces — the source doc comments carry the same story in place.
 | `main() -> ExitCode` | Entry point: delegates to `run`, prints the error, maps the [`RunError`] kind to the process exit code (2 usage / 1 runtime). |
 | `run(args) -> Result<(), RunError>` | Argument dispatch for every subcommand (chat/serve/init/inspect/context/formats/help); also handles the bare-invocation chat-from-cwd case. |
 | `run_init_command(args)` | `cheetah init <src> <dst>`: native model preparation (C `cheetah_init_model`), manifest metadata, then Ant settings resolution and page-in of the planned resident units. |
-| `resolve_ant_settings(model_dir, ant_options)` | Resolves effective Ant settings through the chain defaults → user preset file (`--setup` wizard) → CLI overrides; every execution consumes exactly this resolved value. |
-| `split_ant_args(args)` | Value-aware extraction of `--ant*`/`--setup` flags from a mixed argument list, so `serve` can parse the rest while Ant options travel to the engine. |
+| `resolve_ant_settings(model_dir)` | Resolves effective Ant settings from the model's preset file (written at init), falling back to the built-in defaults; every execution consumes exactly this resolved value. |
+
 | `run_inspect_command(args)` | `cheetah inspect`: loads model metadata (shards/manifest), renders text or JSON, optionally writes `-o <file>`. |
 | `write_report(path, report)` | Writes an inspect report to a file (overwrites), appending a trailing newline. |
 | `apply_ant_overrides(settings, ant_options)` | Applies parsed CLI Ant flags onto a settings struct (defaults → preset → CLI order). |
@@ -249,7 +249,7 @@ enforces — the source doc comments carry the same story in place.
 | `parse_nonnegative_option(args, i, option)` | Parses an option value that must be a non-negative integer (>= 0). |
 | `parse_u64_option(args, i, option)` | Parses the next argument as u64 (Ant budgets and seeds). |
 | `parse_text_option(args, i, option)` | Consumes the next argument as a raw text value (paths, unit ids, prompts). |
-| `is_boolean_literal(value)` | Whether a token is a bool literal — lets flags like `--ant` stay value-free while `--ant=true` still works. |
+
 | `parse_bool_option(args, i, option)` | Parses a boolean flag value from the accepted literal set (see [`is_boolean_literal`]); anything else is a usage error. |
 | `AntCliOptions::resolve()` | Collapses the parsed Ant flags into concrete settings (unspecified fields fall back to the built-in defaults). |
 | `parse_setup_flag(args, i, option)` | Parses the `--setup`/`--ant-setup` interactive flag without consuming the next token (the caller's loop still applies its trailing `index += 1`). |

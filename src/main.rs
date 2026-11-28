@@ -58,7 +58,6 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
             Path::new("."),
             ChatOptions::default(),
             cli::ContextCliOptions::default(),
-            cli::AntCliOptions::default(),
             cli::McpCliOptions::default(),
         );
     };
@@ -85,28 +84,22 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
         "load" | "inspect" => run_inspect_command(&args[1..]),
         "init" | "prepare" => run_init_command(&args[1..]),
         "chat" => {
-            let (path, options, context_options, ant_options, mcp_options) =
+            let (path, options, context_options, mcp_options) =
                 cli::parse_chat_args(&args[1..])?;
-            run_chat(&path, options, context_options, ant_options, mcp_options)
+            run_chat(&path, options, context_options, mcp_options)
         }
         "context" => {
             let (operation, options) = cli::parse_context_args(&args[1..])?;
             run_context_command(operation, options.directory)
         }
         "serve" => {
-            let (serve_args, ant_options) = split_ant_args(&args[1..])?;
-            let (serve_options, chat_options, mcp_options) = cli::parse_serve_args(&serve_args)?;
-            runtime(serve::serve(
-                serve_options,
-                chat_options,
-                &ant_options,
-                &mcp_options,
-            ))
+            let (serve_options, chat_options, mcp_options) = cli::parse_serve_args(&args[1..])?;
+            runtime(serve::serve(serve_options, chat_options, &mcp_options))
         }
         value if !value.starts_with('-') => {
-            let (path, options, context_options, ant_options, mcp_options) =
+            let (path, options, context_options, mcp_options) =
                 cli::parse_chat_args(&args)?;
-            run_chat(&path, options, context_options, ant_options, mcp_options)
+            run_chat(&path, options, context_options, mcp_options)
         }
         other => Err(RunError::usage(format!(
             "Unknown command '{other}'. Run `cheetah help` for usage."
@@ -127,21 +120,11 @@ fn run(args: Vec<String>) -> Result<(), RunError> {
 ///    immediately `page_in`-ing it into the target tier.
 fn run_init_command(args: &[String]) -> Result<(), RunError> {
     // init takes exactly two positional arguments (source and destination
-    // directories) plus a batch of Ant flags; group them coarsely here by
-    // "starts with '-' = flag" and leave the detailed flag parsing to
-    // parse_ant_args.
-    let mut positional: Vec<String> = Vec::new();
-    let mut flag_args: Vec<String> = Vec::new();
-    for arg in args {
-        if arg.starts_with('-') {
-            flag_args.push(arg.clone());
-        } else {
-            positional.push(arg.clone());
-        }
-    }
-    if positional.len() != 2 || positional.iter().any(String::is_empty) {
+    // directories); Ant is configured automatically (see below).
+    let positional: Vec<&String> = args.iter().filter(|a| !a.is_empty()).collect();
+    if positional.len() != 2 || args.iter().any(|a| a.starts_with('-')) {
         return Err(RunError::usage(
-            "Usage: cheetah init <source-dir> <destination-dir> [--ant <bool>] [--ant-vram <bytes>] ...",
+            "Usage: cheetah init <source-dir> <destination-dir>",
         ));
     }
     let source = PathBuf::from(&positional[0]);
@@ -156,10 +139,10 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
     ))?;
 
     // Ant: after native preparation, route each atomic unit through the
-    // built-in residency planner (VRAM -> RAM -> disk), honoring the
-    // interactive preset (`--setup`) or CLI overrides when given.
-    let ant_options = cli::parse_ant_args(&flag_args)?;
-    let settings = resolve_ant_settings(&destination, &ant_options)?;
+    // built-in residency planner (VRAM -> RAM -> disk) with the automatic
+    // settings — the preset file when one exists, otherwise the built-in
+    // defaults — and persist it so chat/serve load the same plan.
+    let settings = resolve_ant_settings(&destination)?;
     let ant = runtime(ant::Ant::with_settings(&settings))?;
     runtime(ant.write_settings_for_model(&destination, &settings))?;
     let units = runtime(ant.units_for_model(&destination))?;
@@ -213,73 +196,17 @@ fn run_init_command(args: &[String]) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Ant: resolve the effective settings for a model directory — defaults, then
-/// the user-managed preset file (when enabled), then command-line overrides.
-/// `--setup` / `--ant-setup` runs the interactive preset wizard first and
-/// persists its preset, and every Ant entry point (init, chat, serve) then
-/// executes with exactly these settings.
-fn resolve_ant_settings(
-    model_dir: &Path,
-    ant_options: &cli::AntCliOptions,
-) -> Result<ant::AntSettings, RunError> {
+/// Ant: resolve the effective settings for a model directory — the preset
+/// file written at init (or a hand-tuned one) when present and enabled,
+/// otherwise the built-in defaults. Ant configures itself; there are no
+/// command-line knobs.
+pub(crate) fn resolve_ant_settings(model_dir: &Path) -> Result<ant::AntSettings, RunError> {
     let probe_ant = runtime(ant::Ant::with_settings(&ant::AntSettings::default()))?;
-    if ant_options.interactive == Some(true) {
-        runtime(probe_ant.run_interactive_setup(model_dir))?;
-    }
-    let mut settings = match probe_ant.settings_for_model(model_dir) {
+    let settings = match probe_ant.settings_for_model(model_dir) {
         Ok(preset) if preset.enabled => preset,
-        _ => ant_options.resolve(),
+        _ => ant::AntSettings::default(),
     };
-    apply_ant_overrides(&mut settings, ant_options);
     Ok(settings)
-}
-
-/// Split `--ant*` / `--setup` flags out of a raw argument list so the target
-/// subcommand parser only sees its own options; returns the remainder plus the
-/// parsed Ant options.
-fn split_ant_args(args: &[String]) -> Result<(Vec<String>, cli::AntCliOptions), RunError> {
-    const VALUE_FLAGS: [&str; 7] = [
-        "--ant-vram",
-        "--ant-ram",
-        "--ant-disk-dir",
-        "--ant-resident",
-        "--ant-eviction-policy",
-        "--ant-prefetch-stages",
-        "--ant-allow-vram-swap",
-    ];
-    let mut rest = Vec::new();
-    let mut ant_args = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if VALUE_FLAGS.contains(&arg) || arg == "--ant" || arg == "--ant-setup" || arg == "--setup"
-        {
-            ant_args.push(arg.to_string());
-            // Flags with values always consume the next argument; the bare
-            // flags only consume an explicit boolean literal.
-            if VALUE_FLAGS.contains(&arg) {
-                if let Some(value) = args.get(index + 1) {
-                    ant_args.push(value.clone());
-                    index += 1;
-                }
-            } else if args
-                .get(index + 1)
-                .is_some_and(|value| cli::is_boolean_literal(value.as_str()))
-            {
-                ant_args.push(args[index + 1].clone());
-                index += 1;
-            }
-        } else {
-            rest.push(arg.to_string());
-        }
-        index += 1;
-    }
-    let ant_options = if ant_args.is_empty() {
-        cli::AntCliOptions::default()
-    } else {
-        cli::parse_ant_args(&ant_args)?
-    };
-    Ok((rest, ant_options))
 }
 
 /// `cheetah inspect` / `cheetah load`: inspect a Safetensors file or model
@@ -313,35 +240,6 @@ fn write_report(path: &Path, report: &str) -> Result<(), RunError> {
     })
 }
 
-/// Applies explicit CLI Ant overrides on top of resolved settings; only the
-/// fields the user actually passed are touched (first-wins layering:
-/// defaults → preset → CLI).
-fn apply_ant_overrides(settings: &mut ant::AntSettings, ant_options: &cli::AntCliOptions) {
-    if let Some(enabled) = ant_options.enabled {
-        settings.enabled = enabled;
-    }
-    if let Some(vram) = ant_options.vram_pool_bytes {
-        settings.vram_pool_bytes = vram;
-    }
-    if let Some(ram) = ant_options.ram_budget_bytes {
-        settings.ram_budget_bytes = ram;
-    }
-    if let Some(disk_dir) = ant_options.disk_dir.clone() {
-        settings.disk_dir = Some(disk_dir);
-    }
-    if !ant_options.resident_units.is_empty() {
-        settings.resident_units = ant_options.resident_units.clone();
-    }
-    if let Some(policy) = ant_options.eviction_policy.clone() {
-        settings.eviction_policy = policy;
-    }
-    if let Some(prefetch) = ant_options.prefetch_stages {
-        settings.prefetch_stages = prefetch as i32;
-    }
-    if let Some(swap) = ant_options.allow_vram_swap {
-        settings.allow_vram_swap = swap;
-    }
-}
 
 /// Entry point for the chat subcommand (and the legacy bare-model form):
 /// resolves Ant settings, restores/creates the conversation archive, and
@@ -350,7 +248,6 @@ fn run_chat(
     path: &Path,
     requested_options: ChatOptions,
     context_options: cli::ContextCliOptions,
-    ant_options: cli::AntCliOptions,
     mcp_options: cli::McpCliOptions,
 ) -> Result<(), RunError> {
     // MCP: connect the configured servers up front so a broken server fails
@@ -359,9 +256,9 @@ fn run_chat(
         &mcp_options.servers,
         mcp_options.config.as_deref(),
     ))?;
-    // Ant: resolve effective memory settings from user-managed defaults,
-    // then CLI overrides.
-    let settings = resolve_ant_settings(path, &ant_options)?;
+    // Ant: resolve effective memory settings from the model's preset file
+    // (written at init) or the built-in defaults.
+    let settings = resolve_ant_settings(path)?;
 
     // Ant: warn when the target model has not been prepared for Ant memory
     // management (chat still works, just without tiered residency).
@@ -483,17 +380,7 @@ fn print_help() {
     --mcp-config <path>  JSON file: {servers: [{name, command, args: [...]}]} (once)\n\
     \n\
     Ant memory options (cheetah init <source-dir> <destination-dir> | cheetah chat <model-path> | cheetah serve <name-or-path>):\n\
-    --setup [bool]        Interactive Ant preset wizard (bare flag or true/false; alias of --ant-setup);\n\
                           after setup, init/chat/serve execute with the configured settings\n\
-    --ant-setup [bool]    Same as --setup\n\
-    --ant <bool>          Enable/disable Ant memory optimization (default: true; bare --ant enables the preset)\n\
-    --ant-vram <bytes>    VRAM pool size override in bytes (default: 8GiB)\n\
-    --ant-ram <bytes>     RAM budget override in bytes (default: 16GiB)\n\
-    --ant-disk-dir <path> Disk residency directory override\n\
-    --ant-resident <id>   Repeatable unit id to keep resident\n\
-    --ant-eviction-policy <policy> Eviction policy override\n\
-    --ant-prefetch-stages <n> Prefetch stages override\n\
-    --ant-allow-vram-swap <bool> Allow VRAM swap override\n\
     User-managed defaults live in <model-dir>/cheetah_ant_settings.json.\n\
     \n\
     Server options (cheetah serve):\n\

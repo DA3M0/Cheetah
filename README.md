@@ -318,11 +318,11 @@ Ant is **enabled by default** (`AntSettings::default()`: 8 GiB/16 GiB budgets, f
 
 The startup RSS timeline has four phases (sampled at 0.2 s on qwen-0.5b): process spawn ~24 MB → **load window ~50–62 MB** (weights mmap'd but untouched — the disk-tier "cold" shape; transient, before the first request is accepted) → warmup forward faults everything in → **idle baseline** (1017 MB full-resident / 123 MB tiered), which stays flat when idle (200 s sampled, no pressure — clean pages are kernel-reclaimable and re-fault from page cache, so a memory-pressured host can decay it). Inference then climbs slowly from that baseline. Note the warmup raises the full-resident idle baseline from the ~50–62 MB load shape to the resident size — that is the TTFT-vs-idle-RAM trade; tiered plans keep their small idle either way (warmup's transient peaks are released per layer).
 
-Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `--ant-disk-dir <path>`, `--ant-resident <unit>`, `--ant-eviction-policy <policy>`, `--ant-prefetch-stages <n>`, `--ant-allow-vram-swap <bool>`. Default budgets: VRAM pool 8 GiB, RAM budget 16 GiB.
+Ant configures itself: `cheetah init` resolves the automatic plan (default budgets: VRAM pool 8 GiB, RAM budget 16 GiB) and writes the preset file — there are no Ant command-line flags. A hand-tuned `cheetah_ant_settings.json` in the model directory is honored as data.
 
 ### Interactive Ant preset
 
-`cheetah init <source-dir> <destination-dir> --setup`, `cheetah chat <model-path> --setup`, and `cheetah serve <name-or-path> --setup` run an interactive preset configuration: it shows the model's unit context (count, size, layers), prompts for the VRAM pool, RAM budget, disk directory, eviction policy, prefetch stages, VRAM swap, and pinned resident units (validated against the manifest), and persists the preset to the model directory. `--setup` accepts a bare flag or an explicit boolean; `--ant-setup` is an alias. All three entry points then execute Ant with exactly those settings (CLI overrides still win).
+The interactive preset wizard was removed in v1.3.3: `cheetah init` auto-configures Ant (writes `cheetah_ant_settings.json` with the automatic full-resident-when-it-fits plan), and chat/serve load that preset. To customize, edit the preset file directly — it is plain JSON and stays the single source of truth.
 
 ### Backend landscape
 
@@ -331,7 +331,7 @@ Ant CLI overrides: `--ant <bool>`, `--ant-vram <bytes>`, `--ant-ram <bytes>`, `-
 | `CHEETAH_DEVICE=cpu` (default) | native mmap backend (Qwen2, Llama, Qwen3, Mixtral MoE, Mistral, Gemma, Phi) | Ant-tiered, SIMD kernels; requires a prepared model directory (`cheetah init`); architectures without a native backend report guidance |
 | `CHEETAH_DEVICE=vulkan` | independent Vulkan executor (`--features vulkan`) | Candle-free; Ant bucketed residency (VRAM/streams); Q8 quantization; verified on Lavapipe, Intel Haswell iGPU, NVIDIA GT 730M |
 
-The startup banner prints the backend capability list per architecture (`backends: native, vulkan`) and the resolved device (`device: native-cpu` / `device: Vulkan`). If the device does not match your expectation, check that `CHEETAH_DEVICE` is exported — an unexported variable silently falls back to the default. The OpenAI-compatible server accepts the same device/`--ant*` settings as chat; generation requests may additionally pass a `resident_units` override list.
+The startup banner prints the backend capability list per architecture (`backends: native, vulkan`) and the resolved device (`device: native-cpu` / `device: Vulkan`). If the device does not match your expectation, check that `CHEETAH_DEVICE` is exported — an unexported variable silently falls back to the default. The OpenAI-compatible server resolves Ant from the model's preset file like chat; generation requests may additionally pass a `resident_units` override list.
 
 ### Developer documentation & contributing
 

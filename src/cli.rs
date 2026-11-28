@@ -12,7 +12,6 @@
 //! `parse_float_option`, ...) are `pub` because `main.rs` reuses the Ant
 //! flags via `split_ant_args`.
 
-use crate::ant::AntSettings;
 use crate::options::ChatOptions;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -124,19 +123,12 @@ impl std::fmt::Display for RunError {
 pub fn parse_chat_args(
     args: &[String],
 ) -> Result<
-    (
-        PathBuf,
-        ChatOptions,
-        ContextCliOptions,
-        AntCliOptions,
-        McpCliOptions,
-    ),
+    (PathBuf, ChatOptions, ContextCliOptions, McpCliOptions),
     RunError,
 > {
     let mut path = None;
     let mut options = ChatOptions::default();
     let mut context = ContextCliOptions::default();
-    let mut ant = AntCliOptions::default();
     let mut mcp = McpCliOptions::default();
     let mut index = 0;
     // Track explicit inference flags separately so restored archives can
@@ -217,53 +209,6 @@ pub fn parse_chat_args(
                 index += 1;
                 mcp.add_config(parse_text_option(args, index, "--mcp-config")?.as_str())?;
             }
-            "--ant" => {
-                if args
-                    .get(index + 1)
-                    .is_some_and(|value| is_boolean_literal(value.as_str()))
-                {
-                    ant.enabled = Some(parse_bool_option(args, index + 1, "--ant")?);
-                    index += 1;
-                } else {
-                    ant.enabled = Some(true);
-                }
-            }
-            "--ant-setup" | "--setup" => {
-                let option = args[index].as_str();
-                ant.interactive = Some(parse_setup_flag(args, &mut index, option)?);
-            }
-            "--ant-vram" => {
-                index += 1;
-                ant.vram_pool_bytes = Some(parse_u64_option(args, index, "--ant-vram")?);
-            }
-            "--ant-ram" => {
-                index += 1;
-                ant.ram_budget_bytes = Some(parse_u64_option(args, index, "--ant-ram")?);
-            }
-            "--ant-disk-dir" => {
-                index += 1;
-                ant.disk_dir = Some(parse_text_option(args, index, "--ant-disk-dir")?);
-            }
-            "--ant-resident" => {
-                index += 1;
-                ant.resident_units
-                    .push(parse_text_option(args, index, "--ant-resident")?);
-            }
-            "--ant-eviction-policy" => {
-                index += 1;
-                ant.eviction_policy =
-                    Some(parse_text_option(args, index, "--ant-eviction-policy")?);
-            }
-            "--ant-prefetch-stages" => {
-                index += 1;
-                ant.prefetch_stages =
-                    Some(parse_nonnegative_option(args, index, "--ant-prefetch-stages")? as i64);
-            }
-            "--ant-allow-vram-swap" => {
-                index += 1;
-                ant.allow_vram_swap =
-                    Some(parse_bool_option(args, index, "--ant-allow-vram-swap")?);
-            }
             option if option.starts_with('-') => {
                 return Err(RunError::usage(format!(
                     "Unknown option '{option}'. Run `cheetah help` for usage."
@@ -283,7 +228,7 @@ pub fn parse_chat_args(
             "Specify a Safetensors model directory or file. Usage: cheetah <model-path> [options]. Run `cheetah help` for all options.",
         )
     })?;
-    Ok((path, options, context, ant, mcp))
+    Ok((path, options, context, mcp))
 }
 
 /// Parses `cheetah context list | delete <name> [--context-dir <path>]`.
@@ -637,27 +582,6 @@ fn parse_text_option(args: &[String], index: usize, option: &str) -> Result<Stri
     })
 }
 
-/// Recognizes boolean flag values: true/false/1/0/yes/no/on/off
-/// (case-insensitive). Used to decide whether a bare flag like `--ant`
-/// consumed the next token as its value.
-pub fn is_boolean_literal(value: &str) -> bool {
-    ["true", "false", "1", "0", "yes", "no", "on", "off"]
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(value))
-}
-
-/// Parses the next argument as a boolean (same literals as
-/// [`is_boolean_literal`]); anything else is a usage error.
-fn parse_bool_option(args: &[String], index: usize, option: &str) -> Result<bool, RunError> {
-    let value = parse_text_option(args, index, option)?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err(RunError::usage(format!(
-            "{option} expects a boolean value (true/false); received '{value}'."
-        ))),
-    }
-}
 
 /// MCP (`--mcp-server` / `--mcp-config`) options shared by chat and serve.
 /// Raw strings live here; the MCP registry resolves them into live server
@@ -683,148 +607,6 @@ impl McpCliOptions {
         }
         Ok(())
     }
-}
-
-/// Command-line overrides for Ant memory optimization; `None` means the
-/// flag was not given, deferring to the user preset / built-in defaults.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AntCliOptions {
-    /// `--ant [bool]`: enable/disable Ant entirely (bare flag = enable).
-    pub enabled: Option<bool>,
-    /// `--ant-vram <bytes>`: VRAM pool size override.
-    pub vram_pool_bytes: Option<u64>,
-    /// `--ant-ram <bytes>`: RAM budget override.
-    pub ram_budget_bytes: Option<u64>,
-    /// `--ant-disk-dir <path>`: disk-residency directory override.
-    pub disk_dir: Option<String>,
-    /// `--ant-resident <id>` (repeatable): unit ids to keep resident.
-    pub resident_units: Vec<String>,
-    /// `--ant-eviction-policy <policy>`: eviction policy override.
-    pub eviction_policy: Option<String>,
-    /// `--ant-prefetch-stages <n>`: prefetch look-ahead override.
-    pub prefetch_stages: Option<i64>,
-    /// `--ant-allow-vram-swap <bool>`: VRAM swap permission override.
-    pub allow_vram_swap: Option<bool>,
-    /// `--setup` / `--ant-setup`: run the interactive preset wizard;
-    /// `None` means the flag was not given.
-    pub interactive: Option<bool>,
-}
-
-impl AntCliOptions {
-    /// Merges this set of overrides into a complete [`AntSettings`]
-    /// (unspecified fields fall back to the built-in defaults).
-    pub fn resolve(&self) -> AntSettings {
-        let mut settings = AntSettings::default();
-        if let Some(enabled) = self.enabled {
-            settings.enabled = enabled;
-        }
-        if let Some(vram) = self.vram_pool_bytes {
-            settings.vram_pool_bytes = vram;
-        }
-        if let Some(ram) = self.ram_budget_bytes {
-            settings.ram_budget_bytes = ram;
-        }
-        if let Some(disk_dir) = self.disk_dir.clone() {
-            settings.disk_dir = Some(disk_dir);
-        }
-        if !self.resident_units.is_empty() {
-            settings.resident_units = self.resident_units.clone();
-        }
-        if let Some(policy) = self.eviction_policy.clone() {
-            settings.eviction_policy = policy;
-        }
-        if let Some(prefetch) = self.prefetch_stages {
-            settings.prefetch_stages = prefetch as i32;
-        }
-        if let Some(swap) = self.allow_vram_swap {
-            settings.allow_vram_swap = swap;
-        }
-        settings
-    }
-}
-
-/// Parse an interactive-setup flag that accepts either a bare flag or an
-/// explicit boolean value (`--setup`, `--setup true`). `index` points at the
-/// flag itself and is advanced past the flag and any consumed value; the
-/// caller's loop still applies its trailing `index += 1`.
-fn parse_setup_flag(args: &[String], index: &mut usize, option: &str) -> Result<bool, RunError> {
-    if args
-        .get(*index + 1)
-        .is_some_and(|value| is_boolean_literal(value.as_str()))
-    {
-        let value = parse_bool_option(args, *index + 1, option)?;
-        *index += 1;
-        Ok(value)
-    } else {
-        Ok(true)
-    }
-}
-
-/// Parses Ant memory-optimization flags: `--ant <bool>` plus the
-/// budget / residency / eviction override family. Any unknown flag here is
-/// a usage error, which is what makes [`crate::main::split_ant_args`]-style
-/// pre-extraction safe.
-pub fn parse_ant_args(args: &[String]) -> Result<AntCliOptions, RunError> {
-    let mut options = AntCliOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        let option = args[index].as_str();
-        match option {
-            "--ant" => {
-                if args
-                    .get(index + 1)
-                    .is_some_and(|value| is_boolean_literal(value.as_str()))
-                {
-                    options.enabled = Some(parse_bool_option(args, index + 1, option)?);
-                    index += 1;
-                } else {
-                    options.enabled = Some(true);
-                }
-            }
-            "--ant-setup" | "--setup" => {
-                let option = args[index].as_str();
-                options.interactive = Some(parse_setup_flag(args, &mut index, option)?);
-            }
-            "--ant-vram" => {
-                index += 1;
-                options.vram_pool_bytes = Some(parse_u64_option(args, index, option)?);
-            }
-            "--ant-ram" => {
-                index += 1;
-                options.ram_budget_bytes = Some(parse_u64_option(args, index, option)?);
-            }
-            "--ant-disk-dir" => {
-                index += 1;
-                options.disk_dir = Some(parse_text_option(args, index, option)?);
-            }
-            "--ant-resident" => {
-                index += 1;
-                options
-                    .resident_units
-                    .push(parse_text_option(args, index, option)?);
-            }
-            "--ant-eviction-policy" => {
-                index += 1;
-                options.eviction_policy = Some(parse_text_option(args, index, option)?);
-            }
-            "--ant-prefetch-stages" => {
-                index += 1;
-                options.prefetch_stages =
-                    Some(parse_nonnegative_option(args, index, option)? as i64);
-            }
-            "--ant-allow-vram-swap" => {
-                index += 1;
-                options.allow_vram_swap = Some(parse_bool_option(args, index, option)?);
-            }
-            _ => {
-                return Err(RunError::usage(format!(
-                    "Unknown Ant option '{option}'. Run `cheetah help` for usage."
-                )));
-            }
-        }
-        index += 1;
-    }
-    Ok(options)
 }
 
 /// Parses a float with a lower bound `min` (NaN rejected).
@@ -896,7 +678,7 @@ mod tests {
             "--ctx-size",
             "16384",
         ]);
-        let (path, options, context, _ant, _mcp) = parse_chat_args(&values).unwrap();
+        let (path, options, context, _mcp) = parse_chat_args(&values).unwrap();
         assert_eq!(path, PathBuf::from("model.safetensors"));
         assert!(context.chat_options_specified);
         assert_eq!(
@@ -927,7 +709,7 @@ mod tests {
             "--system",
             "You are a concise assistant.",
         ]);
-        let (_, options, _, _, _mcp) = parse_chat_args(&values).unwrap();
+        let (_, options, _, _mcp) = parse_chat_args(&values).unwrap();
         assert_eq!(options.temperature, 0.0);
         assert_eq!(options.top_p, 1.0);
         assert_eq!(options.top_k, 40);
@@ -1004,109 +786,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_ant_flags_into_chat_options() {
-        let ant = parse_ant_args(&args(&[
-            "--ant",
-            "true",
-            "--ant-vram",
-            "1024",
-            "--ant-ram",
-            "2048",
-        ]))
-        .unwrap();
-        assert_eq!(ant.enabled, Some(true));
-        assert_eq!(ant.vram_pool_bytes, Some(1024));
-        assert_eq!(ant.ram_budget_bytes, Some(2048));
-        assert!(ant.disk_dir.is_none());
-        assert!(ant.resident_units.is_empty());
-
-        let ant = parse_ant_args(&args(&[])).unwrap();
-        assert_eq!(ant.enabled, None);
-        assert_eq!(ant.vram_pool_bytes, None);
-        assert_eq!(ant.ram_budget_bytes, None);
-        assert_eq!(ant.disk_dir, None);
-        assert!(ant.resident_units.is_empty());
-    }
-
-    #[test]
-    fn parses_chat_ant_flags() {
-        let values = args(&[
-            "model.safetensors",
-            "--ant",
-            "false",
-            "--ant-vram",
-            "512",
-            "--ant-resident",
-            "model.embed_tokens.weight",
-        ]);
-        let (path, _options, _context, ant, _mcp) = parse_chat_args(&values).unwrap();
-        assert_eq!(path, PathBuf::from("model.safetensors"));
-        assert_eq!(ant.enabled, Some(false));
-        assert_eq!(ant.vram_pool_bytes, Some(512));
-        assert_eq!(
-            ant.resident_units,
-            vec!["model.embed_tokens.weight".to_string()]
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_ant_flag() {
-        let error = parse_ant_args(&args(&["--ant-vram", "1024", "--bogus"])).unwrap_err();
-        assert!(matches!(error, RunError::Usage(_)));
-    }
-
-    #[test]
-    fn bare_ant_flag_enables_preset_ant() {
-        let ant = parse_ant_args(&args(&["--ant"])).unwrap();
-        assert_eq!(ant.enabled, Some(true));
-        assert_eq!(ant.interactive, None);
-
-        let values = args(&["model.safetensors", "--ant"]);
-        let (path, _options, _context, ant, _mcp) = parse_chat_args(&values).unwrap();
-        assert_eq!(path, PathBuf::from("model.safetensors"));
-        assert_eq!(ant.enabled, Some(true));
-    }
-
-    #[test]
-    fn ant_flag_with_boolean_value_overrides_preset() {
-        let ant = parse_ant_args(&args(&["--ant", "false"])).unwrap();
-        assert_eq!(ant.enabled, Some(false));
-    }
-
-    #[test]
-    fn parses_ant_setup_interactive_flag() {
-        let ant = parse_ant_args(&args(&["--ant-setup", "true"])).unwrap();
-        assert_eq!(ant.interactive, Some(true));
-
-        let ant = parse_ant_args(&args(&["--ant-setup", "false"])).unwrap();
-        assert_eq!(ant.interactive, Some(false));
-    }
-
-    #[test]
-    fn parses_setup_alias_and_bare_interactive_flags() {
-        // `--setup` is the alias of `--ant-setup`; both accept a bare flag.
-        let ant = parse_ant_args(&args(&["--setup"])).unwrap();
-        assert_eq!(ant.interactive, Some(true));
-
-        let ant = parse_ant_args(&args(&["--setup", "false"])).unwrap();
-        assert_eq!(ant.interactive, Some(false));
-
-        let ant = parse_ant_args(&args(&["--ant-setup"])).unwrap();
-        assert_eq!(ant.interactive, Some(true));
-
-        // A bare setup flag does not swallow a following model path.
-        let (path, _, _, ant, _mcp) = parse_chat_args(&args(&[
-            "model.safetensors",
-            "--setup",
-            "--max-tokens",
-            "8",
-        ]))
-        .unwrap();
-        assert_eq!(path, PathBuf::from("model.safetensors"));
-        assert_eq!(ant.interactive, Some(true));
-    }
-
-    #[test]
     fn reports_usage_errors_with_usage_variant() {
         let error = parse_chat_args(&args(&["--bogus"])).unwrap_err();
         assert!(matches!(error, RunError::Usage(_)));
@@ -1114,7 +793,7 @@ mod tests {
 
     #[test]
     fn parses_context_options_and_management_commands() {
-        let (_, _, context, _, _mcp) = parse_chat_args(&args(&[
+        let (_, _, context, _mcp) = parse_chat_args(&args(&[
             "model.safetensors",
             "--context",
             "work",
@@ -1128,7 +807,7 @@ mod tests {
             Some(PathBuf::from("/tmp/cheetah-contexts"))
         );
         assert!(!context.chat_options_specified);
-        let (_, _, context, _, _mcp) =
+        let (_, _, context, _mcp) =
             parse_chat_args(&args(&["model.safetensors", "--max-tokens", "256"])).unwrap();
         assert!(context.chat_options_specified);
 
@@ -1152,7 +831,7 @@ mod tests {
 
     #[test]
     fn parses_mcp_flags_for_chat() {
-        let (path, _, _, _, mcp) = parse_chat_args(&args(&[
+        let (path, _, _, mcp) = parse_chat_args(&args(&[
             "model.safetensors",
             "--mcp-server",
             "fs=npx -y @mcp/fs /tmp",

@@ -5,7 +5,7 @@ mod mcp;
 mod openai;
 mod queue;
 
-use crate::cli::{AntCliOptions, ServeOptions};
+use crate::cli::ServeOptions;
 use crate::color::{self, Color};
 use crate::options::ChatOptions;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,6 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub fn serve(
     options: ServeOptions,
     chat_options: ChatOptions,
-    ant_options: &AntCliOptions,
     mcp_options: &crate::cli::McpCliOptions,
 ) -> Result<(), String> {
     // Logging: per-request timing lines land on stderr at info level; RUST_LOG
@@ -49,11 +48,11 @@ pub fn serve(
     }
 
     let (model_path, model_id) = resolve_model(&options)?;
-    // Ant: resolve the effective settings against the resolved model directory
-    // so the user-managed preset (`--setup`) is honored, with CLI overrides on
-    // top; `--setup` / `--ant-setup` runs the interactive wizard first.
+    // Ant: resolve the effective settings against the resolved model
+    // directory — the preset file written at init (or a hand-tuned one) wins,
+    // otherwise the built-in defaults.
     let ant_settings =
-        crate::resolve_ant_settings(&model_path, ant_options).map_err(|error| error.to_string())?;
+        crate::resolve_ant_settings(&model_path).map_err(|error| error.to_string())?;
     eprintln!(
         "{}",
         color::stderr(

@@ -137,7 +137,7 @@ shape heuristics (heuristic `head_dim`: `hidden >= 2048 → 128`, else 64).
 
 ### 3.3 `cheetah_ant_settings.json` (user-managed)
 
-Written by the interactive wizard (`--setup`) or by init defaults. Schema:
+Written automatically by `cheetah init` (the auto plan) or hand-tuned in place. Schema:
 
 ```json
 {
@@ -158,8 +158,8 @@ Written by the interactive wizard (`--setup`) or by init defaults. Schema:
 - `eviction_policy` (`lru|clock|clock2`) is metadata today.
 
 Resolution order (see `resolve_ant_settings` in `src/main.rs`):
-**defaults → preset file (when `enabled`) → CLI overrides**. `--setup` /
-`--ant-setup` runs the interactive wizard first and persists its preset; all
+**preset file (when `enabled`) → built-in defaults**. `cheetah init` writes
+the preset automatically; all
 three entry points (init / chat / serve) then execute with exactly those
 settings.
 
@@ -562,7 +562,7 @@ behind a `Mutex`):
 Every generation: `apply_ant_request_overrides` → `prefetch_ant_units` →
 `promote_ant_units` → `enforce_ant_budget`. Each swap routes through
 `ant_swap_in_unit`, which **re-checks the budget before executing** (and again
-after each eviction), evicts residents only when `--ant-allow-vram-swap`
+after each eviction), evicts residents only when the preset's `allow_vram_swap`
 permits it, and updates the engine accounting plus the real pages via
 `AntTierControl` (`page_in_unit` / `evict_unit`).
 

@@ -24,7 +24,7 @@ cheetah/
 ├── matmul*.comp, shared_ops.comp   shared Vulkan compute shaders
 ├── src/
 │   ├── main.rs                 CLI dispatch (init/chat/serve/inspect/context) + Ant settings resolution
-│   ├── cli.rs                  argument parsing for every subcommand (+ Ant options, --setup)
+│   ├── cli.rs                  argument parsing for every subcommand
 │   ├── ant.rs                  AntSettings/AntUnit/Ant manager, residency planner, FFI wrappers
 │   ├── chat/
 │   │   ├── mod.rs              chat entry (chat()), model_metadata_for_init, generated REGISTRY include
@@ -70,12 +70,12 @@ cheetah/
 
 ## 2. Data flows
 
-### 2.1 `cheetah chat <model> [--ant]` (CPU, Qwen2 family)
+### 2.1 `cheetah chat <model>` (CPU, Qwen2 family)
 
 ```
 main.rs::run (dispatch)                      src/main.rs
   → run_chat                                 src/main.rs:287
-      → resolve_ant_settings                 src/main.rs (defaults → preset → CLI; --setup wizard)
+      → resolve_ant_settings                 src/main.rs (preset file → defaults; no CLI flags)
       → chat::chat                           src/chat/mod.rs
           → load_engine_with_progress        src/chat/engine.rs:60
               → Engine::load                 src/chat/engine.rs (§ load pipeline)
@@ -150,7 +150,7 @@ run_init_command      src/main.rs:90
   → native::init_model_with_metadata   src/native.rs (C cheetah_init_model + manifest metadata)
       C side: parse safetensors → aligned shards → write_manifest (parameter snapshot)
               → write_units (atomic units) → copy config/tokenizer
-  → cli::parse_ant_args (+ --setup wizard)
+  → automatic Ant settings (preset file → defaults)
   → resolve_ant_settings → Ant::plan_residency → page_in per unit
   → prints "ant plan: N unit(s) → X vram, Y ram, Z disk"
 ```
@@ -209,7 +209,7 @@ run_init_command      src/main.rs:90
 | `Ant::layer_residency_summary` | per-layer partial-layer tracking (banner) |
 | `ant_swap_fit` | pure swap decision (used by the engine's budget-checked swap) |
 | `ant_filter_known_units` | wizard unit-id validation |
-| `run_interactive_setup` | the `--setup` wizard |
+
 
 ### `src/mcp.rs` + `src/mcp/client.rs` — MCP client
 
@@ -262,7 +262,7 @@ run_init_command      src/main.rs:90
 
 | Item | File | Role |
 |------|------|------|
-| `AntCliOptions` / `parse_ant_args` / `parse_chat_args` | cli.rs | all `--ant*`/`--setup` parsing |
+| `parse_chat_args` / `parse_serve_args` | cli.rs | subcommand option parsing (Ant has no flags — preset file only) |
 | `split_ant_args` | main.rs | value-aware ant-flag extraction for serve |
 | `serve::serve` / `resolve_model` | serve/mod.rs | server lifecycle, model resolution by name/dir |
 | `http.rs` / `openai.rs` / `queue.rs` | serve/ | routing, request schemas, concurrency tickets |
