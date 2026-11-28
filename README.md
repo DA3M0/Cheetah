@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | 🧠 **Ant tiered memory** | per-tensor VRAM/RAM/Disk residency acting on real pages — idle RSS scales with the plan on a 0.5B model: ~123 MB (16 MB/32 MB, nearly all disk) → ~0.6 GB (RAM-tier 512 MB) → ~1.0 GB full-resident — and climbs slowly to the inference peak from that baseline (vs 2.5 GB untiered) |
-| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 8 tok/s on Qwen2-0.5B; chunked prefill runs batched GEMMs (`CHEETAH_PREFILL_CHUNK`), an int8 KV cache by default (`CHEETAH_KV_Q8=0` restores bit-exact f32) cuts cache and prefix-snapshot memory ~4× and speeds attention up (measured: -16% prefill, +13% decode), an LRU KV-prefix cache skips re-prefilling shared history across turns, and serve warms the model up before binding |
+| 🚀 **native CPU backend** | mmap-backed BF16 weights, AVX2 SIMD kernels — up to 10 tok/s on Qwen2-0.5B; chunked prefill runs batched GEMMs (`CHEETAH_PREFILL_CHUNK`), an int8 KV cache by default (`CHEETAH_KV_Q8=0` restores bit-exact f32) cuts cache and prefix-snapshot memory ~4× and speeds attention up (measured: -16% prefill, +13% decode), an LRU KV-prefix cache skips re-prefilling shared history across turns, and serve warms the model up before binding |
 | 🧩 **declarative model registry** | one registration file per family — architecture, chat template, stop markers, both backends, family constants; build.rs generates the registry, lookups derive from it |
 | 🔌 **OpenAI-compatible API** | `/v1/chat/completions` with SSE streaming, tool calls, API keys |
 | 🧰 **MCP, both directions** | **Server**: built into `cheetah serve` — the model is exposed at `POST /mcp` for any MCP agent, no flags needed. **Client**: `--mcp-server` / `--mcp-config` connects MCP servers whose tools the model calls in an agentic loop. Guide: [docs/MCP.md](docs/MCP.md) |
@@ -310,7 +310,7 @@ On the default CPU path (the native backend), tiers act on **real memory pages**
 
 | Ant plan | idle RSS | inference peak | after request |
 |----------|----------|----------------|---------------|
-| tiered (16 MB VRAM / 32 MB RAM, rest disk) | **123 MB** (vs 2,497 MB for the retired Candle CPU path) | **~255 MB** | ~210 MB |
+| tiered (16 MB VRAM / 32 MB RAM, rest disk) | **123 MB** (vs 2,497 MB for the retired Candle CPU path) | **~220 MB** | ~210 MB |
 | RAM-tier plan (16 MB VRAM / 512 MB RAM, rest disk) | **~603 MB** | **~735 MB** | ~689 MB |
 | **default** — full-resident (8 GiB/16 GiB budgets; measured both via a model preset and with no preset file — identical) | **~1.0 GB** | **~1.12 GB** | ~1.10 GB |
 

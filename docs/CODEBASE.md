@@ -134,7 +134,7 @@ content delta):
 | Scenario | before (HEAD c3c79bf) | after |
 |---|---|---|
 | Repeat / multi-turn turn hitting the KV prefix cache | 187–208 s | **0.17–0.45 s** |
-| Cold prompt (no cached prefix) | 187–208 s | **~75 s** |
+| Cold prompt (no cached prefix) | 187–208 s | **~65 s** (re-measured at v1.3.3, 1.6k tokens; KV Q8 default) |
 
 The cold prompt is bounded by raw CPU: chunked GEMM runs ~15.8 GMACs/s and
 attention ~3.2 GMACs/s on this machine (see the ignored
@@ -324,8 +324,8 @@ cargo build --release --features vulkan   # + shader compilation (needs glslc) +
 cargo build --release --features cuda     # Candle CUDA (needs CUDA toolkit)
 cargo build --release --features metal    # Candle Metal (macOS)
 
-cargo test                           # default feature tests (229 passed, 1 ignored)
-cargo test --features vulkan         # + Vulkan executor/shader/catalog parity tests (262 passed, 4 ignored)
+cargo test                           # default feature tests (224 passed, 2 ignored)
+cargo test --features vulkan         # + Vulkan executor/shader/catalog parity tests (257 passed, 4 ignored)
 cargo test native_                   # all native-backend tests
 cargo test -- --test-threads=4       # parallel (some tests are timing-sensitive)
 ```
