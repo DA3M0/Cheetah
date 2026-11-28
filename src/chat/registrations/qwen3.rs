@@ -995,6 +995,11 @@ impl Qwen3VulkanExecutor {
                     self.config.rms_norm_eps,
                 )?;
             }
+            let rope_freqs = crate::chat::native::ops::scaled_freqs(
+                self.config.rope_theta,
+                self.config.head_dim,
+                &self.config.rope_scaling,
+            );
             (query, keys) = cheetah::native::vulkan::rotary(
                 &query,
                 &keys,
@@ -1004,7 +1009,7 @@ impl Qwen3VulkanExecutor {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
                 self.config.head_dim,
-                self.config.rope_theta,
+                &rope_freqs,
             )?;
             layer.kv.append(&keys, &values);
             let attention = cheetah::native::vulkan::attention(
@@ -1142,9 +1147,16 @@ mod vulkan_feature_tests {
     }
 
     #[test]
-    fn qwen3_vulkan_rejects_scaled_rope() {
+    fn qwen3_vulkan_resolves_scaled_rope() {
         let mut raw = qwen3_raw();
         raw["rope_scaling"] = serde_json::json!({"type": "linear", "factor": 2.0});
+        let config = qwen3_vulkan_config(&raw).unwrap();
+        assert!(matches!(
+            config.rope_scaling,
+            crate::chat::native::ops::RopeScaling::Linear { factor: 2.0 }
+        ));
+        // Unsupported types still fail loudly.
+        raw["rope_scaling"] = serde_json::json!({"type": "yarn", "factor": 2.0});
         assert!(qwen3_vulkan_config(&raw).is_err());
     }
 

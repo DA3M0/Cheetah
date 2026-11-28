@@ -948,6 +948,11 @@ impl Qwen2VulkanExecutor {
             let mut query = layer.q_proj.forward(&normalized, sequence)?;
             let mut keys = layer.k_proj.forward(&normalized, sequence)?;
             let values = layer.v_proj.forward(&normalized, sequence)?;
+            let rope_freqs = crate::chat::native::ops::scaled_freqs(
+                self.config.rope_theta,
+                self.config.head_dim,
+                &self.config.rope_scaling,
+            );
             (query, keys) = cheetah::native::vulkan::rotary(
                 &query,
                 &keys,
@@ -957,7 +962,7 @@ impl Qwen2VulkanExecutor {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
                 self.config.head_dim,
-                self.config.rope_theta,
+                &rope_freqs,
             )?;
             layer.kv.append(&keys, &values);
             let attention = cheetah::native::vulkan::attention(

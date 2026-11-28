@@ -173,8 +173,10 @@ void run_rotary(uint index) {
     float second = is_query
                        ? uintBitsToFloat(b0.data[second_index])
                        : uintBitsToFloat(b1.data[second_index]);
-    float frequency = pow(uintBitsToFloat(params.p6),
-                          -float(2u * pair_dimension) / float(rotary_dim));
+    // The host resolves the per-index frequency table (base theta + any
+    // rope scaling) and binds it through b4 — one implementation of the
+    // scaling math serves both backends. Table length = rotary_dim / 2.
+    float frequency = uintBitsToFloat(b4.data[pair_dimension]);
     float angle = float(offset + sequence_index) * frequency;
     float cosine = cos(angle);
     float sine = sin(angle);

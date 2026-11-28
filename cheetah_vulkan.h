@@ -68,9 +68,10 @@ int vk_qwen_elementwise(const float *a, const float *b, float *output,
                         size_t count, uint32_t operation);
 int vk_qwen_rotary(const float *query, const float *keys,
                    float *query_output, float *key_output,
+                   const float *freqs, uint32_t freq_count,
                    uint32_t sequence, uint32_t offset,
                    uint32_t query_heads, uint32_t kv_heads,
-                   uint32_t head_dim, uint32_t rotary_dim, float theta);
+                   uint32_t head_dim, uint32_t rotary_dim);
 int vk_qwen_attention(const float *query, const float *keys,
                       const float *values, float *output,
                       uint32_t sequence, uint32_t offset,

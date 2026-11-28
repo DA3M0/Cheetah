@@ -800,6 +800,7 @@ mod parity {
                     rotary_dim: 4,
                     position: 3,
                     theta: 10000.0,
+                    scaling: &crate::chat::native::ops::RopeScaling::None,
                 },
             )
             .expect(id)

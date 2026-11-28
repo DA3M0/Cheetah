@@ -59,6 +59,8 @@ pub(crate) enum OpCall<'a> {
         width: usize,
     },
     /// Rotary embedding over one query span (`kv_heads = 0`, query-only).
+    /// The host resolves the per-index frequency table (base theta + any
+    /// rope scaling) and the shader reads it through b4.
     Rope {
         x: &'a [f32],
         heads: usize,
@@ -66,6 +68,7 @@ pub(crate) enum OpCall<'a> {
         rotary_dim: usize,
         position: usize,
         theta: f32,
+        scaling: &'a crate::chat::native::ops::RopeScaling,
     },
     /// Gather one row `row` of `width` from `table`.
     Embedding {
@@ -129,6 +132,7 @@ pub(crate) fn run_vulkan_op(op: &VulkanOp, call: OpCall<'_>) -> Result<OpOutput,
     // Temporaries whose backing memory must outlive the FFI call.
     let mut bias_zeros: Vec<f32> = Vec::new();
     let mut packed_b4: Vec<f32> = Vec::new();
+    let rope_freqs: Vec<f32>;
     let mut token_ids = [0u32; 1];
 
     params[0] = op.op_code;
@@ -259,6 +263,7 @@ pub(crate) fn run_vulkan_op(op: &VulkanOp, call: OpCall<'_>) -> Result<OpOutput,
             rotary_dim,
             position,
             theta,
+            scaling,
         } => {
             let query_count = heads * head_dim;
             params[1] = 1; // sequence = 1
@@ -266,10 +271,13 @@ pub(crate) fn run_vulkan_op(op: &VulkanOp, call: OpCall<'_>) -> Result<OpOutput,
             params[3] = heads as u32; // query_heads
             params[4] = 0; // kv_heads = 0 (query-only span)
             params[5] = head_dim as u32;
-            params[6] = theta.to_bits();
+            params[6] = theta.to_bits(); // informational; the table in b4 carries the resolved frequencies
             params[7] = rotary_dim as u32;
+            rope_freqs = crate::chat::native::ops::scaled_freqs(theta, rotary_dim, scaling);
             sources[0] = x.as_ptr() as *const c_void;
+            sources[4] = rope_freqs.as_ptr() as *const c_void;
             sizes[0] = bytes(x.len());
+            sizes[4] = bytes(rope_freqs.len());
             primary = vec![0.0; query_count];
             destinations[2] = primary.as_mut_ptr() as *mut c_void;
             sizes[2] = bytes(query_count);

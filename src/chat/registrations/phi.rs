@@ -1060,7 +1060,11 @@ impl VulkanPhiExecutor {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
                 self.config.rotary_dim,
-                self.config.rope_theta,
+                &crate::chat::native::ops::scaled_freqs(
+                    self.config.rope_theta,
+                    self.config.rotary_dim,
+                    &crate::chat::native::ops::RopeScaling::None,
+                ),
             )?;
             layer.kv.append(&keys, &values);
             let attention = cheetah::native::vulkan::attention(

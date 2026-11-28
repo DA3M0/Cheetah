@@ -1092,13 +1092,14 @@ pub mod vulkan {
             keys: *const f32,
             query_output: *mut f32,
             key_output: *mut f32,
+            freqs: *const f32,
+            freq_count: u32,
             sequence: u32,
             offset: u32,
             query_heads: u32,
             kv_heads: u32,
             head_dim: u32,
             rotary_dim: u32,
-            theta: f32,
         ) -> c_int;
         // GQA attention shader with causal masking + sliding window.
         fn vk_qwen_attention(
@@ -1847,8 +1848,14 @@ pub mod vulkan {
         kv_heads: usize,
         head_dim: usize,
         rotary_dim: usize,
-        theta: f32,
+        freqs: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if freqs.len() != rotary_dim / 2 {
+            return Err(format!(
+                "Vulkan rotary frequency table must carry rotary_dim/2 = {} entries.",
+                rotary_dim / 2
+            ));
+        }
         let query_count = sequence
             .checked_mul(query_heads)
             .and_then(|count| count.checked_mul(head_dim))
@@ -1871,13 +1878,14 @@ pub mod vulkan {
                 keys.as_ptr(),
                 query_output.as_mut_ptr(),
                 key_output.as_mut_ptr(),
+                freqs.as_ptr(),
+                to_u32(freqs.len())?,
                 to_u32(sequence)?,
                 to_u32(offset)?,
                 to_u32(query_heads)?,
                 to_u32(kv_heads)?,
                 to_u32(head_dim)?,
                 to_u32(rotary_dim)?,
-                theta,
             )
         };
         check_native_result(result, "Vulkan rotary embedding")?;
@@ -2091,7 +2099,7 @@ pub mod vulkan {
             assert!((gated[1] - 3.0 / (1.0 + (-1.0f32).exp())).abs() < 1e-5);
 
             let (query, keys) =
-                rotary(&[1.0, 0.0], &[1.0, 0.0], 1, 1, 1, 1, 2, 2, 10_000.0).unwrap();
+                rotary(&[1.0, 0.0], &[1.0, 0.0], 1, 1, 1, 1, 2, 2, &[1.0]).unwrap();
             assert!((query[0] - 1.0f32.cos()).abs() < 1e-5);
             assert!((query[1] - 1.0f32.sin()).abs() < 1e-5);
             assert!((keys[0] - query[0]).abs() < 1e-6);

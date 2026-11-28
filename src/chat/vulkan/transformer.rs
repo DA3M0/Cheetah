@@ -31,6 +31,9 @@ pub(crate) struct VulkanTransformerConfig {
     /// overrides the pattern when present.
     pub(crate) layer_types: Option<Vec<bool>>,
     pub(crate) activation: Activation,
+    /// Resolved RoPE frequency scaling from the config's `rope_scaling`
+    /// block (linear / llama3; other types error at resolution).
+    pub(crate) rope_scaling: crate::chat::native::ops::RopeScaling,
     pub(crate) features: TransformerFeatures,
 }
 
@@ -239,17 +242,48 @@ impl VulkanTransformerConfig {
                 ));
             }
         };
-        // Rope scaling (linear / dynamic / llama3 / ...) is not implemented by
-        // the rotary operator: a checkpoint that requires it must fail loudly
-        // instead of rotating every position with the base theta.
-        if raw
-            .get("rope_scaling")
-            .is_some_and(|value| !value.is_null())
-        {
-            return Err(format!(
-                "Vulkan {model_name} does not support RoPE scaling."
-            ));
-        }
+        // RoPE frequency scaling: linear and llama3 (NTK-by-parts) are
+        // supported through the shared frequency-table path; anything else
+        // fails loudly instead of silently rotating with the base theta.
+        let rope_scaling = match raw.get("rope_scaling") {
+            None | Some(Value::Null) => crate::chat::native::ops::RopeScaling::None,
+            Some(Value::Object(obj)) => {
+                let rope_type = obj
+                    .get("rope_type")
+                    .or_else(|| obj.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let factor = obj.get("factor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                match rope_type {
+                    "linear" => crate::chat::native::ops::RopeScaling::Linear { factor },
+                    "llama3" => crate::chat::native::ops::RopeScaling::Llama3 {
+                        factor,
+                        low_freq_factor: obj
+                            .get("low_freq_factor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(1.0) as f32,
+                        high_freq_factor: obj
+                            .get("high_freq_factor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(4.0) as f32,
+                        original_max_position: obj
+                            .get("original_max_position_embeddings")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(8192) as usize,
+                    },
+                    other => {
+                        return Err(format!(
+                            "Vulkan {model_name}: rope_scaling type '{other}' is not supported (linear and llama3 are)."
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "Vulkan {model_name}: rope_scaling must be an object."
+                ));
+            }
+        };
         if let TransformerFeedForwardFeatures::MixtureOfExperts {
             num_local_experts,
             num_experts_per_tok,
@@ -296,6 +330,7 @@ impl VulkanTransformerConfig {
             sliding_window_pattern,
             layer_types,
             activation,
+            rope_scaling,
             features,
         })
     }

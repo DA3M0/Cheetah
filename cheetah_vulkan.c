@@ -1646,22 +1646,24 @@ int vk_qwen_elementwise(const float *a, const float *b, float *output,
 
 int vk_qwen_rotary(const float *query, const float *keys,
                    float *query_output, float *key_output,
+                   const float *freqs, uint32_t freq_count,
                    uint32_t sequence, uint32_t offset,
                    uint32_t query_heads, uint32_t kv_heads,
-                   uint32_t head_dim, uint32_t rotary_dim, float theta) {
-    const void *sources[5] = {query, keys, NULL, NULL, NULL};
+                   uint32_t head_dim, uint32_t rotary_dim) {
+    const void *sources[5] = {query, keys, NULL, NULL, freqs};
     void *destinations[5] = {NULL, NULL, query_output, key_output, NULL};
     size_t sizes[5];
     uint32_t parameters[8] = {0};
     uint64_t query_count;
     uint64_t key_count;
     if (query == NULL || keys == NULL || query_output == NULL ||
-        key_output == NULL || sequence == 0 || query_heads == 0 ||
+        key_output == NULL || freqs == NULL || freq_count == 0 ||
+        freq_count != rotary_dim / 2U ||
+        sequence == 0 || query_heads == 0 ||
         kv_heads == 0 || head_dim == 0 || rotary_dim == 0 ||
         rotary_dim > head_dim ||
         query_heads % kv_heads != 0 || (head_dim & 1U) != 0 ||
-        (rotary_dim & 1U) != 0 ||
-        !isfinite(theta) || theta <= 0.0f) {
+        (rotary_dim & 1U) != 0) {
         report_error("invalid arguments to vk_qwen_rotary");
         return -1;
     }
@@ -1676,14 +1678,13 @@ int vk_qwen_rotary(const float *query, const float *keys,
     }
     sizes[0] = sizes[2] = (size_t)query_count * sizeof(float);
     sizes[1] = sizes[3] = (size_t)key_count * sizeof(float);
-    sizes[4] = 0;
+    sizes[4] = (size_t)freq_count * sizeof(float);
     parameters[0] = 3;
     parameters[1] = sequence;
     parameters[2] = offset;
     parameters[3] = query_heads;
     parameters[4] = kv_heads;
     parameters[5] = head_dim;
-    memcpy(&parameters[6], &theta, sizeof(theta));
     parameters[7] = rotary_dim;
     return run_qwen_compute(sources, destinations, sizes, parameters,
                             ceil_div_u32((uint32_t)(query_count + key_count), 64));
