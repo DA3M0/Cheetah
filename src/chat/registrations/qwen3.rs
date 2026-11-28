@@ -71,6 +71,7 @@ const fn qwen3_family() -> ModelFamily {
         ],
         extra_config_json: "{\"hidden_act\":\"silu\"}",
         max_position_embeddings: None,
+        unit_prefix: "model",
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
         features: super::native::decoder::LLAMA_BASELINE,
     }

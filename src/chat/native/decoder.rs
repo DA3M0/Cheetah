@@ -26,6 +26,23 @@ use serde_json::Value;
 /// concrete: there are no optional values, so the forward pass never has to
 /// re-derive shapes or re-read JSON. Cloning is cheap (only the feature and
 /// layout tags are copyable metadata; there are no heap allocations).
+/// Gated-delta-net layer geometry (Qwen3.5 linear-attention layers).
+/// Intentionally unconsumed until the Qwen3.5 forward lands (1.4, next step).
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct GatedDeltaDims {
+    pub num_key_heads: usize,
+    pub num_value_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub conv_kernel: usize,
+}
+
+/// The resolved decoder configuration for one checkpoint: every dimension
+/// and behavior tag the native forward needs, derived through the
+/// config → manifest → family fallback chain. Clone is cheap (only the
+/// feature and layout tags are copyable metadata; there are no heap
+/// allocations).
 #[derive(Clone)]
 pub struct DecoderConfig {
     /// Width of the residual stream; also the embedding row length and the
@@ -79,6 +96,19 @@ pub struct DecoderConfig {
     /// it is required to be nonzero whenever `num_local_experts` is nonzero,
     /// because tensor shapes cannot carry this value.
     pub num_experts_per_tok: usize,
+    /// Qwen3.5-style gated-delta-net dimensions, resolved from the config's
+    /// `linear_*` fields; present only when the checkpoint declares them.
+    /// Consumed by the Qwen3.5 forward (1.4, next step).
+    #[allow(dead_code)]
+    pub gated_delta: Option<GatedDeltaDims>,
+    /// Per-layer kinds from `layer_types` (`true` = linear-attention layer).
+    /// `None` when the checkpoint has none (every layer is full attention).
+    #[allow(dead_code)]
+    pub linear_attn_layers: Option<Vec<bool>>,
+    /// Attention output gate: `q_proj` emits 2× per-head span and the
+    /// attention output is multiplied by `sigmoid(gate)` before `o_proj`.
+    #[allow(dead_code)]
+    pub attn_output_gate: bool,
     /// Resolved rotary span per head: `head_dim` for full rope (llama-shaped
     /// families), the `partial_rotary_factor * head_dim` share for phi-style
     /// partial rotary. Rope applies to the leading `rotary_dim` dims only.
@@ -294,40 +324,61 @@ impl DecoderConfig {
         // missing key, or a value of the wrong JSON type, letting `unwrap_or`
         // chains fall through to manifest derivation. `field_u` narrows to
         // usize, `field_f` to f64 (later cast to f32), `field_b` to bool.
+        // VL wrappers (Qwen3.5) nest the language-model dims under
+        // `text_config`; the accessors fall back to it after the top level.
         let field_u = |name: &str| {
-            raw.and_then(|value| value.get(name))
-                .and_then(Value::as_u64)
-                .map(|value| value as usize)
+            raw.and_then(|value| {
+                value
+                    .get(name)
+                    .or_else(|| value.get("text_config").and_then(|tc| tc.get(name)))
+            })
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
         };
         let field_f = |name: &str| {
-            raw.and_then(|value| value.get(name))
-                .and_then(Value::as_f64)
+            raw.and_then(|value| {
+                value
+                    .get(name)
+                    .or_else(|| value.get("text_config").and_then(|tc| tc.get(name)))
+            })
+            .and_then(Value::as_f64)
         };
         let field_b = |name: &str| {
-            raw.and_then(|value| value.get(name))
-                .and_then(Value::as_bool)
+            raw.and_then(|value| {
+                value
+                    .get(name)
+                    .or_else(|| value.get("text_config").and_then(|tc| tc.get(name)))
+            })
+            .and_then(Value::as_bool)
         };
         // Unknown architecture: fall back to the llama-shaped family defaults
         // (rope theta 1e6, epsilon 1e-6, untied head, Mixtral expert naming,
         // baseline dense features). This is the same shape as a family whose
         // config lists no extras.
         let family = family.unwrap_or(crate::chat::registry::ModelFamily {
+            unit_prefix: "model",
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
             tie_word_embeddings: false,
             profiles: &[],
             extra_config_json: "",
             max_position_embeddings: None,
-            moe_layout: MoEExpertLayout::MIXTRAL,
+        moe_layout: MoEExpertLayout::MIXTRAL,
             features: DenseFeatures::default(),
         });
 
         // The embedding is the one tensor every decoder must have: its shape
         // anchors the derived hidden size (columns) and vocabulary (rows) when
         // config.json omits them.
+        let embed_unit = format!("{}.embed_tokens.weight", family.unit_prefix);
         let embed_shape = store
-            .unit_shape("model.embed_tokens.weight")
-            .ok_or_else(|| "Native backend: units manifest has no embedding tensor.".to_string())?;
+            .unit_shape(&embed_unit)
+            .ok_or_else(|| {
+                format!(
+                    "Native backend: units manifest has no embedding tensor ({}).",
+                    embed_unit
+                )
+            })?;
         if embed_shape.len() != 2 {
             return Err("Native backend: unexpected embedding shape in the units manifest.".into());
         }
@@ -365,7 +416,8 @@ impl DecoderConfig {
         let moe_layout = family.moe_layout;
         // Probe unit id for expert 0's gate on layer 0; only consulted when the
         // dense MLP units are absent, i.e. for a sparse manifest.
-        let expert_gate_unit = moe_layout.expert_unit("model.layers.0.", 0, moe_layout.gate);
+        let layer_probe_prefix = format!("{}.layers.0.", family.unit_prefix);
+        let expert_gate_unit = moe_layout.expert_unit(&layer_probe_prefix, 0, moe_layout.gate);
         // Intermediate width fallback chain: config, dense gate rows, phi fc1
         // rows, then a sparse expert's gate rows. Zero means nothing matched
         // and resolution aborts below.
@@ -396,7 +448,7 @@ impl DecoderConfig {
         // tensor shapes cannot carry it — so a sparse manifest without it fails
         // loudly instead of silently taking the dense feed-forward path.
         let num_local_experts =
-            field_u("num_local_experts").unwrap_or_else(|| count_layer_experts(store, &moe_layout));
+            field_u("num_local_experts").unwrap_or_else(|| count_layer_experts(store, &moe_layout, family.unit_prefix));
         let num_experts_per_tok = field_u("num_experts_per_tok").unwrap_or(0);
         if num_local_experts > 0 && num_experts_per_tok == 0 {
             return Err(format!(
@@ -461,6 +513,31 @@ impl DecoderConfig {
         // or an explicit `layer_types` list (true = sliding). Both default to
         // absent, i.e. every layer uses the global window resolution.
         let sliding_window_pattern = field_u("sliding_window_pattern").unwrap_or(0);
+        // Gated-delta-net geometry (Qwen3.5 linear-attention layers): the
+        // checkpoint's `linear_*` fields declare the head layout; the layer
+        // kinds come from `layer_types` ("linear_attention" vs
+        // "full_attention").
+        let gated_delta = field_u("linear_key_head_dim").map(|key_head_dim| GatedDeltaDims {
+            key_head_dim,
+            value_head_dim: field_u("linear_value_head_dim").unwrap_or(key_head_dim),
+            num_key_heads: field_u("linear_num_key_heads").unwrap_or(1),
+            num_value_heads: field_u("linear_num_value_heads").unwrap_or(1),
+            conv_kernel: field_u("linear_conv_kernel_dim").unwrap_or(4),
+        });
+        let linear_attn_layers = raw
+            .and_then(|value| {
+                value
+                    .get("layer_types")
+                    .or_else(|| value.get("text_config").and_then(|tc| tc.get("layer_types")))
+            })
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.as_str() == Some("linear_attention"))
+                    .collect()
+            });
+        let attn_output_gate = field_b("attn_output_gate").unwrap_or(false);
         let layer_types = raw
             .and_then(|value| value.get("layer_types"))
             .and_then(Value::as_array)
@@ -556,6 +633,9 @@ impl DecoderConfig {
             rms_eps: field_f("rms_norm_eps").unwrap_or(family.rms_norm_eps) as f32,
             rope_theta: field_f("rope_theta").unwrap_or(family.rope_theta) as f32,
             rope_scaling,
+            gated_delta,
+            linear_attn_layers,
+            attn_output_gate,
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
             sliding_window,
@@ -579,8 +659,12 @@ impl DecoderConfig {
 /// expert indices are contiguous from zero — true for every prepared
 /// Mixtral-shaped model. A manifest with no matching units reports zero,
 /// selecting the dense feed-forward path.
-fn count_layer_experts(store: &MmapWeightStore, layout: &MoEExpertLayout) -> usize {
-    let prefix = format!("model.layers.0.{}.", layout.experts_prefix);
+fn count_layer_experts(
+    store: &MmapWeightStore,
+    layout: &MoEExpertLayout,
+    unit_prefix: &str,
+) -> usize {
+    let prefix = format!("{}.layers.0.{}.", unit_prefix, layout.experts_prefix);
     let suffix = format!(".{}.weight", layout.gate);
     store
         .unit_ids()
@@ -925,13 +1009,16 @@ mod forward_tests {
             rms_eps: 1e-5,
             rope_theta: 10_000.0,
             rope_scaling: ops::RopeScaling::None,
+            gated_delta: None,
+            linear_attn_layers: None,
+            attn_output_gate: false,
             tie_word_embeddings: true,
             sliding_window,
             sliding_window_pattern: 0,
             layer_types: None,
             num_local_experts: 0,
             num_experts_per_tok: 0,
-            moe_layout: MoEExpertLayout::MIXTRAL,
+        moe_layout: MoEExpertLayout::MIXTRAL,
             features: DenseFeatures::default(),
         }
     }
@@ -1461,13 +1548,16 @@ mod forward_tests {
             rms_eps: 1e-5, // phi's layer_norm_eps
             rope_theta: 10_000.0,
             rope_scaling: RopeScaling::None,
+            gated_delta: None,
+            linear_attn_layers: None,
+            attn_output_gate: false,
             tie_word_embeddings: false,
             sliding_window: 0,
             sliding_window_pattern: 0,
             layer_types: None,
             num_local_experts: 0,
             num_experts_per_tok: 0,
-            moe_layout: MoEExpertLayout::MIXTRAL,
+        moe_layout: MoEExpertLayout::MIXTRAL,
             features: DenseFeatures {
                 layer_norm: true,
                 parallel_residual: true,

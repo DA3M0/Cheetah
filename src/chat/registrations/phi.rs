@@ -78,6 +78,7 @@ const fn phi_family() -> ModelFamily {
         ],
         extra_config_json: "{\"hidden_act\":\"gelu_new\"}",
         max_position_embeddings: Some(2048),
+        unit_prefix: "model",
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
         features: super::native::decoder::PHI_FEATURES,
     }

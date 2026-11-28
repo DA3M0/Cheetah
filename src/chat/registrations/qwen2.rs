@@ -76,6 +76,7 @@ const fn qwen2_family() -> ModelFamily {
         extra_config_json:
             "{\"hidden_act\":\"silu\",\"sliding_window\":4096,\"use_sliding_window\":false,\"max_window_layers\":21}",
         max_position_embeddings: None,
+        unit_prefix: "model",
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
         features: super::native::decoder::LLAMA_BASELINE,
     }

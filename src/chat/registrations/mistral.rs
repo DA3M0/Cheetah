@@ -75,6 +75,7 @@ const fn mistral_family() -> ModelFamily {
         ],
         extra_config_json: "{\"hidden_act\":\"silu\",\"sliding_window\":4096}",
         max_position_embeddings: Some(32768),
+        unit_prefix: "model",
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
         features: super::native::decoder::LLAMA_BASELINE,
     }

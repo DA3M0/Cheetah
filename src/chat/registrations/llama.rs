@@ -77,6 +77,7 @@ const fn llama_family() -> ModelFamily {
         ],
         extra_config_json: "",
         max_position_embeddings: Some(4096),
+        unit_prefix: "model",
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
         features: super::native::decoder::LLAMA_BASELINE,
     }

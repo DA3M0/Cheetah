@@ -200,6 +200,10 @@ pub(crate) enum BackendLoader {
 /// completeness.
 #[derive(Clone, Copy)]
 pub(crate) struct ModelFamily {
+    /// Unit-name prefix for the decoder stack: `"model"` for every
+    /// single-model checkpoint, `"model.language_model"` for VL wrappers
+    /// whose language backbone is nested (Qwen3.5).
+    pub(super) unit_prefix: &'static str,
     pub(super) rope_theta: f64,
     pub(super) rms_norm_eps: f64,
     pub(super) tie_word_embeddings: bool,

@@ -78,6 +78,7 @@ const fn gemma_family() -> ModelFamily {
         ],
         extra_config_json: "{\"hidden_act\":\"gelu_pytorch_tanh\"}",
         max_position_embeddings: Some(8192),
+        unit_prefix: "model",
         moe_layout: super::native::decoder::MoEExpertLayout::MIXTRAL,
         features: super::native::decoder::GEMMA_FEATURES,
     }
