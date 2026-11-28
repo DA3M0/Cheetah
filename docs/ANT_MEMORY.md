@@ -333,7 +333,7 @@ drop_disk_units_of_layer(0)                     // embed/norm bucket
 
 - **KV cache**: per layer, flattened as
   `[position * kv_heads * head_dim + index]`. Default storage is f32;
-  `CHEETAH_KV_Q8=1` switches to signed int8 codes plus one f32 scale per
+  The KV cache defaults to signed int8 codes plus one f32 scale per (`CHEETAH_KV_Q8=0` restores f32):
   `(position, kv_head)` (symmetric per-head `max|v|/127`). `cache_append`
   quantizes at append time, so continuation and snapshot/restore stay
   bit-exact within one storage mode; attention expands codes in the score and
@@ -469,7 +469,7 @@ the dequantization error to ±scale/2 (±max|w|/254).
 
 ### 7.5.1 Q8 KV cache (activation-precision, opt-in)
 
-`CHEETAH_KV_Q8=1` switches the native KV cache from f32 to symmetric per-head
+The native KV cache defaults to symmetric per-head (since v1.3.3; `CHEETAH_KV_Q8=0` restores f32)
 int8: each layer stores `codes[position * kv_dim + index]` plus
 `scales[position * kv_heads + head]` (`scale = max|v|/127` for that head's
 row, zero rows use 1.0). `cache_append` quantizes each row as it is written,
@@ -649,7 +649,7 @@ single steady number (serve, qwen-0.5b-prepared, ~1.4k-token prompt, v1.2.0):
 Idle RSS ≈ resident plan bytes (VRAM + RAM tiers; disk tier ≈ 0 until touched)
 + ~70 MB runtime. The growth over idle is the KV cache (~35 MB at this length)
 plus the KV prefix-cache snapshot (≤ ~25 MB), chunked-prefill working buffers
-and allocator retention. With `CHEETAH_KV_Q8=1` the live KV cache and prefix
+and allocator retention. With the default Q8 KV cache the live KV cache and prefix
 snapshot shrink roughly 4×; the rest of the profile is unchanged. vs Candle
 2,497/3,704 MB (F32 materialized).
 
@@ -742,7 +742,7 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   to full attention on both backends.
 - Q8 quantization changes the numerics (per-row int8 bounds the error to
   ±max|w|/254 per weight). Outputs differ from BF16/F32 runs.
-- Q8 KV cache (`CHEETAH_KV_Q8=1`) is lossy: K/V rows round to ±max|v|/254 per
+- The default Q8 KV cache is lossy: K/V rows round to ±max|v|/254 per
   head, so attention scores and logits differ slightly from the f32 cache.
   Continuation and snapshot/restore stay bit-exact within Q8 mode.
 - Vulkan resident bucket (DEVICE_LOCAL) requires the VRAM-tier bytes to fit

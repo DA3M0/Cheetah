@@ -1601,18 +1601,22 @@ pub(crate) struct DebugCapture {
 // ---------------------------------------------------------------------------
 
 /// Whether the KV cache stores row-wise int8 codes instead of f32 values.
-/// Selected once per process through `CHEETAH_KV_Q8=1` (or the
-/// `CHEETAH_KV_QUANT_Q8` alias); unset/`0` keeps full f32 precision.
+/// Default-on since v1.3.3 (measured: identical greedy output on the
+/// reference model, faster prefill/decode — the attention reads half the KV
+/// bytes — and a 4× smaller cache); `CHEETAH_KV_Q8=0` (or the
+/// `CHEETAH_KV_QUANT_Q8` alias) restores full f32 precision for
+/// bit-exactness-sensitive runs.
 fn kv_q8_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         ["CHEETAH_KV_Q8", "CHEETAH_KV_QUANT_Q8"]
             .iter()
-            .any(|variable| {
-                std::env::var(variable)
-                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false)
+            .find_map(|variable| {
+                std::env::var(variable).ok().map(|value| {
+                    !(value == "0" || value.eq_ignore_ascii_case("false"))
+                })
             })
+            .unwrap_or(true)
     })
 }
 
@@ -1885,8 +1889,11 @@ impl OpsToolbox {
     /// Build a toolbox around an already-resolved config and store (test and
     /// fixture path; the loader path uses [`OpsToolbox::open`]). The KV cache
     /// precision follows the `CHEETAH_KV_Q8` selector.
+    /// Test constructor: pins the KV cache to f32 so reference-math and
+    /// parity fixtures stay exact regardless of the process default. The
+    /// production path (`open`) follows `kv_q8_enabled`.
     pub(crate) fn with_store(cfg: DecoderConfig, store: Arc<MmapWeightStore>) -> Self {
-        Self::with_store_kv_q8(cfg, store, kv_q8_enabled())
+        Self::with_store_kv_q8(cfg, store, false)
     }
 
     /// [`OpsToolbox::with_store`] with an explicit KV precision — the test
@@ -1927,7 +1934,7 @@ impl OpsToolbox {
     ) -> Result<Self, String> {
         let store = Arc::new(MmapWeightStore::open(model_dir)?);
         let cfg = DecoderConfig::resolve(Some(raw_config), &store, Some(family))?;
-        let mut toolbox = Self::with_store(cfg, Arc::clone(&store));
+        let mut toolbox = Self::with_store_kv_q8(cfg, Arc::clone(&store), kv_q8_enabled());
         toolbox.apply_tiers(plan);
         Ok(toolbox)
     }
