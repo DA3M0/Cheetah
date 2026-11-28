@@ -969,8 +969,8 @@ fn mixtral_vulkan_config(
     crate::chat::vulkan::transformer::VulkanTransformerConfig::from_raw(raw_config, features)
 }
 
-/// Vulkan loader for this registration: build the generic transformer
-/// executor around the mixtral feature set.
+/// Vulkan loader for this registration: build the mixtral family's own
+/// executor (the decode graph below) around the mixtral feature set.
 #[cfg(feature = "vulkan")]
 fn mixtral_vulkan_loader(
     weight_paths: &[std::path::PathBuf],
@@ -979,11 +979,457 @@ fn mixtral_vulkan_loader(
     plan: &BTreeMap<String, String>,
 ) -> Result<Box<dyn ModelForward>, String> {
     let config = mixtral_vulkan_config(&raw_config)?;
-    Ok(Box::new(
-        crate::chat::vulkan::transformer::VulkanTransformerExecutor::load(
-            weight_paths, &config, plan,
-        )?,
-    ))
+    Ok(Box::new(MixtralVulkanExecutor::load(weight_paths, &config, plan)?))
+}
+
+// ---------------------------------------------------------------------------
+// The family's own Vulkan executor (Part B Phase 2): the decode graph lives
+// in this registration file. Mixtral's block is the llama baseline shape
+// with the sparse feed-forward: RMSNorm → split q/k/v → full-span
+// rotate-half rope → GQA attention → o_proj → residual → RMSNorm → routed
+// experts → residual. The router runs as one batched GEMM, rows are
+// bucketed BY EXPERT (one batched gate/up/activation/down per picked
+// expert), and the routing-aware per-expert residency is driven through the
+// shared `VulkanForwardContext`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "vulkan")]
+use crate::chat::moe::select_experts;
+#[cfg(feature = "vulkan")]
+use crate::chat::vulkan::context::{Expert, GpuKvCache, VulkanForwardContext, apply_activation, page_linear, validate_sequence};
+#[cfg(feature = "vulkan")]
+use crate::chat::vulkan::transformer::{TransformerFeedForwardFeatures, VulkanTransformerConfig};
+#[cfg(feature = "vulkan")]
+use crate::chat::vulkan::weights::{
+    Linear, WeightData, load_weights, take_linear, take_weight, validate_shape,
+};
+
+/// Mixtral-style sparse-MoE tensor naming: router + expert projections.
+#[cfg(feature = "vulkan")]
+const MOE_ROUTER_LAYOUT: &str = "block_sparse_moe.gate";
+#[cfg(feature = "vulkan")]
+const MOE_EXPERTS_LAYOUT: &str = "block_sparse_moe.experts";
+#[cfg(feature = "vulkan")]
+const MOE_GATE_LAYOUT: &str = "w1";
+#[cfg(feature = "vulkan")]
+const MOE_UP_LAYOUT: &str = "w3";
+#[cfg(feature = "vulkan")]
+const MOE_DOWN_LAYOUT: &str = "w2";
+
+/// The mixtral sparse feed-forward: the router plus one `Expert` per expert
+/// (three projections paged together through the context).
+#[cfg(feature = "vulkan")]
+#[derive(Clone)]
+struct MixtralFeedForward {
+    router: Linear,
+    experts: Vec<Expert>,
+    num_experts_per_tok: usize,
+}
+
+/// One mixtral decoder layer on the GPU.
+#[cfg(feature = "vulkan")]
+#[derive(Clone)]
+struct MixtralVulkanLayer {
+    input_norm: WeightData,
+    post_attention_norm: WeightData,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    feed_forward: MixtralFeedForward,
+    kv: GpuKvCache,
+}
+
+/// The mixtral family's Vulkan executor.
+#[cfg(feature = "vulkan")]
+#[derive(Clone)]
+pub(crate) struct MixtralVulkanExecutor {
+    config: VulkanTransformerConfig,
+    embedding: WeightData,
+    layers: Vec<MixtralVulkanLayer>,
+    final_norm: WeightData,
+    lm_head: WeightData,
+    /// Expert-residency state (keyed (layer, expert)) the MoE block drives.
+    context: VulkanForwardContext,
+}
+
+#[cfg(feature = "vulkan")]
+impl MixtralVulkanExecutor {
+    /// Load entry with guaranteed substrate teardown on failure.
+    fn load(
+        paths: &[std::path::PathBuf],
+        config: &VulkanTransformerConfig,
+        plan: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        crate::chat::vulkan::load_with_substrate(|| Self::load_initialized(paths, config, plan))
+    }
+
+    /// The load graph (tied-or-untied lm head per the config; the sparse
+    /// feed-forward under the fixed MOE_* layout).
+    fn load_initialized(
+        paths: &[std::path::PathBuf],
+        config: &VulkanTransformerConfig,
+        plan: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let head_dim = config.head_dim;
+        let kv_size = config.num_key_value_heads * head_dim;
+        let layout = &config.features.layout;
+        let mut weights = load_weights(paths)?;
+        let embedding =
+            take_weight(&mut weights, layout.embedding, &[config.vocab_size, config.hidden_size])?
+                .data;
+        let final_norm = take_weight(&mut weights, layout.final_norm, &[config.hidden_size])?.data;
+        let lm_head = match weights.remove(layout.lm_head) {
+            Some(head) => {
+                validate_shape(
+                    layout.lm_head,
+                    &head.shape,
+                    &[config.vocab_size, config.hidden_size],
+                )?;
+                head.data
+            }
+            None if config.features.tie_word_embeddings => embedding.clone(),
+            None => {
+                return Err(format!(
+                    "Vulkan {} checkpoint is missing tensor '{}'.",
+                    config.features.model_name, layout.lm_head
+                ));
+            }
+        };
+        let TransformerFeedForwardFeatures::MixtureOfExperts {
+            num_local_experts,
+            num_experts_per_tok,
+        } = &config.features.feed_forward
+        else {
+            unreachable!("mixtral_vulkan_config only resolves the MoE feature set");
+        };
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for index in 0..config.num_hidden_layers {
+            let prefix = format!("{}.{index}", layout.layer_prefix);
+            let input_norm = take_weight(
+                &mut weights,
+                &format!("{prefix}.{}", layout.input_norm),
+                &[config.hidden_size],
+            )?
+            .data;
+            let post_attention_norm = take_weight(
+                &mut weights,
+                &format!("{prefix}.{}", layout.post_attention_norm),
+                &[config.hidden_size],
+            )?
+            .data;
+            let attention = format!("{prefix}.{}", layout.attention_prefix);
+            let router = take_linear(
+                &mut weights,
+                plan,
+                &format!("{prefix}.{MOE_ROUTER_LAYOUT}"),
+                config.hidden_size,
+                *num_local_experts,
+                false,
+            )?;
+            let mut experts = Vec::with_capacity(*num_local_experts);
+            for expert_index in 0..*num_local_experts {
+                let expert_prefix = format!("{prefix}.{MOE_EXPERTS_LAYOUT}.{expert_index}");
+                experts.push(Expert {
+                    gate: take_linear(
+                        &mut weights,
+                        plan,
+                        &format!("{expert_prefix}.{MOE_GATE_LAYOUT}"),
+                        config.hidden_size,
+                        config.intermediate_size,
+                        false,
+                    )?,
+                    up: take_linear(
+                        &mut weights,
+                        plan,
+                        &format!("{expert_prefix}.{MOE_UP_LAYOUT}"),
+                        config.hidden_size,
+                        config.intermediate_size,
+                        false,
+                    )?,
+                    down: take_linear(
+                        &mut weights,
+                        plan,
+                        &format!("{expert_prefix}.{MOE_DOWN_LAYOUT}"),
+                        config.intermediate_size,
+                        config.hidden_size,
+                        false,
+                    )?,
+                });
+            }
+            layers.push(MixtralVulkanLayer {
+                input_norm,
+                post_attention_norm,
+                q_proj: take_linear(
+                    &mut weights,
+                    plan,
+                    &format!("{attention}.{}", layout.q_proj),
+                    config.hidden_size,
+                    config.num_attention_heads * head_dim,
+                    config.features.attention_bias,
+                )?,
+                k_proj: take_linear(
+                    &mut weights,
+                    plan,
+                    &format!("{attention}.{}", layout.k_proj),
+                    config.hidden_size,
+                    kv_size,
+                    config.features.attention_bias,
+                )?,
+                v_proj: take_linear(
+                    &mut weights,
+                    plan,
+                    &format!("{attention}.{}", layout.v_proj),
+                    config.hidden_size,
+                    kv_size,
+                    config.features.attention_bias,
+                )?,
+                o_proj: take_linear(
+                    &mut weights,
+                    plan,
+                    &format!("{attention}.{}", layout.o_proj),
+                    config.num_attention_heads * head_dim,
+                    config.hidden_size,
+                    config.features.attention_output_bias,
+                )?,
+                feed_forward: MixtralFeedForward {
+                    router,
+                    experts,
+                    num_experts_per_tok: *num_experts_per_tok,
+                },
+                kv: GpuKvCache::default(),
+            });
+        }
+        Ok(Self {
+            config: config.clone(),
+            embedding,
+            layers,
+            final_norm,
+            lm_head,
+            context: VulkanForwardContext::new(),
+        })
+    }
+
+    /// Per-layer KV reset backing the trait impl.
+    fn clear_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.kv.clear();
+        }
+    }
+
+    /// The mixtral decode graph: validate, gather embeddings as a shader, then
+    /// per layer the block above; final norm + lm head on the last position.
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        let cached_elements = self
+            .layers
+            .first()
+            .map(|layer| layer.kv.keys.len())
+            .unwrap_or(0);
+        let sequence = validate_sequence(
+            tokens,
+            offset,
+            self.config.vocab_size,
+            self.config.max_position_embeddings,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            cached_elements,
+        )?;
+        let hidden = self.config.hidden_size;
+        let (table_ptr, table_format, table_elements) = self.embedding.ffi_parts();
+        let mut activations = cheetah::native::vulkan::embedding_gather(
+            tokens,
+            table_ptr,
+            table_format,
+            table_elements,
+            hidden,
+            false,
+        )?;
+
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            let residual = activations.clone();
+            let normalized =
+                layer
+                    .input_norm
+                    .rms_norm(&activations, sequence, hidden, self.config.rms_norm_eps)?;
+            let mut query = layer.q_proj.forward(&normalized, sequence)?;
+            let mut keys = layer.k_proj.forward(&normalized, sequence)?;
+            let values = layer.v_proj.forward(&normalized, sequence)?;
+            (query, keys) = cheetah::native::vulkan::rotary(
+                &query,
+                &keys,
+                sequence,
+                offset,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                self.config.head_dim,
+                self.config.rope_theta,
+            )?;
+            layer.kv.append(&keys, &values);
+            let attention = cheetah::native::vulkan::attention(
+                &query,
+                &layer.kv.keys,
+                &layer.kv.values,
+                sequence,
+                offset,
+                offset + sequence,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                self.config.sliding_window,
+            )?;
+            let attention = layer.o_proj.forward(&attention, sequence)?;
+            activations = cheetah::native::vulkan::add(&residual, &attention)?;
+
+            let residual = activations.clone();
+            let normalized = layer.post_attention_norm.rms_norm(
+                &activations,
+                sequence,
+                hidden,
+                self.config.rms_norm_eps,
+            )?;
+            let feed_forward = Self::forward_moe(
+                &mut self.context,
+                self.config.activation,
+                layer,
+                layer_index,
+                &normalized,
+                sequence,
+                hidden,
+            )?;
+            activations = cheetah::native::vulkan::add(&residual, &feed_forward)?;
+        }
+
+        let last = &activations[(sequence - 1) * hidden..sequence * hidden];
+        let normalized = self
+            .final_norm
+            .rms_norm(last, 1, hidden, self.config.rms_norm_eps)?;
+        self.lm_head
+            .linear(&normalized, 1, hidden, self.config.vocab_size)
+    }
+
+    /// The sparse feed-forward over `rows` positions: route every row through
+    /// `select_experts`, drive the residency through the shared context, run
+    /// one batched matmul per picked expert over its bucket rows, and scatter
+    /// the route-weighted outputs back.
+    fn forward_moe(
+        context: &mut VulkanForwardContext,
+        activation: crate::chat::vulkan::context::Activation,
+        layer: &mut MixtralVulkanLayer,
+        layer_index: usize,
+        input: &[f32],
+        rows: usize,
+        hidden_size: usize,
+    ) -> Result<Vec<f32>, String> {
+        let feed_forward = &mut layer.feed_forward;
+        let router_logits = feed_forward.router.forward(input, rows)?;
+        let mut output = vec![0.0; rows * hidden_size];
+        let mut selected_by_expert: Vec<Vec<(usize, f32)>> =
+            vec![Vec::new(); feed_forward.experts.len()];
+        for row in 0..rows {
+            let logits = &router_logits[row * feed_forward.experts.len()..(row + 1) * feed_forward.experts.len()];
+            for (expert_index, route_weight) in
+                select_experts(logits, feed_forward.num_experts_per_tok)?
+            {
+                selected_by_expert[expert_index].push((row, route_weight));
+            }
+        }
+        let resident: Vec<bool> = selected_by_expert
+            .iter()
+            .map(|selected_rows| !selected_rows.is_empty())
+            .collect();
+        context.sync_expert_residency(layer_index, &mut feed_forward.experts, &resident);
+
+        for (expert, selected_rows) in feed_forward
+            .experts
+            .iter_mut()
+            .zip(selected_by_expert.into_iter())
+        {
+            if selected_rows.is_empty() {
+                continue;
+            }
+            let mut expert_input = Vec::with_capacity(selected_rows.len() * hidden_size);
+            for (row, _) in &selected_rows {
+                expert_input.extend_from_slice(&input[row * hidden_size..(row + 1) * hidden_size]);
+            }
+            let gate = expert.gate.forward(&expert_input, selected_rows.len())?;
+            let up = expert.up.forward(&expert_input, selected_rows.len())?;
+            let activated = apply_activation(activation, &gate, &up)?;
+            let expert_output = expert.down.forward(&activated, selected_rows.len())?;
+            for (selected_index, (row, route_weight)) in selected_rows.into_iter().enumerate() {
+                let destination = &mut output[row * hidden_size..(row + 1) * hidden_size];
+                let start = selected_index * hidden_size;
+                for (out, value) in destination
+                    .iter_mut()
+                    .zip(&expert_output[start..start + hidden_size])
+                {
+                    *out += value * route_weight;
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// Ant bucketing: page one weight tensor between the GPU bucket and the
+    /// host-streaming bucket through the shared paging primitive.
+    fn page_weight(&mut self, unit_id: &str, resident: bool) -> bool {
+        let mut handled = false;
+        for layer in &mut self.layers {
+            for linear in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+                &mut layer.feed_forward.router,
+            ] {
+                if linear.name != unit_id {
+                    continue;
+                }
+                handled = true;
+                page_linear(linear, resident);
+            }
+            for expert in &mut layer.feed_forward.experts {
+                for linear in [&mut expert.gate, &mut expert.up, &mut expert.down] {
+                    if linear.name != unit_id {
+                        continue;
+                    }
+                    handled = true;
+                    page_linear(linear, resident);
+                }
+            }
+        }
+        handled
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl ModelForward for MixtralVulkanExecutor {
+    fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        MixtralVulkanExecutor::forward(self, tokens, offset)
+    }
+
+    fn clear_cache(&mut self) {
+        MixtralVulkanExecutor::clear_cache(self);
+    }
+
+    fn device_name(&self) -> &'static str {
+        "Vulkan"
+    }
+
+    fn as_ant_tier_control(&mut self) -> Option<&mut dyn AntTierControl> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl AntTierControl for MixtralVulkanExecutor {
+    fn page_in_unit(&mut self, unit_id: &str, _tier: i32) -> bool {
+        self.page_weight(unit_id, true)
+    }
+
+    fn evict_unit(&mut self, unit_id: &str) -> bool {
+        self.page_weight(unit_id, false)
+    }
 }
 
 #[cfg(all(test, feature = "vulkan"))]
