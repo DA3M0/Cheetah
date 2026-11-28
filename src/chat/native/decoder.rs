@@ -15,6 +15,7 @@
 //! - the native forward test suite (below), which drives the registration
 //!   files' runtime types against mmap fixtures and reference math.
 
+use super::ops::{self, RopeScaling};
 use super::store::MmapWeightStore;
 use serde_json::Value;
 
@@ -52,6 +53,9 @@ pub struct DecoderConfig {
     pub rms_eps: f32,
     /// Base frequency of the rotary embedding (`rope_theta`).
     pub rope_theta: f32,
+    /// Resolved RoPE frequency scaling from the config's `rope_scaling`
+    /// block (linear / llama3; other types error at resolution).
+    pub rope_scaling: RopeScaling,
     /// Whether the lm head reuses the embedding table instead of reading a
     /// separate `lm_head.weight` unit.
     pub tie_word_embeddings: bool,
@@ -413,6 +417,46 @@ impl DecoderConfig {
         } else {
             0
         };
+        // RoPE frequency scaling: linear and llama3 (NTK-by-parts) are
+        // supported; anything else fails loudly instead of silently rotating
+        // with the base theta.
+        let rope_scaling = match raw.and_then(|value| value.get("rope_scaling")) {
+            None | Some(Value::Null) => ops::RopeScaling::None,
+            Some(Value::Object(obj)) => {
+                let rope_type = obj
+                    .get("rope_type")
+                    .or_else(|| obj.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let factor = obj.get("factor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                match rope_type {
+                    "linear" => ops::RopeScaling::Linear { factor },
+                    "llama3" => ops::RopeScaling::Llama3 {
+                        factor,
+                        low_freq_factor: obj
+                            .get("low_freq_factor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(1.0) as f32,
+                        high_freq_factor: obj
+                            .get("high_freq_factor")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(4.0) as f32,
+                        original_max_position: obj
+                            .get("original_max_position_embeddings")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(8192) as usize,
+                    },
+                    other => {
+                        return Err(format!(
+                            "Native backend: rope_scaling type '{other}' is not supported (linear and llama3 are)."
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err("Native backend: rope_scaling must be an object.".into());
+            }
+        };
         // Hybrid attention: `sliding_window_pattern` (every Nth layer full)
         // or an explicit `layer_types` list (true = sliding). Both default to
         // absent, i.e. every layer uses the global window resolution.
@@ -511,6 +555,7 @@ impl DecoderConfig {
             vocab_size,
             rms_eps: field_f("rms_norm_eps").unwrap_or(family.rms_norm_eps) as f32,
             rope_theta: field_f("rope_theta").unwrap_or(family.rope_theta) as f32,
+            rope_scaling,
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
             sliding_window,
@@ -879,6 +924,7 @@ mod forward_tests {
             vocab_size: 32,
             rms_eps: 1e-5,
             rope_theta: 10_000.0,
+            rope_scaling: ops::RopeScaling::None,
             tie_word_embeddings: true,
             sliding_window,
             sliding_window_pattern: 0,
@@ -1414,6 +1460,7 @@ mod forward_tests {
             vocab_size: 32,
             rms_eps: 1e-5, // phi's layer_norm_eps
             rope_theta: 10_000.0,
+            rope_scaling: RopeScaling::None,
             tie_word_embeddings: false,
             sliding_window: 0,
             sliding_window_pattern: 0,

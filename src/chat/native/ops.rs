@@ -960,6 +960,64 @@ pub fn rope_in_place(
 /// a decode step used to run `powf` + `sin_cos` per head per dim (thousands
 /// of transcendental calls per token), while the angles depend only on the
 /// position and the frequency index.
+/// RoPE frequency scaling, resolved from the model config's `rope_scaling`
+/// block. `None` is the unscaled baseline. `Linear` divides every frequency
+/// by the factor (equivalently: rotate at position / factor). `Llama3`
+/// applies NTK-by-parts: the highest-frequency dimensions stay unscaled, the
+/// lowest are divided by the factor, and a smooth ramp blends in between —
+/// the llama-3.1/3.2/3.3 long-context recipe.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum RopeScaling {
+    #[default]
+    None,
+    Linear {
+        factor: f32,
+    },
+    Llama3 {
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_position: usize,
+    },
+}
+
+/// The per-index rotary frequencies for one head span under `scaling` — the
+/// single source of truth both backends consume (the native kernel rotates
+/// against this table; the Vulkan shader receives it through buffer b4).
+pub fn scaled_freqs(theta: f32, rotary_dim: usize, scaling: &RopeScaling) -> Vec<f32> {
+    let half = rotary_dim / 2;
+    (0..half)
+        .map(|index| {
+            let base = theta.powf(-2.0 * index as f32 / rotary_dim as f32);
+            match scaling {
+                RopeScaling::None => base,
+                RopeScaling::Linear { factor } => base / factor,
+                RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position,
+                } => {
+                    let wavelen = std::f32::consts::TAU / base;
+                    let high_wavelen =
+                        *original_max_position as f32 / high_freq_factor.max(f32::EPSILON);
+                    let low_wavelen =
+                        *original_max_position as f32 / low_freq_factor.max(f32::EPSILON);
+                    if wavelen < high_wavelen {
+                        base
+                    } else if wavelen > low_wavelen {
+                        base / factor
+                    } else {
+                        let smooth = (*original_max_position as f32 / wavelen - low_freq_factor)
+                            / (high_freq_factor - low_freq_factor);
+                        (1.0 - smooth) * base / factor + smooth * base
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
 pub fn rope_heads(
     values: &mut [f32],
     heads: usize,
@@ -968,7 +1026,33 @@ pub fn rope_heads(
     position: usize,
     theta: f32,
 ) {
-    rope_span_in_place(values, heads, head_dim, rotary_dim, position, theta);
+    rope_heads_scaled(values, heads, head_dim, rotary_dim, position, theta, &RopeScaling::None);
+}
+
+/// RoPE with a resolved scaling — the call the family forwards use.
+pub fn rope_heads_scaled(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    position: usize,
+    theta: f32,
+    scaling: &RopeScaling,
+) {
+    let half = rotary_dim / 2;
+    let freqs = scaled_freqs(theta, rotary_dim, scaling);
+    for head in 0..heads {
+        let base = head * head_dim;
+        for (index, &freq) in freqs.iter().enumerate() {
+            let angle = position as f32 * freq;
+            let (sin, cos) = angle.sin_cos();
+            let first = base + index;
+            let second = base + half + index;
+            let (a, b) = (values[first], values[second]);
+            values[first] = a * cos - b * sin;
+            values[second] = b * cos + a * sin;
+        }
+    }
 }
 
 /// Shared rotate-half kernel over `heads` heads of `head_dim`, rotating the
@@ -2710,6 +2794,41 @@ impl QuantState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// scaled_freqs: linear divides every frequency by the factor; llama3
+    /// NTK-by-parts leaves the highest-frequency dimension untouched, divides
+    /// the lowest, and blends a wavelen in the transition band.
+    #[test]
+    fn scaled_freqs_implements_linear_and_llama3() {
+        let theta = 10_000.0f32;
+        let rotary_dim = 4usize; // half = 2: freqs = 1.0, 0.01
+        let base = scaled_freqs(theta, rotary_dim, &RopeScaling::None);
+        assert_eq!(base, vec![1.0, 0.01]);
+
+        let linear = scaled_freqs(theta, rotary_dim, &RopeScaling::Linear { factor: 2.0 });
+        assert_eq!(linear, vec![0.5, 0.005]);
+
+        let llama3 = scaled_freqs(
+            1_000_000.0,
+            rotary_dim,
+            &RopeScaling::Llama3 {
+                factor: 8.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
+                original_max_position: 8192,
+            },
+        );
+        // Index 0: freq 1.0 → wavelen 2π < 2048 (high band) → unscaled.
+        assert_eq!(llama3[0], 1.0);
+        // Index 1: base 1e-3 → wavelen 2π·1000 ≈ 6283, inside the band
+        // [2048, 8192] → smooth blend. Compare against the closed form.
+        let base1 = 1e-3f32;
+        let wavelen = std::f32::consts::TAU / base1;
+        let smooth = (8192.0 / wavelen - 1.0) / (4.0 - 1.0);
+        let expected = (1.0 - smooth) * base1 / 8.0 + smooth * base1;
+        assert!((llama3[1] - expected).abs() < expected.abs() * 1e-6);
+    }
+
 
     #[test]
     fn bf16_widening_matches_bit_shift() {

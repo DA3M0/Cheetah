@@ -328,21 +328,23 @@ impl GemmaNative {
         self.chunk.attn_out.resize(rows * q_dim, 0.0);
         for row in 0..rows {
             let position = offset + row;
-            ops::rope_heads(
+            ops::rope_heads_scaled(
                 &mut self.chunk.q[row * q_dim..(row + 1) * q_dim],
                 cfg.q_heads,
                 cfg.head_dim,
                 cfg.rotary_dim,
                 position,
                 cfg.rope_theta,
+            &cfg.rope_scaling,
             );
-            ops::rope_heads(
+            ops::rope_heads_scaled(
                 &mut self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
                 cfg.kv_heads,
                 cfg.head_dim,
                 cfg.rotary_dim,
                 position,
                 cfg.rope_theta,
+            &cfg.rope_scaling,
             );
             self.ctx.cache_append(
                 layer,
@@ -533,21 +535,23 @@ impl GemmaNative {
             .add_bias(&mut self.scratch.v, &format!("{prefix}self_attn.v_proj"));
 
         // Rotate-half rope over the full head span of every head.
-        ops::rope_heads(
+        ops::rope_heads_scaled(
             &mut self.scratch.q,
             cfg.q_heads,
             cfg.head_dim,
             cfg.rotary_dim,
             position,
             cfg.rope_theta,
+        &cfg.rope_scaling,
         );
-        ops::rope_heads(
+        ops::rope_heads_scaled(
             &mut self.scratch.k,
             cfg.kv_heads,
             cfg.head_dim,
             cfg.rotary_dim,
             position,
             cfg.rope_theta,
+        &cfg.rope_scaling,
         );
 
         // Append K/V to the cache for this position, then GQA attention over
