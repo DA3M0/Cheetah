@@ -26,23 +26,6 @@ use serde_json::Value;
 /// concrete: there are no optional values, so the forward pass never has to
 /// re-derive shapes or re-read JSON. Cloning is cheap (only the feature and
 /// layout tags are copyable metadata; there are no heap allocations).
-/// Gated-delta-net layer geometry (Qwen3.5 linear-attention layers).
-/// Intentionally unconsumed until the Qwen3.5 forward lands (1.4, next step).
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct GatedDeltaDims {
-    pub num_key_heads: usize,
-    pub num_value_heads: usize,
-    pub key_head_dim: usize,
-    pub value_head_dim: usize,
-    pub conv_kernel: usize,
-}
-
-/// The resolved decoder configuration for one checkpoint: every dimension
-/// and behavior tag the native forward needs, derived through the
-/// config → manifest → family fallback chain. Clone is cheap (only the
-/// feature and layout tags are copyable metadata; there are no heap
-/// allocations).
 #[derive(Clone)]
 pub struct DecoderConfig {
     /// Width of the residual stream; also the embedding row length and the
@@ -96,19 +79,6 @@ pub struct DecoderConfig {
     /// it is required to be nonzero whenever `num_local_experts` is nonzero,
     /// because tensor shapes cannot carry this value.
     pub num_experts_per_tok: usize,
-    /// Qwen3.5-style gated-delta-net dimensions, resolved from the config's
-    /// `linear_*` fields; present only when the checkpoint declares them.
-    /// Consumed by the Qwen3.5 forward (1.4, next step).
-    #[allow(dead_code)]
-    pub gated_delta: Option<GatedDeltaDims>,
-    /// Per-layer kinds from `layer_types` (`true` = linear-attention layer).
-    /// `None` when the checkpoint has none (every layer is full attention).
-    #[allow(dead_code)]
-    pub linear_attn_layers: Option<Vec<bool>>,
-    /// Attention output gate: `q_proj` emits 2× per-head span and the
-    /// attention output is multiplied by `sigmoid(gate)` before `o_proj`.
-    #[allow(dead_code)]
-    pub attn_output_gate: bool,
     /// Resolved rotary span per head: `head_dim` for full rope (llama-shaped
     /// families), the `partial_rotary_factor * head_dim` share for phi-style
     /// partial rotary. Rope applies to the leading `rotary_dim` dims only.
@@ -513,31 +483,6 @@ impl DecoderConfig {
         // or an explicit `layer_types` list (true = sliding). Both default to
         // absent, i.e. every layer uses the global window resolution.
         let sliding_window_pattern = field_u("sliding_window_pattern").unwrap_or(0);
-        // Gated-delta-net geometry (Qwen3.5 linear-attention layers): the
-        // checkpoint's `linear_*` fields declare the head layout; the layer
-        // kinds come from `layer_types` ("linear_attention" vs
-        // "full_attention").
-        let gated_delta = field_u("linear_key_head_dim").map(|key_head_dim| GatedDeltaDims {
-            key_head_dim,
-            value_head_dim: field_u("linear_value_head_dim").unwrap_or(key_head_dim),
-            num_key_heads: field_u("linear_num_key_heads").unwrap_or(1),
-            num_value_heads: field_u("linear_num_value_heads").unwrap_or(1),
-            conv_kernel: field_u("linear_conv_kernel_dim").unwrap_or(4),
-        });
-        let linear_attn_layers = raw
-            .and_then(|value| {
-                value
-                    .get("layer_types")
-                    .or_else(|| value.get("text_config").and_then(|tc| tc.get("layer_types")))
-            })
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| entry.as_str() == Some("linear_attention"))
-                    .collect()
-            });
-        let attn_output_gate = field_b("attn_output_gate").unwrap_or(false);
         let layer_types = raw
             .and_then(|value| value.get("layer_types"))
             .and_then(Value::as_array)
@@ -633,9 +578,6 @@ impl DecoderConfig {
             rms_eps: field_f("rms_norm_eps").unwrap_or(family.rms_norm_eps) as f32,
             rope_theta: field_f("rope_theta").unwrap_or(family.rope_theta) as f32,
             rope_scaling,
-            gated_delta,
-            linear_attn_layers,
-            attn_output_gate,
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
             sliding_window,
@@ -1009,9 +951,6 @@ mod forward_tests {
             rms_eps: 1e-5,
             rope_theta: 10_000.0,
             rope_scaling: ops::RopeScaling::None,
-            gated_delta: None,
-            linear_attn_layers: None,
-            attn_output_gate: false,
             tie_word_embeddings: true,
             sliding_window,
             sliding_window_pattern: 0,
@@ -1548,9 +1487,6 @@ mod forward_tests {
             rms_eps: 1e-5, // phi's layer_norm_eps
             rope_theta: 10_000.0,
             rope_scaling: RopeScaling::None,
-            gated_delta: None,
-            linear_attn_layers: None,
-            attn_output_gate: false,
             tie_word_embeddings: false,
             sliding_window: 0,
             sliding_window_pattern: 0,
