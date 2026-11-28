@@ -958,7 +958,7 @@ impl LlamaVulkanExecutor {
             false,
         )?;
 
-        for layer in &mut self.layers {
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             let residual = activations.clone();
             let normalized =
                 layer
@@ -989,7 +989,7 @@ impl LlamaVulkanExecutor {
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
                 self.config.head_dim,
-                self.config.sliding_window,
+                self.config.window_for_layer(layer_index),
             )?;
             let attention = layer.o_proj.forward(&attention, sequence)?;
             activations = cheetah::native::vulkan::add(&residual, &attention)?;

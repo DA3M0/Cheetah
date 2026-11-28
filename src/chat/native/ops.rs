@@ -2183,12 +2183,14 @@ impl OpsToolbox {
         let scale = 1.0 / (self.cfg.head_dim as f32).sqrt();
         // Sparse (sliding-window) attention: the query at `position` only
         // sees keys from `end - window` onward (`end` is one past this
-        // position), matching the Vulkan attention shader.
+        // position), matching the Vulkan attention shader. The window
+        // resolves per layer (hybrid pattern / explicit layer_types).
         // window == 0 attends to the whole cache.
-        let window_start = if self.cfg.sliding_window == 0 {
+        let window = self.cfg.window_for_layer(layer);
+        let window_start = if window == 0 {
             0
         } else {
-            (position + 1).saturating_sub(self.cfg.sliding_window)
+            (position + 1).saturating_sub(window)
         };
         // Never start past the cache: an all-masked softmax would be NaN.
         let window_start = window_start.min(cache_len.saturating_sub(1));

@@ -723,9 +723,9 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   chunks the sparse block per picked expert (one batched gate/up/down GEMM
   triple per expert bucket, rows accumulated in score order so the result is
   bit-exact against the per-position path).
-- Sliding-window attention is a single global window resolved per config;
-  per-layer alternating windows (gemma-2-style hybrid attention) are not
-  supported.
+- Sliding-window attention resolves per layer: `sliding_window_pattern`
+  (every Nth layer full attention) and explicit `layer_types` lists are
+  supported on both backends.
 - MoE routing-aware offload (per-expert residency) is implemented as of RC2-B:
   both backends now track per-(layer, expert) residency from the router's
   expert selections. The native runner pages in freshly selected experts and

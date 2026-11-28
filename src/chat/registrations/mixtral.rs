@@ -1276,7 +1276,7 @@ impl MixtralVulkanExecutor {
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
                 self.config.head_dim,
-                self.config.sliding_window,
+                self.config.window_for_layer(layer_index),
             )?;
             let attention = layer.o_proj.forward(&attention, sequence)?;
             activations = cheetah::native::vulkan::add(&residual, &attention)?;

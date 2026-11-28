@@ -396,7 +396,9 @@ the resolution metadata the parameter fallback chain probes.
 
 Sparse (sliding-window) attention and MoE routing are backend-agnostic: both
 runners resolve `use_sliding_window` / `sliding_window` the same way (`false`
-or `0` → attend to the whole cache) and route experts with
+or `0` → attend to the whole cache), resolve the window **per layer**
+(`sliding_window_pattern`: every Nth layer full attention, or an explicit
+`layer_types` list — hybrid gemma-2/3-style attention) and route experts with
 `chat::moe::select_experts` (softmax → top-k → renormalize).
 
 **Cheetah is decoder-only and text-only by design.** Every registered family

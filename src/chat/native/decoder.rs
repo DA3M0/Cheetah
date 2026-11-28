@@ -60,6 +60,14 @@ pub struct DecoderConfig {
     /// which is what an absent `sliding_window` or a config that sets
     /// `use_sliding_window: false` resolves to.
     pub sliding_window: usize,
+    /// Hybrid-attention pattern (HF `sliding_window_pattern`): every Nth
+    /// layer attends to the whole cache while the layers between use the
+    /// window. 0 disables the pattern (every layer uses `sliding_window`).
+    pub sliding_window_pattern: usize,
+    /// Explicit per-layer window kinds (HF `layer_types`, `true` = sliding):
+    /// when present it overrides the pattern; a layer past the list falls
+    /// back to the pattern/global resolution.
+    pub layer_types: Option<Vec<bool>>,
     /// Number of experts in every sparse feed-forward block. Zero means the
     /// model is dense and the family's dense MLP path runs.
     pub num_local_experts: usize,
@@ -245,6 +253,22 @@ pub const PHI_FEATURES: DenseFeatures = DenseFeatures {
 /// Config resolution: turn the optional model config.json plus the units
 /// manifest into a complete `DecoderConfig`.
 impl DecoderConfig {
+    /// The sliding window for one layer: an explicit `layer_types` entry wins
+    /// (true = window), then the hybrid pattern (every
+    /// `sliding_window_pattern`-th layer is full attention), then the global
+    /// window (0 = the whole cache).
+    pub fn window_for_layer(&self, layer: usize) -> usize {
+        if let Some(layer_types) = &self.layer_types
+            && let Some(&sliding) = layer_types.get(layer)
+        {
+            return if sliding { self.sliding_window } else { 0 };
+        }
+        if self.sliding_window_pattern > 1 && (layer + 1) % self.sliding_window_pattern == 0 {
+            return 0;
+        }
+        self.sliding_window
+    }
+
     /// Resolve the configuration through the parameter fallback chain:
     /// explicit config fields, then derivation from the units manifest's
     /// tensor shapes, then the registered family constants. This keeps the
@@ -389,6 +413,19 @@ impl DecoderConfig {
         } else {
             0
         };
+        // Hybrid attention: `sliding_window_pattern` (every Nth layer full)
+        // or an explicit `layer_types` list (true = sliding). Both default to
+        // absent, i.e. every layer uses the global window resolution.
+        let sliding_window_pattern = field_u("sliding_window_pattern").unwrap_or(0);
+        let layer_types = raw
+            .and_then(|value| value.get("layer_types"))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.as_str() != Some("full_attention"))
+                    .collect()
+            });
 
         // Head layout. When the config declares the query head count, derive
         // head_dim and kv_heads around it; otherwise consult the family's
@@ -477,6 +514,8 @@ impl DecoderConfig {
             tie_word_embeddings: field_b("tie_word_embeddings")
                 .unwrap_or(family.tie_word_embeddings),
             sliding_window,
+            sliding_window_pattern,
+            layer_types,
             num_local_experts,
             num_experts_per_tok,
             moe_layout,
@@ -804,6 +843,30 @@ mod forward_tests {
         .unwrap();
     }
 
+    /// 逐层窗口解析：显式 layer_types 优先，其次混合 pattern（每 N 层一个
+    /// 全注意力层），否则全局窗口。
+    #[test]
+    fn sliding_window_resolves_per_layer() {
+        let mut cfg = dense_config(32);
+        assert_eq!(cfg.window_for_layer(0), 32);
+        assert_eq!(cfg.window_for_layer(5), 32);
+
+        cfg.sliding_window_pattern = 2;
+        assert_eq!(cfg.window_for_layer(0), 32);
+        assert_eq!(cfg.window_for_layer(1), 0);
+        assert_eq!(cfg.window_for_layer(2), 32);
+
+        cfg.sliding_window_pattern = 6;
+        assert_eq!(cfg.window_for_layer(4), 32);
+        assert_eq!(cfg.window_for_layer(5), 0);
+
+        cfg.layer_types = Some(vec![true, false, true]);
+        assert_eq!(cfg.window_for_layer(0), 32);
+        assert_eq!(cfg.window_for_layer(1), 0);
+        assert_eq!(cfg.window_for_layer(2), 32);
+        assert_eq!(cfg.window_for_layer(5), 0);
+    }
+
     fn dense_config(sliding_window: usize) -> DecoderConfig {
         DecoderConfig {
             hidden_size: 8,
@@ -818,6 +881,8 @@ mod forward_tests {
             rope_theta: 10_000.0,
             tie_word_embeddings: true,
             sliding_window,
+            sliding_window_pattern: 0,
+            layer_types: None,
             num_local_experts: 0,
             num_experts_per_tok: 0,
             moe_layout: MoEExpertLayout::MIXTRAL,
@@ -828,6 +893,8 @@ mod forward_tests {
     fn moe_config(num_experts_per_tok: usize) -> DecoderConfig {
         DecoderConfig {
             sliding_window: 0,
+            sliding_window_pattern: 0,
+            layer_types: None,
             num_local_experts: 2,
             num_experts_per_tok,
             ..dense_config(0)
@@ -1349,6 +1416,8 @@ mod forward_tests {
             rope_theta: 10_000.0,
             tie_word_embeddings: false,
             sliding_window: 0,
+            sliding_window_pattern: 0,
+            layer_types: None,
             num_local_experts: 0,
             num_experts_per_tok: 0,
             moe_layout: MoEExpertLayout::MIXTRAL,

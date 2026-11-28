@@ -24,6 +24,12 @@ pub(crate) struct VulkanTransformerConfig {
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     pub(crate) sliding_window: usize,
+    /// Hybrid-attention pattern (HF `sliding_window_pattern`): every Nth
+    /// layer attends to the whole cache; 0 disables the pattern.
+    pub(crate) sliding_window_pattern: usize,
+    /// Explicit per-layer window kinds (HF `layer_types`, true = sliding);
+    /// overrides the pattern when present.
+    pub(crate) layer_types: Option<Vec<bool>>,
     pub(crate) activation: Activation,
     pub(crate) features: TransformerFeatures,
 }
@@ -124,6 +130,22 @@ pub(crate) enum TransformerFeedForwardFeatures {
 }
 
 impl VulkanTransformerConfig {
+    /// The sliding window for one layer: an explicit `layer_types` entry wins
+    /// (true = window), then the hybrid pattern (every
+    /// `sliding_window_pattern`-th layer is full attention), then the global
+    /// window (0 = the whole cache).
+    pub(crate) fn window_for_layer(&self, layer: usize) -> usize {
+        if let Some(layer_types) = &self.layer_types
+            && let Some(&sliding) = layer_types.get(layer)
+        {
+            return if sliding { self.sliding_window } else { 0 };
+        }
+        if self.sliding_window_pattern > 1 && (layer + 1) % self.sliding_window_pattern == 0 {
+            return 0;
+        }
+        self.sliding_window
+    }
+
     /// Config parsing + validation: derives `head_dim` and the kv-head count,
     /// applies family defaults, honors `use_sliding_window`, maps `hidden_act`,
     /// and fails loudly on rope scaling, inconsistent MoE counts, or any
@@ -191,6 +213,22 @@ impl VulkanTransformerConfig {
         } else {
             0
         };
+        // Hybrid attention: `sliding_window_pattern` (every Nth layer full)
+        // or an explicit `layer_types` list (true = sliding); both default to
+        // absent, i.e. every layer uses the global window resolution.
+        let sliding_window_pattern = raw
+            .get("sliding_window_pattern")
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| "sliding_window_pattern does not fit usize.".to_string())?
+            .unwrap_or(0);
+        let layer_types = raw.get("layer_types").and_then(Value::as_array).map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.as_str() != Some("full_attention"))
+                .collect()
+        });
         let activation = match raw.get("hidden_act").and_then(Value::as_str) {
             Some("silu") => Activation::Silu,
             Some("gelu") => Activation::Gelu,
@@ -255,6 +293,8 @@ impl VulkanTransformerConfig {
             rms_norm_eps,
             rope_theta,
             sliding_window,
+            sliding_window_pattern,
+            layer_types,
             activation,
             features,
         })
@@ -264,9 +304,7 @@ impl VulkanTransformerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::collections::BTreeMap;
-    use super::super::weights::WeightData;
+    use crate::chat::vulkan::weights::WeightData;
 
     #[test]
     fn parses_common_and_moe_transformer_configurations() {
@@ -335,6 +373,53 @@ mod tests {
     }
 
     #[test]
+    fn sliding_window_resolves_per_layer() {
+        let raw = serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 12,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+            "hidden_act": "silu",
+            "sliding_window": 32
+        });
+        // No pattern: every layer uses the global window.
+        let config =
+            VulkanTransformerConfig::from_raw(&raw, TransformerFeatures::standard("Global"))
+                .unwrap();
+        assert_eq!(config.window_for_layer(0), 32);
+        assert_eq!(config.window_for_layer(5), 32);
+
+        // Hybrid pattern: every 2nd layer is full attention (gemma-2 shape).
+        let features = TransformerFeatures::standard("Patterned");
+        let mut raw_pattern = raw.clone();
+        raw_pattern["sliding_window_pattern"] = serde_json::json!(2);
+        let config = VulkanTransformerConfig::from_raw(&raw_pattern, features.clone()).unwrap();
+        assert_eq!(config.window_for_layer(0), 32);
+        assert_eq!(config.window_for_layer(1), 0);
+        assert_eq!(config.window_for_layer(2), 32);
+
+        // Every 6th layer full (gemma-3 shape).
+        raw_pattern["sliding_window_pattern"] = serde_json::json!(6);
+        let config = VulkanTransformerConfig::from_raw(&raw_pattern, features.clone()).unwrap();
+        assert_eq!(config.window_for_layer(4), 32);
+        assert_eq!(config.window_for_layer(5), 0);
+
+        // Explicit layer_types override the pattern (true = sliding).
+        raw_pattern["layer_types"] = serde_json::json!(
+            ["sliding_attention", "full_attention", "sliding_attention"]
+        );
+        let config = VulkanTransformerConfig::from_raw(&raw_pattern, features).unwrap();
+        assert_eq!(config.window_for_layer(0), 32);
+        assert_eq!(config.window_for_layer(1), 0);
+        assert_eq!(config.window_for_layer(2), 32);
+        // Layers past the list fall back to the pattern resolution.
+        assert_eq!(config.window_for_layer(5), 0);
+    }
+
+    #[test]
     #[ignore = "requires a Vulkan compute device"]
     fn linear_splits_large_sequences_into_bounded_row_tiles() {
         cheetah::native::vulkan::initialize().unwrap();
@@ -351,7 +436,6 @@ mod tests {
 
 #[cfg(test)]
 mod q8_tests {
-    use super::*;
 
     /// CHEETAH_QUANT_Q8=1 + a synthetic BF16 decoder: the Vulkan executor's
     /// q8-quantized output must stay finite and terminate (a hang here means
