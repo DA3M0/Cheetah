@@ -10,7 +10,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use super::context::{Expert, GpuKvCache, VulkanForwardContext, page_linear};
+use super::context::{
+    Activation, Expert, GpuKvCache, VulkanForwardContext, apply_activation, page_linear,
+    validate_sequence,
+};
 use super::required_usize;
 use super::weights::{
     Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight, validate_shape,
@@ -18,18 +21,18 @@ use super::weights::{
 
 #[derive(Clone, Debug)]
 pub(crate) struct VulkanTransformerConfig {
-    vocab_size: usize,
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
     pub(crate) head_dim: usize,
-    max_position_embeddings: usize,
-    rms_norm_eps: f32,
-    rope_theta: f32,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
     pub(crate) sliding_window: usize,
-    activation: Activation,
+    pub(crate) activation: Activation,
     pub(crate) features: TransformerFeatures,
 }
 
@@ -126,13 +129,6 @@ pub(crate) enum TransformerFeedForwardFeatures {
         /// Experts routed per token; `0` disables routing (dense).
         num_experts_per_tok: usize,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Activation {
-    Silu,
-    Gelu,
-    NewGelu,
 }
 
 impl VulkanTransformerConfig {
@@ -374,16 +370,6 @@ impl FeedForward {
                 Ok(output)
             }
         }
-    }
-}
-
-/// Applies the configured activation (silu / gelu / tanh-gelu) to the
-/// gate·up pair as one shader call.
-fn apply_activation(activation: Activation, gate: &[f32], up: &[f32]) -> Result<Vec<f32>, String> {
-    match activation {
-        Activation::Silu => cheetah::native::vulkan::silu_mul(gate, up),
-        Activation::Gelu => cheetah::native::vulkan::gelu_mul(gate, up, false),
-        Activation::NewGelu => cheetah::native::vulkan::gelu_mul(gate, up, true),
     }
 }
 
@@ -703,39 +689,21 @@ impl VulkanTransformerExecutor {
     /// (sliding window) → o_proj → residual → post norm → feed-forward →
     /// residual; final norm + lm head on the last position.
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
-        let sequence = tokens.len();
-        if sequence == 0 {
-            return Err(format!(
-                "Vulkan {} requires a non-empty token sequence.",
-                self.config.features.model_name
-            ));
-        }
-        let last_position = offset
-            .checked_add(sequence)
-            .ok_or_else(|| "Vulkan transformer sequence position overflow.".to_string())?;
-        if last_position > self.config.max_position_embeddings {
-            return Err("Vulkan transformer input exceeds max_position_embeddings.".into());
-        }
-        let expected_cache = offset
-            .checked_mul(self.config.num_key_value_heads)
-            .and_then(|count| count.checked_mul(self.config.head_dim))
-            .ok_or_else(|| "Vulkan transformer cache size overflow.".to_string())?;
-        if self
+        let cached_elements = self
             .layers
             .first()
-            .is_some_and(|layer| layer.kv.keys.len() != expected_cache)
-        {
-            return Err(
-                "Vulkan transformer KV cache position does not match the input offset.".into(),
-            );
-        }
+            .map(|layer| layer.kv.keys.len())
+            .unwrap_or(0);
+        let sequence = validate_sequence(
+            tokens,
+            offset,
+            self.config.vocab_size,
+            self.config.max_position_embeddings,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            cached_elements,
+        )?;
         let hidden = self.config.hidden_size;
-        for token_id in tokens {
-            let token = *token_id as usize;
-            if token >= self.config.vocab_size {
-                return Err(format!("Token ID {token} exceeds the model vocabulary."));
-            }
-        }
         // Ant op 8: embedding gather runs as a Vulkan shader — the host loop
         // only validates token ids against the vocabulary.
         let (table_ptr, table_format, table_elements) = self.embedding.ffi_parts();

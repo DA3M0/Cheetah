@@ -11,6 +11,70 @@ use std::collections::HashMap;
 
 use super::weights::{Linear, upload_slot};
 
+/// The gate·up activation a feed-forward applies, as resolved from the
+/// model config's `hidden_act`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Activation {
+    Silu,
+    Gelu,
+    NewGelu,
+}
+
+/// Applies the configured activation (silu / gelu / tanh-gelu) to the
+/// gate·up pair as one shader call.
+pub(crate) fn apply_activation(
+    activation: Activation,
+    gate: &[f32],
+    up: &[f32],
+) -> Result<Vec<f32>, String> {
+    match activation {
+        Activation::Silu => cheetah::native::vulkan::silu_mul(gate, up),
+        Activation::Gelu => cheetah::native::vulkan::gelu_mul(gate, up, false),
+        Activation::NewGelu => cheetah::native::vulkan::gelu_mul(gate, up, true),
+    }
+}
+
+/// Sequence-level input validation shared by every transformer executor:
+/// non-empty ids, vocabulary bounds, position limits, and cache/offset
+/// consistency (`cached_elements` is the per-layer KV element count). The
+/// error strings are part of the surface — keep them identical when touching.
+pub(crate) fn validate_sequence(
+    tokens: &[u32],
+    offset: usize,
+    vocab_size: usize,
+    max_position_embeddings: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    cached_elements: usize,
+) -> Result<usize, String> {
+    let sequence = tokens.len();
+    if sequence == 0 {
+        return Err("Vulkan transformer requires a non-empty token sequence.".into());
+    }
+    let last_position = offset
+        .checked_add(sequence)
+        .ok_or_else(|| "Vulkan transformer sequence position overflow.".to_string())?;
+    if last_position > max_position_embeddings {
+        return Err("Vulkan transformer input exceeds max_position_embeddings.".into());
+    }
+    let expected_cache = offset
+        .checked_mul(kv_heads)
+        .and_then(|count| count.checked_mul(head_dim))
+        .ok_or_else(|| "Vulkan transformer cache size overflow.".to_string())?;
+    if cached_elements != expected_cache {
+        return Err(
+            "Vulkan transformer KV cache position does not match the input offset.".into(),
+        );
+    }
+    for token_id in tokens {
+        let token = *token_id as usize;
+        if token >= vocab_size {
+            return Err(format!("Token ID {token} exceeds the model vocabulary."));
+        }
+    }
+    Ok(sequence)
+}
+
 /// Ant bucketing for one weight tensor: page it between the GPU bucket
 /// (persistent upload) and the host-streaming bucket. The host copy in
 /// `WeightData` is always authoritative, so eviction only releases the

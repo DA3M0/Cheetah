@@ -639,7 +639,7 @@ fn phi_vulkan_loader(
 #[cfg(feature = "vulkan")]
 use crate::chat::vulkan::required_usize;
 #[cfg(feature = "vulkan")]
-use crate::chat::vulkan::transformer::Activation;
+use crate::chat::vulkan::context::Activation;
 #[cfg(feature = "vulkan")]
 use crate::chat::vulkan::weights::{
     Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight,
