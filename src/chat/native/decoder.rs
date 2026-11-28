@@ -2045,6 +2045,51 @@ mod forward_tests {
             phi_config,
         );
     }
+
+    /// mixtral 批量 prefill parity：MoE 前向的批量路径（路由批量 GEMM +
+    /// 按专家分桶的批量 gate/up/down + 逐行按 score 顺序累加）必须与逐位置
+    /// 路径比特一致。k=2 让每行都选两个专家（考验逐行累加顺序），k=1 只选
+    /// 一个（考验分桶 scatter）；两种路由形态都要过。
+    #[test]
+    fn mixtral_chunked_prefill_matches_per_position_bit_exact() {
+        let tokens: Vec<u32> = (0..53u32).map(|i| (i * 7 + 3) % 32).collect();
+        for num_experts_per_tok in [1, 2] {
+            let fixture = Fixture::new("mixtral_chunk", FeedForward::SparseMoE, true);
+            let cfg = moe_config(num_experts_per_tok);
+
+            // 批量路径：chunk=16（尾块 5）一次 prefill。
+            let mut batched = MixtralNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+            let logits_batched = batched
+                .forward_with_chunk(&tokens, 0, 16)
+                .unwrap_or_else(|e| panic!("k={num_experts_per_tok} batched forward: {e}"));
+
+            // 逐位置基准：同一台 decoder 上单 token forward 累积 KV。
+            let mut per_position =
+                MixtralNative::with_store(cfg.clone(), Arc::clone(&fixture.store));
+            let mut logits_per_position = Vec::new();
+            for (index, &token) in tokens.iter().enumerate() {
+                logits_per_position = per_position.forward(&[token], index).unwrap();
+            }
+            assert_eq!(
+                logits_batched, logits_per_position,
+                "k={num_experts_per_tok}: 批量 prefill 必须与逐位置 prefill 比特一致"
+            );
+
+            // 非零 offset：前 5 个位置逐位置 prefill 后，其余以 chunk=8 批量续算。
+            let mut prefix_then_chunk =
+                MixtralNative::with_store(cfg, Arc::clone(&fixture.store));
+            for (index, &token) in tokens[..5].iter().enumerate() {
+                prefix_then_chunk.forward(&[token], index).unwrap();
+            }
+            let logits_mixed = prefix_then_chunk
+                .forward_with_chunk(&tokens[5..], 5, 8)
+                .unwrap_or_else(|e| panic!("k={num_experts_per_tok} mixed forward: {e}"));
+            assert_eq!(
+                logits_mixed, logits_per_position,
+                "k={num_experts_per_tok}: 前缀逐位置 + 批量续算必须与全量逐位置比特一致"
+            );
+        }
+    }
     // --- 一次性性能分解基准（`cargo test --release bench_prefill -- --ignored --nocapture`）---
 
     /// 分别计时 FFN 形状的 gemm、逐 token gemv 批次与 1400 上下文的
@@ -2142,6 +2187,92 @@ mod forward_tests {
         println!(
             "attention @1400 keys: {attn_s:.6}s per call = {:.1} GMACs/s effective",
             attn_macs / attn_s / 1e9
+        );
+    }
+
+    /// MoE prefill 的分桶收益基准：旧路径（逐 token × 逐选中专家的 gemv）
+    /// 对比新路径（每专家一个按桶行的 gemm），Mixtral-8x7B 比例的 FFN 形状
+    /// （intermediate 6144 / hidden 2048，256 token、top-2、8 专家 → 每桶
+    /// 平均 64 行）。MAC 总量相同，差异只在 gemm 对 gemv 的效率。
+    #[test]
+    #[ignore]
+    fn bench_moe_prefill_buckets() {
+        let intermediate = 6144usize;
+        let hidden = 2048usize;
+        let n = 256usize;
+        let top_k = 2usize;
+        let experts = 8usize;
+
+        // 一个 bf16 权重矩阵 [intermediate, hidden]，三个投影共用形状计时。
+        let mut weight = Vec::with_capacity(intermediate * hidden * 2);
+        let mut state = 0x9e3779b9u32;
+        for _ in 0..intermediate * hidden {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let value = ((state >> 16) as f32 / u16::MAX as f32 - 0.5) / 16.0;
+            let bits = (value.to_bits() >> 16) as u16;
+            weight.extend_from_slice(&bits.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..n * hidden)
+            .map(|index| ((index % 31) as f32 - 15.0) / 32.0)
+            .collect();
+        let mut y = vec![0f32; n * intermediate];
+        let bf16 = crate::chat::native::store::WeightDType::Bf16;
+        let macs = (intermediate * hidden * n * top_k) as f64;
+        let rounds = 5;
+
+        // 旧路径：每个 token 对它的 top-k 个专家各跑一次 gemv。
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for token in 0..n {
+                for _ in 0..top_k {
+                    ops::gemv(
+                        &weight,
+                        bf16,
+                        intermediate,
+                        hidden,
+                        &x[token * hidden..(token + 1) * hidden],
+                        &mut y[token * intermediate..(token + 1) * intermediate],
+                    );
+                }
+            }
+        }
+        let old_s = started.elapsed().as_secs_f64() / rounds as f64;
+        println!(
+            "old per-token gemv ({n} tok × top-{top_k}): {old_s:.4}s = {:.1} GMACs/s",
+            macs / old_s / 1e9
+        );
+
+        // 新路径：每专家一个 gemm，桶行数 = n·k/experts（均匀路由假设）。
+        // 先把桶行 gather 进连续缓冲，再一次 gemm——与实现的桶路径同构。
+        let bucket = n * top_k / experts;
+        let mut bucket_x = vec![0f32; bucket * hidden];
+        let mut bucket_y = vec![0f32; bucket * intermediate];
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for expert in 0..experts {
+                // 桶行从同一 token 池取（演示用；真实实现按选中关系 gather）。
+                let start_row = expert * bucket % n;
+                for (index, i) in (0..bucket).enumerate() {
+                    let src = (start_row + i) % n;
+                    bucket_x[index * hidden..(index + 1) * hidden]
+                        .copy_from_slice(&x[src * hidden..(src + 1) * hidden]);
+                }
+                ops::gemm(
+                    &weight,
+                    bf16,
+                    intermediate,
+                    hidden,
+                    &bucket_x,
+                    bucket,
+                    &mut bucket_y,
+                );
+            }
+        }
+        let new_s = started.elapsed().as_secs_f64() / rounds as f64;
+        println!(
+            "new per-expert gemm ({experts} buckets × {bucket} rows): {new_s:.4}s = {:.1} GMACs/s ({:.2}x)",
+            macs / new_s / 1e9,
+            old_s / new_s
         );
     }
 }

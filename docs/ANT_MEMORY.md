@@ -718,10 +718,11 @@ on GPU): GT 730M 0.3 tok/s, Lavapipe and Haswell iGPU verified functionally.
   since before RC4 and unrelated to the registration layer. Synthetic-model
   Vulkan runs and the native backend are unaffected.
 - Chunked prefill (batched-GEMM passes over prompt-token chunks,
-  `CHEETAH_PREFILL_CHUNK`) is implemented for the dense families — each dense
-  registration file carries its own `forward_chunked` path. Mixtral still
-  walks positions sequentially (the sparse MoE block has no batched
-  feed-forward yet on native), so MoE prefill does not benefit from chunking.
+  `CHEETAH_PREFILL_CHUNK`) is implemented for every family — each dense
+  registration file carries its own `forward_chunked` path, and mixtral's
+  chunks the sparse block per picked expert (one batched gate/up/down GEMM
+  triple per expert bucket, rows accumulated in score order so the result is
+  bit-exact against the per-position path).
 - Sliding-window attention is a single global window resolved per config;
   per-layer alternating windows (gemma-2-style hybrid attention) are not
   supported.

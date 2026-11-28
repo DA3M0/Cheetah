@@ -120,7 +120,8 @@ Q8 stores one int8 code per element plus one f32 scale per `(position,
 kv_head)`, and snapshots keep that quantized form, so both live cache and
 prefix cache shrink roughly 4× while attention expands codes on the fly.
 Backends without KV snapshot support (Vulkan, currently) simply never
-reuse; mixtral does not batch its sparse feed-forward yet. Known limitation:
+reuse; mixtral's sparse feed-forward buckets its chunk rows per picked expert
+(batched per-expert GEMMs, bit-exact vs the per-position path). Known limitation:
 with `CHEETAH_QUANT_Q8`/`Q4`, quantized buffers start fresh per generation
 (the runtime clone resets them), so quantize-at-first-use repeats inside every
 request's TTFT — full-resident bf16 does not have this cost.

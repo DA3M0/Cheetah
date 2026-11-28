@@ -91,6 +91,93 @@ pub(crate) struct MixtralNative {
     pub(crate) ctx: OpsToolbox,
     /// Reusable activation buffers (preallocated at capacity).
     pub(crate) scratch: Scratch,
+    /// Chunked-prefill buffers (the llama-shaped stack plus the MoE extras).
+    pub(crate) chunk: MoEChunk,
+}
+
+/// Chunked-prefill buffers for the sparse feed-forward: the llama-shaped
+/// activation stack plus the MoE extras (router logits, per-row per-expert
+/// outputs, expert bucket workspaces). Sized on first use and grown only when
+/// a later chunk is larger than anything seen before.
+#[derive(Clone)]
+pub(crate) struct MoEChunk {
+    /// Residual stream rows, `[rows, hidden_size]`.
+    hidden: Vec<f32>,
+    /// Most recent norm output per row, `[rows, hidden_size]`.
+    normed: Vec<f32>,
+    /// Query rows after projection + rope, `[rows, q_dim]`.
+    q: Vec<f32>,
+    /// Key rows, `[rows, kv_dim]`.
+    k: Vec<f32>,
+    /// Value rows, `[rows, kv_dim]`.
+    v: Vec<f32>,
+    /// Attention output rows before `o_proj`, `[rows, q_dim]`.
+    attn_out: Vec<f32>,
+    /// Attention output rows after `o_proj`, `[rows, hidden_size]`.
+    attn_projected: Vec<f32>,
+    /// Router logits per row, `[rows, num_local_experts]`.
+    router: Vec<f32>,
+    /// Each row's per-expert outputs parked by selection slot,
+    /// `[rows, k, hidden_size]` — the per-row score-order accumulation reads
+    /// them back after every expert's bucket GEMMs have run.
+    expert_out: Vec<f32>,
+    /// Gathered rows of the expert currently being computed, `[b, hidden]`.
+    bucket_x: Vec<f32>,
+    /// Its gate projection / activated intermediate, `[b, intermediate]`.
+    bucket_gate: Vec<f32>,
+    /// Its up projection, `[b, intermediate]`.
+    bucket_up: Vec<f32>,
+    /// Its down projection, `[b, hidden]`.
+    bucket_out: Vec<f32>,
+    /// Routed feed-forward output rows, `[rows, hidden_size]`.
+    mlp_out: Vec<f32>,
+    /// Rows the buffers were last sized for.
+    capacity_rows: usize,
+}
+
+impl MoEChunk {
+    fn new() -> Self {
+        Self {
+            hidden: Vec::new(),
+            normed: Vec::new(),
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            attn_out: Vec::new(),
+            attn_projected: Vec::new(),
+            router: Vec::new(),
+            expert_out: Vec::new(),
+            bucket_x: Vec::new(),
+            bucket_gate: Vec::new(),
+            bucket_up: Vec::new(),
+            bucket_out: Vec::new(),
+            mlp_out: Vec::new(),
+            capacity_rows: 0,
+        }
+    }
+
+    fn resize_for(&mut self, cfg: &DecoderConfig, rows: usize) {
+        if rows <= self.capacity_rows {
+            return;
+        }
+        let kv_dim = cfg.kv_heads * cfg.head_dim;
+        let k = cfg.num_experts_per_tok.min(cfg.num_local_experts);
+        self.hidden = vec![0.0; rows * cfg.hidden_size];
+        self.normed = vec![0.0; rows * cfg.hidden_size];
+        self.q = vec![0.0; rows * cfg.q_heads * cfg.head_dim];
+        self.k = vec![0.0; rows * kv_dim];
+        self.v = vec![0.0; rows * kv_dim];
+        self.attn_out = vec![0.0; rows * cfg.q_heads * cfg.head_dim];
+        self.attn_projected = vec![0.0; rows * cfg.hidden_size];
+        self.router = vec![0.0; rows * cfg.num_local_experts];
+        self.expert_out = vec![0.0; rows * k * cfg.hidden_size];
+        self.bucket_x = vec![0.0; rows * cfg.hidden_size];
+        self.bucket_gate = vec![0.0; rows * cfg.intermediate_size];
+        self.bucket_up = vec![0.0; rows * cfg.intermediate_size];
+        self.bucket_out = vec![0.0; rows * cfg.hidden_size];
+        self.mlp_out = vec![0.0; rows * cfg.hidden_size];
+        self.capacity_rows = rows;
+    }
 }
 
 impl MixtralNative {
@@ -100,6 +187,7 @@ impl MixtralNative {
         let ctx = OpsToolbox::with_store(cfg.clone(), store);
         Self {
             scratch: Scratch::new(&cfg),
+            chunk: MoEChunk::new(),
             cfg,
             ctx,
         }
@@ -111,6 +199,7 @@ impl MixtralNative {
         let cfg = ctx.cfg.clone();
         Self {
             scratch: Scratch::new(&cfg),
+            chunk: MoEChunk::new(),
             cfg,
             ctx,
         }
@@ -118,14 +207,29 @@ impl MixtralNative {
 
     /// Run the full forward for tokens starting at `offset`; returns the
     /// logits of the final position only (matching the engine's sampling
-    /// contract).
+    /// contract). Single tokens (decode steps) run the per-position path;
+    /// longer batches (prefill) split into chunked batched-GEMM passes with
+    /// the sparse feed-forward bucketed per expert.
     fn run_forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
+        self.forward_with_chunk(tokens, offset, ops::prefill_chunk_size())
+    }
+
+    /// [`Self::run_forward`] with an explicit chunk size — tests force
+    /// uneven chunks and compare against the per-position reference.
+    pub(crate) fn forward_with_chunk(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        chunk_rows: usize,
+    ) -> Result<Vec<f32>, String> {
         self.ctx.validate_tokens(tokens)?;
         // Reserve the KV span for the whole prefill up front: growth into
         // reserved capacity instead of doubling copies mid-prefill.
         self.ctx.reserve_kv(offset + tokens.len());
-        for (index, &token) in tokens.iter().enumerate() {
-            self.forward_position(token as usize, offset + index)?;
+        if tokens.len() == 1 {
+            self.forward_position(tokens[0] as usize, offset)?;
+        } else {
+            self.forward_chunked(tokens, offset, chunk_rows)?;
         }
         // Mixtral keeps a separate lm_head tensor; the tied branch reads the
         // embedding table instead.
@@ -433,6 +537,335 @@ impl MixtralNative {
             &self.scratch.gate,
             &mut self.scratch.mlp_out,
         )?;
+        Ok(())
+    }
+
+    /// Chunked prefill: splits `tokens` into `chunk_rows`-sized batches and
+    /// processes each through [`Self::forward_chunk`]. The projections and
+    /// the routed feed-forward run as batched GEMMs (per-expert over the
+    /// rows that picked it); norms, rope, KV append and attention stay
+    /// per-row, which keeps the result bit-exact against the per-position
+    /// path.
+    fn forward_chunked(
+        &mut self,
+        tokens: &[u32],
+        offset: usize,
+        chunk_rows: usize,
+    ) -> Result<(), String> {
+        for start in (0..tokens.len()).step_by(chunk_rows.max(1)) {
+            let end = (start + chunk_rows).min(tokens.len());
+            self.forward_chunk(&tokens[start..end], offset + start)?;
+        }
+        Ok(())
+    }
+
+    /// One chunk of prefill positions as batched GEMMs, ending with the final
+    /// norm of the last position (the only one whose logits the caller reads).
+    fn forward_chunk(&mut self, tokens: &[u32], offset: usize) -> Result<(), String> {
+        let rows = tokens.len();
+        let hidden = self.cfg.hidden_size;
+        self.chunk.resize_for(&self.cfg, rows);
+        // Stack the embedding rows into `chunk.hidden` = [rows, hidden].
+        self.chunk.hidden.clear();
+        let mut row = std::mem::take(&mut self.scratch.hidden);
+        for &token in tokens {
+            self.ctx.embedding_row_into(token as usize, &mut row)?;
+            self.chunk.hidden.extend_from_slice(&row);
+        }
+        self.scratch.hidden = row;
+        for layer in 0..self.cfg.num_layers {
+            self.forward_layer_chunk(layer, offset, rows)?;
+            // Ant: same per-layer page release as the per-position path.
+            self.ctx.drop_disk_units_of_layer(layer as i32);
+        }
+        // Only the final position feeds the LM head: norm its residual row
+        // into `scratch.hidden` (the caller's logits input).
+        let last_row_start = (rows - 1) * hidden;
+        self.scratch.hidden.clear();
+        self.scratch
+            .hidden
+            .extend_from_slice(&self.chunk.hidden[last_row_start..last_row_start + hidden]);
+        self.ctx.rmsnorm("model.norm", &mut self.scratch.hidden)?;
+        Ok(())
+    }
+
+    /// One decoder layer over a whole chunk — the llama block shape with the
+    /// projections batched and the feed-forward routed per expert. Biases are
+    /// family-optional: mixtral carries none, so the adds stay unit-optional
+    /// no-ops.
+    fn forward_layer_chunk(
+        &mut self,
+        layer: usize,
+        offset: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let cfg = &self.cfg;
+        let q_dim = cfg.q_heads * cfg.head_dim;
+        let kv_dim = cfg.kv_heads * cfg.head_dim;
+        let hidden = cfg.hidden_size;
+        let prefix = format!("model.layers.{layer}.");
+
+        // Input norm per row.
+        self.chunk.normed.clear();
+        self.chunk.normed.resize(rows * hidden, 0.0);
+        for row in 0..rows {
+            let range = row * hidden..(row + 1) * hidden;
+            self.chunk.normed[range.clone()].copy_from_slice(&self.chunk.hidden[range.clone()]);
+            self.ctx.rmsnorm(
+                &format!("{prefix}input_layernorm"),
+                &mut self.chunk.normed[range],
+            )?;
+        }
+
+        // Q/K/V projections as batched GEMMs, then the (unit-optional)
+        // biases per row.
+        self.chunk.q.clear();
+        self.chunk.q.resize(rows * q_dim, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.q_proj.weight"),
+            q_dim,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.q,
+        )?;
+        self.chunk.k.clear();
+        self.chunk.k.resize(rows * kv_dim, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.k_proj.weight"),
+            kv_dim,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.k,
+        )?;
+        self.chunk.v.clear();
+        self.chunk.v.resize(rows * kv_dim, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.v_proj.weight"),
+            kv_dim,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.v,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                &format!("{prefix}self_attn.q_proj"),
+            );
+            self.ctx.add_bias(
+                &mut self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                &format!("{prefix}self_attn.k_proj"),
+            );
+            self.ctx.add_bias(
+                &mut self.chunk.v[row * kv_dim..(row + 1) * kv_dim],
+                &format!("{prefix}self_attn.v_proj"),
+            );
+        }
+
+        // Rope, cache append and attention per row, in order: appending row
+        // r's K/V before attending position r keeps the causal prefix exactly
+        // what the per-position path sees at that point.
+        self.chunk.attn_out.clear();
+        self.chunk.attn_out.resize(rows * q_dim, 0.0);
+        for row in 0..rows {
+            let position = offset + row;
+            ops::rope_heads(
+                &mut self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                cfg.q_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_theta,
+            );
+            ops::rope_heads(
+                &mut self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                cfg.kv_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_theta,
+            );
+            self.ctx.cache_append(
+                layer,
+                &self.chunk.k[row * kv_dim..(row + 1) * kv_dim],
+                &self.chunk.v[row * kv_dim..(row + 1) * kv_dim],
+            );
+            self.ctx.attention(
+                layer,
+                position,
+                &self.chunk.q[row * q_dim..(row + 1) * q_dim],
+                &mut self.chunk.attn_out[row * q_dim..(row + 1) * q_dim],
+            );
+        }
+
+        // Output projection as a batched GEMM (plus optional bias), then the
+        // residual add.
+        self.chunk.attn_projected.clear();
+        self.chunk.attn_projected.resize(rows * hidden, 0.0);
+        self.ctx.linear_batch(
+            &format!("{prefix}self_attn.o_proj.weight"),
+            hidden,
+            q_dim,
+            &self.chunk.attn_out,
+            &mut self.chunk.attn_projected,
+        )?;
+        for row in 0..rows {
+            self.ctx.add_bias(
+                &mut self.chunk.attn_projected[row * hidden..(row + 1) * hidden],
+                &format!("{prefix}self_attn.o_proj"),
+            );
+        }
+        for (value, residual) in self
+            .chunk
+            .attn_projected
+            .iter()
+            .zip(self.chunk.hidden.iter_mut())
+        {
+            *residual += *value;
+        }
+
+        // Post-attention norm per row, then the routed feed-forward, then its
+        // residual add.
+        self.chunk.normed.clear();
+        self.chunk.normed.resize(rows * hidden, 0.0);
+        for row in 0..rows {
+            let range = row * hidden..(row + 1) * hidden;
+            self.chunk.normed[range.clone()].copy_from_slice(&self.chunk.hidden[range.clone()]);
+            self.ctx.rmsnorm(
+                &format!("{prefix}post_attention_layernorm"),
+                &mut self.chunk.normed[range],
+            )?;
+        }
+        self.forward_moe_block_chunk(&prefix, layer, rows)?;
+        for (value, residual) in self.chunk.mlp_out.iter().zip(self.chunk.hidden.iter_mut()) {
+            *residual += *value;
+        }
+        Ok(())
+    }
+
+    /// Routed feed-forward over a whole chunk: the router runs as one
+    /// batched GEMM, every row picks its top-k experts through the shared
+    /// `chat::moe` rule, and each expert computes one batched gate/up/down
+    /// GEMM triple over the rows that picked it (its bucket). Each row's
+    /// expert outputs are parked by selection slot and accumulated in the
+    /// row's score order afterwards, so the mix is bit-exact against the
+    /// per-position path. Residency: the chunk's union of picked experts
+    /// drives one `update_expert_residency` call with the same per-`(layer,
+    /// expert)` contract.
+    fn forward_moe_block_chunk(
+        &mut self,
+        prefix: &str,
+        layer: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let cfg = &self.cfg;
+        let num_experts = cfg.num_local_experts;
+        let k = cfg.num_experts_per_tok.min(num_experts);
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+
+        // Router logits as one batched GEMM.
+        self.chunk.router.clear();
+        self.chunk.router.resize(rows * num_experts, 0.0);
+        self.ctx.linear_batch(
+            &cfg.moe_layout.router_unit(prefix),
+            num_experts,
+            hidden,
+            &self.chunk.normed,
+            &mut self.chunk.router,
+        )?;
+
+        // Per-row selection in score order, plus the chunk-wide union that
+        // drives the routing-aware residency in one call.
+        let mut selections: Vec<Vec<(usize, f32)>> = Vec::with_capacity(rows);
+        let mut picked: Vec<usize> = Vec::new();
+        for row in 0..rows {
+            let logits = &self.chunk.router[row * num_experts..(row + 1) * num_experts];
+            let selected = crate::chat::moe::select_experts(logits, k)?;
+            for (expert, _) in &selected {
+                if !picked.contains(expert) {
+                    picked.push(*expert);
+                }
+            }
+            selections.push(selected);
+        }
+        self.ctx.update_expert_residency(layer, &picked);
+
+        // Per-expert buckets, expert-index order. A row's expert output lands
+        // in `expert_out[row][slot]` where `slot` is the expert's rank in
+        // that row's score-ordered selection.
+        self.chunk.expert_out.clear();
+        self.chunk.expert_out.resize(rows * k * hidden, 0.0);
+        for expert in 0..num_experts {
+            let members: Vec<usize> = (0..rows)
+                .filter(|&row| selections[row].iter().any(|(e, _)| *e == expert))
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let bucket = members.len();
+            for (index, &row) in members.iter().enumerate() {
+                self.chunk.bucket_x[index * hidden..(index + 1) * hidden]
+                    .copy_from_slice(&self.chunk.normed[row * hidden..(row + 1) * hidden]);
+            }
+            self.chunk.bucket_gate.clear();
+            self.chunk.bucket_gate.resize(bucket * intermediate, 0.0);
+            self.ctx.linear_batch(
+                &cfg.moe_layout.expert_unit(prefix, expert, cfg.moe_layout.gate),
+                intermediate,
+                hidden,
+                &self.chunk.bucket_x[..bucket * hidden],
+                &mut self.chunk.bucket_gate,
+            )?;
+            self.chunk.bucket_up.clear();
+            self.chunk.bucket_up.resize(bucket * intermediate, 0.0);
+            self.ctx.linear_batch(
+                &cfg.moe_layout.expert_unit(prefix, expert, cfg.moe_layout.up),
+                intermediate,
+                hidden,
+                &self.chunk.bucket_x[..bucket * hidden],
+                &mut self.chunk.bucket_up,
+            )?;
+            for index in 0..bucket {
+                ops::silu_multiply(
+                    &mut self.chunk.bucket_gate[index * intermediate..(index + 1) * intermediate],
+                    &self.chunk.bucket_up[index * intermediate..(index + 1) * intermediate],
+                );
+            }
+            self.chunk.bucket_out.clear();
+            self.chunk.bucket_out.resize(bucket * hidden, 0.0);
+            self.ctx.linear_batch(
+                &cfg.moe_layout.expert_unit(prefix, expert, cfg.moe_layout.down),
+                hidden,
+                intermediate,
+                &self.chunk.bucket_gate[..bucket * intermediate],
+                &mut self.chunk.bucket_out,
+            )?;
+            for (index, &row) in members.iter().enumerate() {
+                let slot = selections[row]
+                    .iter()
+                    .position(|(e, _)| *e == expert)
+                    .expect("bucket member must have selected this expert");
+                self.chunk.expert_out
+                    [row * k * hidden + slot * hidden..row * k * hidden + (slot + 1) * hidden]
+                    .copy_from_slice(&self.chunk.bucket_out[index * hidden..(index + 1) * hidden]);
+            }
+        }
+
+        // Per-row mix in score order — the exact accumulation the
+        // per-position path performs (mlp_out starts at zero, adds
+        // `expert_out · route_weight` per selected expert in descending
+        // score order).
+        self.chunk.mlp_out.clear();
+        self.chunk.mlp_out.resize(rows * hidden, 0.0);
+        for row in 0..rows {
+            let acc = &mut self.chunk.mlp_out[row * hidden..(row + 1) * hidden];
+            for (slot, (_, route_weight)) in selections[row].iter().enumerate() {
+                let source = &self.chunk.expert_out[row * k * hidden + slot * hidden..][..hidden];
+                for (out, value) in acc.iter_mut().zip(source) {
+                    *out += *value * route_weight;
+                }
+            }
+        }
         Ok(())
     }
 }
