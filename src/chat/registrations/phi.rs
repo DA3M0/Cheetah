@@ -639,7 +639,9 @@ fn phi_vulkan_loader(
 #[cfg(feature = "vulkan")]
 use crate::chat::vulkan::required_usize;
 #[cfg(feature = "vulkan")]
-use crate::chat::vulkan::context::Activation;
+use crate::chat::vulkan::context::{
+    Activation, GpuKvCache, apply_activation, validate_sequence,
+};
 #[cfg(feature = "vulkan")]
 use crate::chat::vulkan::weights::{
     Linear, NamedWeight, WeightData, load_weights, take_linear, take_weight,
@@ -816,8 +818,7 @@ struct PhiLayer {
     dense: Linear,
     fc1: Linear,
     fc2: Linear,
-    keys: Vec<f32>,
-    values: Vec<f32>,
+    kv: GpuKvCache,
 }
 
 #[cfg(feature = "vulkan")]
@@ -843,8 +844,7 @@ impl crate::chat::registry::ModelForward for VulkanPhiExecutor {
 #[cfg(feature = "vulkan")]
     fn clear_cache(&mut self) {
         for layer in &mut self.layers {
-            layer.keys.clear();
-            layer.values.clear();
+            layer.kv.clear();
         }
     }
 
@@ -977,8 +977,7 @@ impl VulkanPhiExecutor {
                     config.hidden_size,
                     true,
                 )?,
-                keys: Vec::new(),
-                values: Vec::new(),
+                kv: GpuKvCache::default(),
             });
         }
         Ok(Self {
@@ -996,27 +995,20 @@ impl VulkanPhiExecutor {
     /// parallel-residual update `x + attn + mlp`; final LayerNorm + lm head.
 #[cfg(feature = "vulkan")]
     fn forward(&mut self, tokens: &[u32], offset: usize) -> Result<Vec<f32>, String> {
-        let sequence = tokens.len();
-        if sequence == 0 {
-            return Err("Vulkan Phi currently requires a non-empty batch of size one.".into());
-        }
-        let last_position = offset
-            .checked_add(sequence)
-            .ok_or_else(|| "Vulkan Phi sequence position overflow.".to_string())?;
-        if last_position > self.config.max_position_embeddings {
-            return Err("Vulkan Phi input exceeds max_position_embeddings.".into());
-        }
-        let expected_cache = offset
-            .checked_mul(self.config.num_key_value_heads)
-            .and_then(|count| count.checked_mul(self.config.head_dim))
-            .ok_or_else(|| "Vulkan Phi cache size overflow.".to_string())?;
-        if self
+        let cached_elements = self
             .layers
             .first()
-            .is_some_and(|layer| layer.keys.len() != expected_cache)
-        {
-            return Err("Vulkan Phi KV cache position does not match the input offset.".into());
-        }
+            .map(|layer| layer.kv.keys.len())
+            .unwrap_or(0);
+        let sequence = validate_sequence(
+            tokens,
+            offset,
+            self.config.vocab_size,
+            self.config.max_position_embeddings,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            cached_elements,
+        )?;
         let hidden = self.config.hidden_size;
         let mut activations = Vec::with_capacity(sequence * hidden);
         for token_id in tokens {
@@ -1066,12 +1058,11 @@ impl VulkanPhiExecutor {
                 self.config.rotary_dim,
                 self.config.rope_theta,
             )?;
-            layer.keys.extend_from_slice(&keys);
-            layer.values.extend_from_slice(&values);
+            layer.kv.append(&keys, &values);
             let attention = cheetah::native::vulkan::attention(
                 &query,
-                &layer.keys,
-                &layer.values,
+                &layer.kv.keys,
+                &layer.kv.values,
                 sequence,
                 offset,
                 offset + sequence,
@@ -1081,16 +1072,10 @@ impl VulkanPhiExecutor {
                 0,
             )?;
             let attention = layer.dense.forward(&attention, sequence)?;
-            let mut feed_forward = layer.fc1.forward(&normalized, sequence)?;
-            let ones = vec![1.0; feed_forward.len()];
-            feed_forward = match self.config.activation {
-                Activation::Silu => cheetah::native::vulkan::silu_mul(&feed_forward, &ones)?,
-                Activation::Gelu => cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, false)?,
-                Activation::NewGelu => {
-                    cheetah::native::vulkan::gelu_mul(&feed_forward, &ones, true)?
-                }
-            };
-            feed_forward = layer.fc2.forward(&feed_forward, sequence)?;
+            let mut activated = layer.fc1.forward(&normalized, sequence)?;
+            let ones = vec![1.0; activated.len()];
+            activated = apply_activation(self.config.activation, &activated, &ones)?;
+            let feed_forward = layer.fc2.forward(&activated, sequence)?;
             let residual_attention = cheetah::native::vulkan::add(&residual, &attention)?;
             activations = cheetah::native::vulkan::add(&residual_attention, &feed_forward)?;
         }
